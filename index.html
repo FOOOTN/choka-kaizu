@@ -376,10 +376,39 @@ async function delRec(id){ if(memStore) memStore.delete(id); else await DB.del(i
 /* ========== 地図 ========== */
 const map = L.map("map",{zoomControl:true}).setView([36.80,137.30],11);
 const gsiAttr = '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">地理院タイル</a>';
+/* 航空写真：沖合で写真のない所（黒い画素・欠けたタイル）を透明にして、
+   下に「粗い航空写真」と「淡色地図」を敷く */
+const PHOTO_URL="https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg";
+const ClearBlackTiles = L.GridLayer.extend({
+  createTile(coords,done){
+    const size=this.getTileSize(), c=document.createElement("canvas");
+    c.width=256; c.height=256; c.style.width=size.x+"px"; c.style.height=size.y+"px";
+    const img=new Image(); img.crossOrigin="anonymous";
+    img.onload=()=>{
+      const ctx=c.getContext("2d"); ctx.drawImage(img,0,0,256,256);
+      try{
+        const d=ctx.getImageData(0,0,256,256), a=d.data;
+        for(let i=0;i<a.length;i+=4) if(a[i]+a[i+1]+a[i+2]<30) a[i+3]=0;
+        ctx.putImageData(d,0,0);
+      }catch{}
+      done(null,c);
+    };
+    img.onerror=()=>done(null,c);           // 写真がないタイルは透明のまま
+    img.src=L.Util.template(PHOTO_URL,{z:coords.z,x:coords.x,y:coords.y});
+    return c;
+  }
+});
+function photoLayer(){
+  return L.layerGroup([
+    L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
+    new ClearBlackTiles({maxZoom:18,maxNativeZoom:12,minZoom:2}),
+    new ClearBlackTiles({maxZoom:18,maxNativeZoom:18,minZoom:13,attribution:gsiAttr}),
+  ]);
+}
 const base = {
   "淡色地図": L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
   "標準地図": L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
-  "航空写真": L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg",{maxZoom:18,attribution:gsiAttr}),
+  "航空写真": photoLayer(),
 };
 const seamark = L.tileLayer("https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
   {maxZoom:18,attribution:'航路標識 © <a href="https://www.openseamap.org" target="_blank" rel="noopener">OpenSeaMap</a>'});
