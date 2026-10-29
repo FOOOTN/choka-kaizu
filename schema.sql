@@ -17,6 +17,8 @@ create table if not exists public.profiles (
   agreed_at   timestamptz not null default now(),
   created_at  timestamptz not null default now()
 );
+-- 釣果の記録を管理者と共有するか（本人が選ぶ。初期値はオフ）
+alter table public.profiles add column if not exists share_catches boolean not null default false;
 
 -- お店（魚介類販売業の許可を持つ店。管理者が許可証を確認して承認）
 create table if not exists public.shops (
@@ -107,6 +109,31 @@ create table if not exists public.reports (
   created_at  timestamptz not null default now(),
   unique (listing_id, reporter)
 );
+
+-- 提供された釣果（アプリの初回に同意した端末から届く。ログインしていない人の分も含む。写真は送らない）
+-- 端末ごとの番号（device_id）と端末内の記録番号（local_id）で1件を表す。前の版の表は作り直す
+do $$ begin
+  if to_regclass('public.shared_catches') is not null and not exists(
+       select 1 from information_schema.columns
+        where table_schema = 'public' and table_name = 'shared_catches' and column_name = 'device_id') then
+    drop table public.shared_catches cascade;
+  end if;
+end $$;
+create table if not exists public.shared_catches (
+  device_id   text not null check (char_length(device_id) between 8 and 64),
+  local_id    text not null check (char_length(local_id) between 1 and 40),
+  owner       uuid references auth.users(id) on delete set null,      -- 最後に送ったログイン（匿名を含む）
+  caught_at   timestamptz not null,
+  species     text not null check (char_length(species) between 1 and 40),
+  count       int check (count between 0 and 100000),
+  lat         double precision not null check (lat between -90 and 90),
+  lon         double precision not null check (lon between -180 and 180),
+  data        jsonb not null default '{}'::jsonb check (pg_column_size(data) < 16000),
+  updated_at  timestamptz not null default now(),
+  primary key (device_id, local_id)
+);
+create index if not exists shared_catches_time_idx on public.shared_catches(caught_at desc);
+create index if not exists shared_catches_owner_idx on public.shared_catches(owner);
 
 -- ---------------------------------------------------------------------
 -- 2. 出品できない種類の初期値
@@ -289,6 +316,59 @@ drop trigger if exists listings_before_insert on public.listings;
 create trigger listings_before_insert before insert on public.listings
   for each row execute function public.listings_before_insert();
 
+-- 前の版の仕組み（本人ごとの共有オン・オフ）は使わないので外す
+drop trigger if exists profiles_share_off on public.profiles;
+drop function if exists public.profiles_share_off();
+drop function if exists public.shared_catches_guard();
+
+-- 釣果を受け取る（端末から最大500件ずつ。同じ端末・同じ記録は上書き）
+create or replace function public.push_catches(p_device text, p_rows jsonb)
+returns int language plpgsql security definer set search_path = public as $$
+declare n int; total int;
+begin
+  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
+  if exists(select 1 from profiles where id = auth.uid() and banned) then raise exception '利用が停止されています'; end if;
+  if char_length(coalesce(p_device, '')) not between 8 and 64 then raise exception '端末の番号が正しくありません'; end if;
+  if jsonb_typeof(p_rows) is distinct from 'array' or jsonb_array_length(p_rows) > 500 then
+    raise exception '一度に送れるのは500件までです';
+  end if;
+  insert into shared_catches(device_id, local_id, owner, caught_at, species, count, lat, lon, data, updated_at)
+  select p_device, left(r->>'local_id', 40), auth.uid(), (r->>'caught_at')::timestamptz,
+         left(coalesce(nullif(r->>'species', ''), '不明'), 40),
+         round(nullif(r->>'count', '')::numeric)::int,
+         (r->>'lat')::float8, (r->>'lon')::float8,
+         case when jsonb_typeof(r->'data') = 'object' then r->'data' else '{}'::jsonb end, now()
+    from jsonb_array_elements(p_rows) r
+   where coalesce(r->>'local_id', '') <> '' and r->>'lat' is not null and r->>'lon' is not null and r->>'caught_at' is not null
+  on conflict (device_id, local_id) do update
+     set owner = excluded.owner, caught_at = excluded.caught_at, species = excluded.species, count = excluded.count,
+         lat = excluded.lat, lon = excluded.lon, data = excluded.data, updated_at = now();
+  get diagnostics n = row_count;
+  select count(*) into total from shared_catches where device_id = p_device;
+  if total > 20000 then raise exception '1台あたりの上限（20000件）を超えました'; end if;
+  return n;
+end $$;
+
+-- 端末で記録を消したとき
+create or replace function public.forget_catch(p_device text, p_local text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
+  delete from shared_catches where device_id = p_device and local_id = p_local;
+end $$;
+
+-- 提供をやめたとき（その端末から届いた記録をすべて消す）
+create or replace function public.forget_device(p_device text)
+returns int language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
+  if char_length(coalesce(p_device, '')) < 8 then raise exception '端末の番号が正しくありません'; end if;
+  delete from shared_catches where device_id = p_device;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
 -- ---------------------------------------------------------------------
 -- 5. 画面から呼ぶ操作（申し込み・承諾・完了・取り消し）
 -- ---------------------------------------------------------------------
@@ -426,6 +506,8 @@ select
   l.species, l.count, l.kind, l.pickup_area, l.handoff, l.price_yen, l.expires_at,
   l.status as listing_status,
   (l.owner = auth.uid()) as i_am_owner,
+  (r.requester = auth.uid()) as i_am_requester,
+  (l.owner = auth.uid() or r.requester = auth.uid()) as i_am_party,
   (select count(*) from messages m where m.request_id = r.id) as msg_count,
   (select max(m.created_at) from messages m where m.request_id = r.id) as last_msg_at
 from public.requests r
@@ -456,6 +538,55 @@ select s.*, p.nickname as owner_name
 from public.shops s join public.profiles p on p.id = s.owner
 where is_admin() or s.owner = auth.uid();
 
+-- 管理者用：提供された釣果（ログインしていない端末は「匿名-端末番号の頭4文字」）
+drop view if exists public.shared_catch_cards;
+create view public.shared_catch_cards with (security_barrier = true) as
+select c.*, coalesce(n.nickname, '匿名-' || left(c.device_id, 4)) as nickname, (n.nickname is not null) as registered
+from public.shared_catches c
+left join lateral (                                 -- 同じ端末でログインしたことがあれば、その表示名
+  select p.nickname from public.shared_catches c2 join public.profiles p on p.id = c2.owner
+   where c2.device_id = c.device_id order by (c2.owner = c.owner) desc, c2.updated_at desc limit 1) n on true
+where is_admin();
+
+-- 管理者用：利用状況のまとめ
+create or replace function public.admin_stats() returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare j jsonb;
+begin
+  if not is_admin() then raise exception '権限がありません'; end if;
+  select jsonb_build_object(
+    'users',          (select count(*) from profiles),
+    'users_7d',       (select count(*) from profiles where created_at > now() - interval '7 days'),
+    'users_30d',      (select count(*) from profiles where created_at > now() - interval '30 days'),
+    'signins_7d',     (select count(*) from auth.users where last_sign_in_at > now() - interval '7 days' and not coalesce(is_anonymous, false)),
+    'active_30d',     (select count(distinct u) from (
+                         select owner u from listings where created_at > now() - interval '30 days'
+                         union select requester from requests where created_at > now() - interval '30 days'
+                         union select sender from messages where created_at > now() - interval '30 days') t),
+    'banned',         (select count(*) from profiles where banned),
+    'sharing_devices',(select count(distinct device_id) from shared_catches),
+    'shared_7d',      (select count(*) from shared_catches where caught_at > now() - interval '7 days'),
+    'listings',       (select coalesce(jsonb_object_agg(k, n), '{}'::jsonb) from (select kind || '_' || status k, count(*) n from listings group by 1) t),
+    'listings_30d',   (select count(*) from listings where created_at > now() - interval '30 days'),
+    'requests',       (select coalesce(jsonb_object_agg(status, n), '{}'::jsonb) from (select status, count(*) n from requests group by 1) t),
+    'messages',       (select count(*) from messages),
+    'shops',          (select coalesce(jsonb_object_agg(status, n), '{}'::jsonb) from (select status, count(*) n from shops group by 1) t),
+    'reports_open',   (select count(*) from reports where status = 'open'),
+    'top_species',    (select coalesce(jsonb_agg(t), '[]'::jsonb) from (
+                         select species, count(*) n, sum(count) fish from listings where status <> 'removed'
+                         group by species order by 2 desc, 1 limit 10) t),
+    'daily',          (select coalesce(jsonb_agg(t order by d), '[]'::jsonb) from (
+                         select (created_at at time zone 'Asia/Tokyo')::date d,
+                                count(*) filter (where kind = 'gift') gift, count(*) filter (where kind = 'shop') shop
+                           from listings where created_at > now() - interval '30 days' group by 1) t),
+    'shared_catches', (select count(*) from shared_catches),
+    'shared_species', (select coalesce(jsonb_agg(t), '[]'::jsonb) from (
+                         select species, count(*) n, sum(coalesce(count, 1)) fish from shared_catches
+                         group by species order by 2 desc, 1 limit 10) t)
+  ) into j;
+  return j;
+end $$;
+
 -- ---------------------------------------------------------------------
 -- 7. アクセス権（RLS）
 -- ---------------------------------------------------------------------
@@ -466,6 +597,7 @@ alter table public.listings      enable row level security;
 alter table public.requests      enable row level security;
 alter table public.messages      enable row level security;
 alter table public.reports       enable row level security;
+alter table public.shared_catches enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 drop policy if exists profiles_insert on public.profiles;
@@ -515,21 +647,33 @@ create policy reports_select on public.reports for select to authenticated using
 create policy reports_insert on public.reports for insert to authenticated with check (reporter = auth.uid() and is_active_user());
 create policy reports_update on public.reports for update to authenticated using (is_admin());
 
+-- 提供された釣果：読めるのは管理者だけ。書き込みは push_catches などの関数を通してだけ
+drop policy if exists shared_select on public.shared_catches;
+drop policy if exists shared_insert on public.shared_catches;
+drop policy if exists shared_update on public.shared_catches;
+drop policy if exists shared_delete on public.shared_catches;
+create policy shared_select on public.shared_catches for select to authenticated using (is_admin());
+revoke insert, update, delete on public.shared_catches from authenticated;
+
 -- ログインしていない人（anon）には何も見せない。操作は関数経由
-revoke all on public.profiles, public.shops, public.listings, public.requests, public.messages, public.reports from anon;
-revoke all on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards from anon;
-grant select on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards to authenticated;
+revoke all on public.profiles, public.shops, public.listings, public.requests, public.messages, public.reports, public.shared_catches from anon;
+revoke all on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards from anon;
+grant select on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards to authenticated;
 grant select on public.blocked_terms to anon, authenticated;
 -- 画面から直接さわれるのは必要な列・操作だけ
 revoke update on public.listings from authenticated;
 grant  update (status) on public.listings to authenticated;          -- 管理者の削除（removed）用。RLSで管理者に限定
 revoke update on public.profiles from authenticated;
-grant  update (nickname, banned) on public.profiles to authenticated; -- banned はトリガーで管理者に限定
+grant  update (nickname, banned, share_catches) on public.profiles to authenticated; -- banned はトリガーで管理者に限定
 
 revoke execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
   public.finish_request(uuid), public.cancel_request(uuid), public.cancel_listing(uuid) from public, anon;
 grant execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
   public.finish_request(uuid), public.cancel_request(uuid), public.cancel_listing(uuid) to authenticated;
+revoke execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) from public, anon;
+grant  execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) to authenticated;
+revoke execute on function public.admin_stats() from public, anon;
+grant  execute on function public.admin_stats() to authenticated;   -- 中で管理者かどうかを確かめる
 
 -- ---------------------------------------------------------------------
 -- 8. 写真の保存場所（Storage）
