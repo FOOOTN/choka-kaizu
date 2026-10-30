@@ -19,6 +19,8 @@ create table if not exists public.profiles (
 );
 -- 釣果の記録を管理者と共有するか（本人が選ぶ。初期値はオフ）
 alter table public.profiles add column if not exists share_catches boolean not null default false;
+-- 会員（有償）の期限。決済を入れるまでは管理者が設定する
+alter table public.profiles add column if not exists member_until date;
 
 -- お店（魚介類販売業の許可を持つ店。管理者が許可証を確認して承認）
 create table if not exists public.shops (
@@ -202,6 +204,84 @@ create table if not exists public.ratings (
 );
 create index if not exists ratings_ratee_idx on public.ratings(ratee);
 
+-- みんなの投稿（写真・ブログ）
+create table if not exists public.posts (
+  id            uuid primary key default gen_random_uuid(),
+  owner         uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  kind          text not null check (kind in ('photo','blog')),
+  title         text check (char_length(title) <= 80),
+  body          text check (char_length(body) <= 5000),
+  photos        text[] not null default '{}',
+  species       text check (char_length(species) <= 40),
+  size_cm       numeric(5,1) check (size_cm > 0 and size_cm < 400),
+  count         int check (count between 1 and 10000),
+  method        text check (char_length(method) <= 40),
+  shime         text check (char_length(shime) <= 40),
+  caught_at     timestamptz,
+  place         text check (char_length(place) <= 40),           -- 本人が書く大まかな場所（誰でも見える）
+  lat           double precision check (lat between -90 and 90),  -- 釣った位置（ログインした人だけに見える）
+  lon           double precision check (lon between -180 and 180),
+  allow_comments boolean not null default true,
+  status        text not null default 'public' check (status in ('public','removed')),
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+create index if not exists posts_time_idx on public.posts(status, created_at desc);
+create index if not exists posts_owner_idx on public.posts(owner);
+
+create table if not exists public.post_likes (
+  post_id     uuid not null references public.posts(id) on delete cascade,
+  user_id     uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  created_at  timestamptz not null default now(),
+  primary key (post_id, user_id)
+);
+
+create table if not exists public.post_comments (
+  id          bigint generated always as identity primary key,
+  post_id     uuid not null references public.posts(id) on delete cascade,
+  user_id     uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  body        text not null check (char_length(body) between 1 and 500),
+  created_at  timestamptz not null default now()
+);
+create index if not exists post_comments_post_idx on public.post_comments(post_id, id);
+
+-- 投稿・コメントの通報
+create table if not exists public.post_reports (
+  id          bigint generated always as identity primary key,
+  post_id     uuid not null references public.posts(id) on delete cascade,
+  comment_id  bigint references public.post_comments(id) on delete cascade,
+  reporter    uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  reason      text not null check (reason in ('釣り場や個人の情報が書かれている','不適切な写真・言葉','他人の写真・うその内容','宣伝・迷惑行為','その他')),
+  detail      text check (char_length(detail) <= 400),
+  status      text not null default 'open' check (status in ('open','closed')),
+  created_at  timestamptz not null default now()
+);
+
+-- ダイレクトメッセージ（1対1）とブロック
+create table if not exists public.dm_threads (
+  id          uuid primary key default gen_random_uuid(),
+  a           uuid not null references public.profiles(id) on delete cascade,
+  b           uuid not null references public.profiles(id) on delete cascade,
+  created_at  timestamptz not null default now(),
+  last_at     timestamptz not null default now(),
+  check (a < b),
+  unique (a, b)
+);
+create table if not exists public.dm_messages (
+  id          bigint generated always as identity primary key,
+  thread_id   uuid not null references public.dm_threads(id) on delete cascade,
+  sender      uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  body        text not null check (char_length(body) between 1 and 1000),
+  created_at  timestamptz not null default now()
+);
+create index if not exists dm_messages_thread_idx on public.dm_messages(thread_id, id);
+create table if not exists public.blocks (
+  blocker     uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  blocked     uuid not null references public.profiles(id) on delete cascade,
+  created_at  timestamptz not null default now(),
+  primary key (blocker, blocked)
+);
+
 -- ---------------------------------------------------------------------
 -- 2. 出品できない種類の初期値
 --    ひらがな・カタカナどちらで入力されても止まるように、照合はカタカナに直して行う
@@ -270,6 +350,29 @@ language sql stable security definer set search_path = public as $$
      where r.id = p_request and (r.requester = auth.uid() or l.owner = auth.uid()))
 $$;
 
+-- 会員か（管理者は常に会員）
+create or replace function public.is_member() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists(select 1 from profiles where id = auth.uid() and not banned
+                  and (role = 'admin' or member_until >= (now() at time zone 'Asia/Tokyo')::date))
+$$;
+
+-- 公開中の投稿か／自分の投稿か（RLS の中から投稿を調べるため）
+create or replace function public.post_is_public(p_post uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists(select 1 from posts where id = p_post and status = 'public')
+$$;
+create or replace function public.is_my_post(p_post uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists(select 1 from posts where id = p_post and owner = auth.uid())
+$$;
+
+-- どちらかがブロックしているか
+create or replace function public.is_blocked(p_a uuid, p_b uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists(select 1 from blocks where (blocker = p_a and blocked = p_b) or (blocker = p_b and blocked = p_a))
+$$;
+
 -- やり取りに自動のお知らせを書く
 create or replace function public.sysmsg(p_request uuid, p_body text) returns void
 language sql security definer set search_path = public as $$
@@ -305,10 +408,11 @@ language plpgsql security definer set search_path = public as $$
 begin
   if auth.uid() is null or is_admin() then return new; end if;
   if tg_op = 'INSERT' then
-    new.id := auth.uid(); new.role := 'user'; new.banned := false;
+    new.id := auth.uid(); new.role := 'user'; new.banned := false; new.member_until := null;
     new.agreed_at := now(); new.created_at := now();
   else
-    if new.role is distinct from old.role or new.banned is distinct from old.banned or new.id <> old.id then
+    if new.role is distinct from old.role or new.banned is distinct from old.banned
+       or new.member_until is distinct from old.member_until or new.id <> old.id then
       raise exception '権限がありません';
     end if;
   end if;
@@ -327,7 +431,7 @@ begin
     if tg_op = 'UPDATE' and new.status is distinct from old.status then new.reviewed_at := now(); end if;
     return new;
   end if;
-  if not is_active_user() then raise exception '利用が停止されているか、登録が済んでいません'; end if;
+  if not is_member() then raise exception 'お店の登録は会員の機能です'; end if;
   if tg_op = 'INSERT' then
     new.owner := auth.uid(); new.created_at := now();
   elsif old.status not in ('pending','rejected') then
@@ -354,7 +458,7 @@ declare
 begin
   if auth.uid() is null then return new; end if;            -- 管理画面からの投入は素通し
   new.owner := auth.uid();
-  if not is_active_user() then raise exception '利用が停止されているか、登録が済んでいません'; end if;
+  if not is_member() then raise exception 'おすそわけ・お店向けの出品は会員の機能です'; end if;
   new.status := 'open'; new.created_at := now();
 
   v_reason := blocked_reason(new.species);
@@ -418,6 +522,7 @@ begin
     return new;
   end if;
   new.owner := auth.uid(); new.status := 'open'; new.created_at := now();
+  if not is_member() then raise exception '買い取り希望は会員の機能です'; end if;
   new.shop_id := my_shop();
   if new.shop_id is null then raise exception '買い取り希望を出せるのは、承認済みのお店だけです'; end if;
   v_reason := blocked_reason(new.species);
@@ -449,6 +554,114 @@ drop trigger if exists contact_cards_guard on public.contact_cards;
 create trigger contact_cards_guard before insert or update on public.contact_cards
   for each row execute function public.contact_cards_guard();
 
+-- 投稿：会員だけ。写真は自分のフォルダ、6枚まで。1日20件まで
+create or replace function public.posts_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare v_n int;
+begin
+  if auth.uid() is null then return new; end if;
+  if tg_op = 'UPDATE' then
+    if is_admin() and new.owner <> auth.uid() then
+      new.owner := old.owner; return new;                  -- 管理者は削除（status）だけ
+    end if;
+    if old.owner <> auth.uid() then raise exception '権限がありません'; end if;
+    new.owner := old.owner; new.created_at := old.created_at; new.updated_at := now();
+    if new.status <> old.status and new.status <> 'removed' then raise exception '権限がありません'; end if;
+  else
+    if not is_member() then raise exception '投稿は会員の機能です'; end if;
+    new.owner := auth.uid(); new.created_at := now(); new.updated_at := now(); new.status := 'public';
+    select count(*) into v_n from posts where owner = auth.uid() and created_at > now() - interval '24 hours';
+    if v_n >= 20 then raise exception '投稿は1日20件までです'; end if;
+  end if;
+  if coalesce(array_length(new.photos, 1), 0) > 6 then raise exception '写真は6枚までです'; end if;
+  if exists(select 1 from unnest(new.photos) p where split_part(p, '/', 1) <> new.owner::text) then
+    raise exception '写真の保存先が正しくありません';
+  end if;
+  if new.kind = 'blog' and coalesce(btrim(new.title), '') = '' then raise exception 'ブログにはタイトルを付けてください'; end if;
+  if new.kind = 'photo' and coalesce(array_length(new.photos, 1), 0) = 0 then raise exception '写真を1枚以上つけてください'; end if;
+  if (new.lat is null) <> (new.lon is null) then raise exception '位置が正しくありません'; end if;
+  return new;
+end $$;
+drop trigger if exists posts_guard on public.posts;
+create trigger posts_guard before insert or update on public.posts
+  for each row execute function public.posts_guard();
+
+-- コメント：コメントを受け付けている公開中の投稿だけ。ブロックされていたら書けない
+create or replace function public.post_comments_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare p posts; v_n int;
+begin
+  if auth.uid() is null then return new; end if;
+  if not is_active_user() then raise exception 'コメントするには表示名の登録が必要です'; end if;
+  new.user_id := auth.uid(); new.created_at := now();
+  select * into p from posts where id = new.post_id;
+  if not found or p.status <> 'public' then raise exception 'この投稿は見られなくなりました'; end if;
+  if not p.allow_comments then raise exception 'この投稿はコメントを受け付けていません'; end if;
+  if is_blocked(p.owner, auth.uid()) then raise exception 'この投稿にはコメントできません'; end if;
+  select count(*) into v_n from post_comments where user_id = auth.uid() and created_at > now() - interval '1 hour';
+  if v_n >= 30 then raise exception 'コメントは1時間に30件までです'; end if;
+  return new;
+end $$;
+drop trigger if exists post_comments_guard on public.post_comments;
+create trigger post_comments_guard before insert on public.post_comments
+  for each row execute function public.post_comments_guard();
+
+-- メッセージの相手とのやり取りを開く（なければ作る）
+create or replace function public.dm_open(p_user uuid)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare v_a uuid; v_b uuid; v_id uuid;
+begin
+  if not is_active_user() then raise exception 'メッセージを送るには表示名の登録が必要です'; end if;
+  if p_user = auth.uid() then raise exception '自分にはメッセージを送れません'; end if;
+  if not exists(select 1 from profiles where id = p_user and not banned) then raise exception '相手が見つかりません'; end if;
+  if is_blocked(auth.uid(), p_user) then raise exception 'この相手とはメッセージをやり取りできません'; end if;
+  v_a := least(auth.uid(), p_user); v_b := greatest(auth.uid(), p_user);
+  insert into dm_threads(a, b) values (v_a, v_b) on conflict (a, b) do nothing;
+  select id into v_id from dm_threads where a = v_a and b = v_b;
+  return v_id;
+end $$;
+
+-- 投稿者の id から相手を開く（投稿者の id は画面に出さないため、投稿から開く）
+create or replace function public.dm_open_post(p_post uuid)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare v_owner uuid;
+begin
+  select owner into v_owner from posts where id = p_post and status = 'public';
+  if not found then raise exception 'この投稿は見られなくなりました'; end if;
+  return dm_open(v_owner);
+end $$;
+
+create or replace function public.dm_messages_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare t dm_threads; v_n int;
+begin
+  if auth.uid() is null then return new; end if;
+  new.sender := auth.uid(); new.created_at := now();
+  select * into t from dm_threads where id = new.thread_id;
+  if not found or auth.uid() not in (t.a, t.b) then raise exception '権限がありません'; end if;
+  if not is_active_user() then raise exception '利用が停止されています'; end if;
+  if is_blocked(t.a, t.b) then raise exception 'この相手とはメッセージをやり取りできません'; end if;
+  select count(*) into v_n from dm_messages where sender = auth.uid() and created_at > now() - interval '1 hour';
+  if v_n >= 60 then raise exception 'メッセージは1時間に60件までです'; end if;
+  update dm_threads set last_at = now() where id = t.id;
+  return new;
+end $$;
+drop trigger if exists dm_messages_guard on public.dm_messages;
+create trigger dm_messages_guard before insert on public.dm_messages
+  for each row execute function public.dm_messages_guard();
+
+-- メッセージの相手をブロック／解除する
+create or replace function public.dm_block(p_thread uuid, p_on boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare t dm_threads; v_other uuid;
+begin
+  select * into t from dm_threads where id = p_thread;
+  if not found or auth.uid() not in (t.a, t.b) then raise exception '権限がありません'; end if;
+  v_other := case when t.a = auth.uid() then t.b else t.a end;
+  if p_on then insert into blocks(blocker, blocked) values (auth.uid(), v_other) on conflict do nothing;
+  else delete from blocks where blocker = auth.uid() and blocked = v_other; end if;
+end $$;
+
 -- 前の版の仕組み（本人ごとの共有オン・オフ）は使わないので外す
 drop trigger if exists profiles_share_off on public.profiles;
 drop function if exists public.profiles_share_off();
@@ -460,7 +673,7 @@ returns int language plpgsql security definer set search_path = public as $$
 declare n int; total int;
 begin
   if auth.uid() is null then raise exception 'ログインが必要です'; end if;
-  if exists(select 1 from profiles where id = auth.uid() and banned) then raise exception '利用が停止されています'; end if;
+  if not is_member() then raise exception '釣果の記録は会員の機能です'; end if;
   if char_length(coalesce(p_device, '')) not between 8 and 64 then raise exception '端末の番号が正しくありません'; end if;
   if jsonb_typeof(p_rows) is distinct from 'array' or jsonb_array_length(p_rows) > 500 then
     raise exception '一度に送れるのは500件までです';
@@ -514,7 +727,7 @@ declare
   v_n int;
 begin
   if auth.uid() is null then raise exception 'ログインが必要です'; end if;
-  if not is_active_user() then raise exception '利用が停止されているか、登録が済んでいません'; end if;
+  if not is_member() then raise exception 'おすそわけへの申し込みは会員の機能です'; end if;
   select * into l from listings where id = p_listing for update;
   if not found or l.status <> 'open' or l.expires_at <= now() then raise exception 'この出品は受付を終了しています'; end if;
   if l.owner = auth.uid() then raise exception '自分の出品には申し込めません'; end if;
@@ -795,6 +1008,67 @@ join public.requests r on r.id = g.request_id
 join public.listings l on l.id = r.listing_id
 where is_admin();
 
+-- みんなの投稿（ログインしなくても見られる。釣った位置はログインした人だけ）
+drop view if exists public.post_cards;
+create view public.post_cards with (security_barrier = true) as
+select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p.method, p.shime, p.caught_at, p.place,
+       case when auth.uid() is not null then p.lat end as lat,
+       case when auth.uid() is not null then p.lon end as lon,
+       (p.lat is not null) as has_pos,
+       p.allow_comments, p.status, p.created_at, p.updated_at,
+       u.nickname as owner_name,
+       (p.owner = auth.uid()) as mine,
+       (select count(*) from post_likes k where k.post_id = p.id) as like_count,
+       (select count(*) from post_comments c where c.post_id = p.id) as comment_count,
+       exists(select 1 from post_likes k where k.post_id = p.id and k.user_id = auth.uid()) as liked
+from public.posts p join public.profiles u on u.id = p.owner
+where (p.status = 'public' and not u.banned) or p.owner = auth.uid() or is_admin();
+
+drop view if exists public.comment_cards;
+create view public.comment_cards with (security_barrier = true) as
+select c.id, c.post_id, c.body, c.created_at, u.nickname as user_name,
+       (c.user_id = auth.uid()) as mine,
+       exists(select 1 from posts p where p.id = c.post_id and p.owner = auth.uid()) as on_my_post
+from public.post_comments c
+join public.profiles u on u.id = c.user_id
+join public.posts p on p.id = c.post_id
+where (p.status = 'public' and not u.banned) or p.owner = auth.uid() or is_admin();
+
+-- メッセージの一覧（自分の分だけ）
+drop view if exists public.dm_cards;
+create view public.dm_cards with (security_barrier = true) as
+select t.id, t.last_at, o.nickname as other_name,
+       exists(select 1 from blocks k where k.blocker = auth.uid() and k.blocked = o.id) as i_blocked,
+       is_blocked(t.a, t.b) as blocked,
+       (select m.body from dm_messages m where m.thread_id = t.id order by m.id desc limit 1) as last_body,
+       (select max(m.created_at) from dm_messages m where m.thread_id = t.id and m.sender <> auth.uid()) as last_in_at
+from public.dm_threads t
+join public.profiles o on o.id = case when t.a = auth.uid() then t.b else t.a end
+where auth.uid() in (t.a, t.b);
+
+-- 管理者用：投稿の通報
+drop view if exists public.post_report_cards;
+create view public.post_report_cards with (security_barrier = true) as
+select r.id, r.reason, r.detail, r.status, r.created_at, r.post_id, r.comment_id,
+       coalesce(p.title, left(p.body, 40)) as post_title, pu.nickname as owner_name,
+       c.body as comment_body, cu.nickname as comment_user, ru.nickname as reporter_name
+from public.post_reports r
+join public.posts p on p.id = r.post_id
+join public.profiles pu on pu.id = p.owner
+join public.profiles ru on ru.id = r.reporter
+left join public.post_comments c on c.id = r.comment_id
+left join public.profiles cu on cu.id = c.user_id
+where is_admin();
+
+-- 管理者用：利用者の一覧（会員の期限を管理する）
+drop view if exists public.user_cards;
+create view public.user_cards with (security_barrier = true) as
+select p.id, p.nickname, p.role, p.banned, p.member_until, p.created_at, u.email, u.last_sign_in_at,
+       (select count(*) from posts x where x.owner = p.id) as posts,
+       (select count(*) from listings x where x.owner = p.id) as listings
+from public.profiles p join auth.users u on u.id = p.id
+where is_admin();
+
 -- 管理者用：提供された釣果（ログインしていない端末は「匿名-端末番号の頭4文字」）
 drop view if exists public.shared_catch_cards;
 create view public.shared_catch_cards with (security_barrier = true) as
@@ -829,6 +1103,13 @@ begin
     'messages',       (select count(*) from messages),
     'shops',          (select coalesce(jsonb_object_agg(status, n), '{}'::jsonb) from (select status, count(*) n from shops group by 1) t),
     'reports_open',   (select count(*) from reports where status = 'open'),
+    'members',        (select count(*) from profiles where role = 'admin' or member_until >= (now() at time zone 'Asia/Tokyo')::date),
+    'posts',          (select count(*) from posts where status = 'public'),
+    'posts_7d',       (select count(*) from posts where status = 'public' and created_at > now() - interval '7 days'),
+    'comments',       (select count(*) from post_comments),
+    'likes',          (select count(*) from post_likes),
+    'dms',            (select count(*) from dm_messages),
+    'post_reports_open', (select count(*) from post_reports where status = 'open'),
     'wants_open',     (select count(*) from wants where status = 'open' and until >= (now() at time zone 'Asia/Tokyo')::date),
     'ratings',        (select count(*) from ratings),
     'cancels',        (select coalesce(jsonb_object_agg(cancel_reason, n), '{}'::jsonb) from (
@@ -863,6 +1144,13 @@ alter table public.contact_cards enable row level security;
 alter table public.deal_cards    enable row level security;
 alter table public.wants         enable row level security;
 alter table public.ratings       enable row level security;
+alter table public.posts         enable row level security;
+alter table public.post_likes    enable row level security;
+alter table public.post_comments enable row level security;
+alter table public.post_reports  enable row level security;
+alter table public.dm_threads    enable row level security;
+alter table public.dm_messages   enable row level security;
+alter table public.blocks        enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 drop policy if exists profiles_insert on public.profiles;
@@ -945,13 +1233,59 @@ create policy ratings_select on public.ratings for select to authenticated using
 create policy ratings_delete on public.ratings for delete to authenticated using (is_admin());
 revoke insert, update on public.ratings from authenticated;
 
+drop policy if exists posts_select on public.posts;
+drop policy if exists posts_insert on public.posts;
+drop policy if exists posts_update on public.posts;
+drop policy if exists posts_delete on public.posts;
+create policy posts_select on public.posts for select to authenticated using (owner = auth.uid() or is_admin());
+create policy posts_insert on public.posts for insert to authenticated with check (owner = auth.uid());
+create policy posts_update on public.posts for update to authenticated using (owner = auth.uid() or is_admin());
+create policy posts_delete on public.posts for delete to authenticated using (owner = auth.uid() or is_admin());
+
+drop policy if exists likes_select on public.post_likes;
+drop policy if exists likes_insert on public.post_likes;
+drop policy if exists likes_delete on public.post_likes;
+create policy likes_select on public.post_likes for select to authenticated using (user_id = auth.uid() or is_admin());
+create policy likes_insert on public.post_likes for insert to authenticated
+  with check (user_id = auth.uid() and is_active_user() and post_is_public(post_id));
+create policy likes_delete on public.post_likes for delete to authenticated using (user_id = auth.uid());
+
+drop policy if exists comments_select on public.post_comments;
+drop policy if exists comments_insert on public.post_comments;
+drop policy if exists comments_delete on public.post_comments;
+create policy comments_select on public.post_comments for select to authenticated using (user_id = auth.uid() or is_admin() or is_my_post(post_id));
+create policy comments_insert on public.post_comments for insert to authenticated with check (user_id = auth.uid());
+create policy comments_delete on public.post_comments for delete to authenticated   -- 自分のコメント・自分の投稿へのコメント・管理者
+  using (user_id = auth.uid() or is_admin() or is_my_post(post_id));
+
+drop policy if exists preports_select on public.post_reports;
+drop policy if exists preports_insert on public.post_reports;
+drop policy if exists preports_update on public.post_reports;
+create policy preports_select on public.post_reports for select to authenticated using (reporter = auth.uid() or is_admin());
+create policy preports_insert on public.post_reports for insert to authenticated with check (reporter = auth.uid() and is_active_user());
+create policy preports_update on public.post_reports for update to authenticated using (is_admin());
+
+drop policy if exists dmt_select on public.dm_threads;
+create policy dmt_select on public.dm_threads for select to authenticated using (auth.uid() in (a, b) or is_admin());
+revoke insert, update, delete on public.dm_threads from authenticated;
+drop policy if exists dmm_select on public.dm_messages;
+drop policy if exists dmm_insert on public.dm_messages;
+create policy dmm_select on public.dm_messages for select to authenticated
+  using (is_admin() or exists(select 1 from dm_threads t where t.id = thread_id and auth.uid() in (t.a, t.b)));
+create policy dmm_insert on public.dm_messages for insert to authenticated with check (sender = auth.uid());
+drop policy if exists blocks_select on public.blocks;
+create policy blocks_select on public.blocks for select to authenticated using (blocker = auth.uid() or is_admin());
+revoke insert, update, delete on public.blocks from authenticated;
+
 -- ログインしていない人（anon）には何も見せない。操作は関数経由
 revoke all on public.profiles, public.shops, public.listings, public.requests, public.messages, public.reports, public.shared_catches,
-  public.contact_cards, public.deal_cards, public.wants, public.ratings from anon;
+  public.contact_cards, public.deal_cards, public.wants, public.ratings,
+  public.posts, public.post_likes, public.post_comments, public.post_reports, public.dm_threads, public.dm_messages, public.blocks from anon;
 revoke all on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards,
-  public.want_cards, public.rating_cards from anon;
+  public.want_cards, public.rating_cards, public.dm_cards, public.post_report_cards, public.user_cards from anon;
 grant select on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards,
-  public.want_cards, public.rating_cards to authenticated;
+  public.want_cards, public.rating_cards, public.post_cards, public.comment_cards, public.dm_cards, public.post_report_cards, public.user_cards to authenticated;
+grant select on public.post_cards, public.comment_cards to anon;        -- みんなの投稿はログインしなくても見られる（位置は出ない）
 revoke update on public.wants from authenticated;
 grant  update (status) on public.wants to authenticated;
 grant select on public.blocked_terms to anon, authenticated;
@@ -959,7 +1293,9 @@ grant select on public.blocked_terms to anon, authenticated;
 revoke update on public.listings from authenticated;
 grant  update (status) on public.listings to authenticated;          -- 管理者の削除（removed）用。RLSで管理者に限定
 revoke update on public.profiles from authenticated;
-grant  update (nickname, banned, share_catches) on public.profiles to authenticated; -- banned はトリガーで管理者に限定
+grant  update (nickname, banned, share_catches, member_until) on public.profiles to authenticated; -- banned・member_until はトリガーで管理者に限定
+revoke update on public.posts from authenticated;
+grant  update (title, body, place, allow_comments, status) on public.posts to authenticated;
 
 revoke execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
   public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
@@ -968,6 +1304,8 @@ grant execute on function public.make_request(uuid, text, int), public.respond_r
   public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
   public.send_card(uuid), public.rate_deal(uuid, int, int, int, text), public.update_listing(uuid, jsonb) to authenticated;
 revoke execute on function public.sysmsg(uuid, text) from public, anon, authenticated;   -- 関数の中からだけ使う
+revoke execute on function public.dm_open(uuid), public.dm_open_post(uuid), public.dm_block(uuid, boolean) from public, anon;
+grant  execute on function public.dm_open(uuid), public.dm_open_post(uuid), public.dm_block(uuid, boolean) to authenticated;
 revoke execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) from public, anon;
 grant  execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) to authenticated;
 revoke execute on function public.admin_stats() from public, anon;
@@ -980,14 +1318,21 @@ grant  execute on function public.admin_stats() to authenticated;   -- 中で管
 --    どちらも「利用者ID/ファイル名」の形で、自分のフォルダにだけ置ける
 -- ---------------------------------------------------------------------
 insert into storage.buckets (id, name, public)
-values ('photos', 'photos', false), ('licenses', 'licenses', false)
+values ('photos', 'photos', false), ('licenses', 'licenses', false), ('posts', 'posts', true)
 on conflict (id) do nothing;
+-- posts : みんなの投稿の写真。誰でも見られる（位置情報は縮小のときに消してある）。置けるのは会員の自分のフォルダだけ
 
 drop policy if exists "photos_insert_own" on storage.objects;
 drop policy if exists "photos_read"       on storage.objects;
 drop policy if exists "photos_delete_own" on storage.objects;
 drop policy if exists "licenses_insert_own" on storage.objects;
 drop policy if exists "licenses_read"       on storage.objects;
+drop policy if exists "posts_insert_own"    on storage.objects;
+drop policy if exists "posts_delete_own"    on storage.objects;
+create policy "posts_insert_own" on storage.objects for insert to authenticated
+  with check (bucket_id = 'posts' and (storage.foldername(name))[1] = auth.uid()::text and public.is_member());
+create policy "posts_delete_own" on storage.objects for delete to authenticated
+  using (bucket_id = 'posts' and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
 create policy "photos_insert_own" on storage.objects for insert to authenticated
   with check (bucket_id = 'photos' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "photos_read" on storage.objects for select to authenticated

@@ -67,12 +67,15 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:1fr 420px}
   .view{overflow:visible;flex:none}
   .actions{bottom:0}
 }
+.here-box{background:rgba(255,255,255,.9);color:#16263a;font-size:12px;padding:3px 8px;border-radius:3px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);white-space:nowrap}
+.here-box small{color:#4b5a6c}
 .map-size{display:none}
 @media (max-width:820px){ .map-size{display:block} }
 .map-size button{font:12px/1 var(--f-body);color:#16263a;background:#fff;border:0;border-radius:4px;padding:8px;min-height:34px;cursor:pointer}
 
-.tabs{display:flex;border-bottom:1px solid var(--rule)}
-.tabs button{flex:1;white-space:nowrap;font:inherit;font-weight:500;background:none;border:0;padding:10px 4px;color:var(--ink-2);cursor:pointer;border-bottom:3px solid transparent}
+.tabs{display:flex;border-bottom:1px solid var(--rule);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:1;white-space:nowrap;font:inherit;font-weight:500;background:none;border:0;padding:10px 6px;font-size:14px;flex-shrink:0;color:var(--ink-2);cursor:pointer;border-bottom:3px solid transparent}
 .tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--magenta)}
 .view{flex:1;overflow:auto;padding-block:14px;padding-left:16px;padding-right:16px}
 
@@ -259,6 +262,22 @@ dialog#dlg::backdrop{background:rgba(10,20,30,.45)}
 .tag.ok{border-color:var(--ok);color:var(--ok)}
 details.box{border:1px solid var(--rule);border-radius:4px;padding:6px 10px;margin-bottom:10px;background:var(--paper)}
 details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;align-items:center;gap:6px}
+.post{grid-template-columns:96px 1fr}
+.post img,.post .noimg{width:96px;height:96px}
+.post .ttl{font-weight:700;font-size:15px}
+.post .ex{font-size:13px;color:var(--ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.post .meta{font-size:12px;color:var(--ink-2);display:flex;gap:10px;flex-wrap:wrap}
+.pbody{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.8;margin:8px 0}
+.likebtn[aria-pressed="true"]{background:#d6336c;border-color:#d6336c;color:#fff}
+.cmt{border-top:1px solid var(--rule);padding:6px 0;font-size:13px}
+.cmt .who{font-weight:700;margin-right:6px}
+.cmt .ops{display:inline-flex;gap:4px;margin-left:6px}
+.thumbs{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+.thumbs figure{margin:0;position:relative}
+.thumbs img{width:72px;height:72px;object-fit:cover;border-radius:3px;display:block}
+.thumbs button{position:absolute;top:2px;right:2px;border:0;background:rgba(0,0,0,.6);color:#fff;border-radius:2px;font-size:11px;cursor:pointer;padding:0 5px}
+.dmrow{grid-template-columns:1fr}
+.dmrow .t{justify-content:space-between}
 [hidden]{display:none!important}
 
 /* 地図 */
@@ -292,6 +311,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
   <h1>釣果海図ログ</h1>
   <span class="sub">位置／魚種／棚／気象／潮汐／波浪・等深線</span>
   <span class="sp"></span>
+  <button class="btn" id="btnAccount" title="ログイン・アカウント">ログイン</button>
   <button class="btn" id="btnTheme" title="表示テーマ切替">昼／夜</button>
 </header>
 
@@ -308,6 +328,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
       <button role="tab" id="tabForm" aria-selected="false">釣果を登録</button>
       <button role="tab" id="tabTrack" aria-selected="false">航跡</button>
       <button role="tab" id="tabShare" aria-selected="false">おすそわけ<span class="badge" id="shareBadge" hidden></span></button>
+      <button role="tab" id="tabFeed" aria-selected="false">みんな<span class="badge" id="feedBadge" hidden></span></button>
     </div>
 
     <!-- 一覧 -->
@@ -483,6 +504,32 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
       </form>
     </div>
 
+    <!-- みんな（写真・ブログ・メッセージ） -->
+    <div class="view" id="viewFeed" hidden>
+      <div class="subtabs" id="fdSubs" role="tablist">
+        <button type="button" data-fsub="posts" aria-selected="true">みんなの投稿</button>
+        <button type="button" data-fsub="dm" aria-selected="false">メッセージ<span class="badge" id="dmBadge" hidden></span></button>
+      </div>
+      <div id="fsub_posts">
+        <div class="toolbar">
+          <div class="chips sq" id="fdKinds">
+            <button type="button" class="chip" data-k="all" aria-pressed="true">すべて</button>
+            <button type="button" class="chip" data-k="photo" aria-pressed="false">写真</button>
+            <button type="button" class="chip" data-k="blog" aria-pressed="false">ブログ</button>
+            <button type="button" class="chip" data-k="mine" aria-pressed="false" id="fdMine" hidden>自分</button>
+          </div>
+          <button type="button" class="btn primary" id="btnPost" style="margin-left:auto">＋ 投稿する</button>
+        </div>
+        <p class="hint" id="fdHint"></p>
+        <div id="feedList"></div>
+        <div class="toolbar" style="justify-content:center"><button type="button" class="btn sm" id="fdMore" hidden>もっと見る</button></div>
+      </div>
+      <div id="fsub_dm" hidden>
+        <p class="hint">投稿者に「メッセージを送る」から、1対1でやり取りできます。迷惑な相手はブロックできます。</p>
+        <div id="dmList"></div>
+      </div>
+    </div>
+
     <!-- おすそわけ・お店 -->
     <div class="view" id="viewShare" hidden>
       <div id="shNoConf" hidden>
@@ -514,6 +561,12 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
         <button type="button" class="btn primary" id="btnProfile">同意して始める</button>
         <div class="status" id="profMsg"></div>
         <div class="shfoot"><span></span><button type="button" class="btn sm" data-logout>ログアウト</button></div>
+      </div>
+
+      <div id="shNotMember" hidden>
+        <div class="rules"><b>おすそわけ・お店向けの取引は、会員の機能です。</b><br>会員になると、釣果・航跡の記録、おすそわけ、写真やブログの投稿が使えます。<br>会員でなくても、「みんな」タブでの閲覧・いいね・コメント・メッセージは使えます。</div>
+        <p class="hint" id="nmInfo">会員の申し込み方法は準備中です。くわしくは管理者にお問い合わせください。</p>
+        <div class="shfoot"><span id="nmWho"></span><button type="button" class="btn sm" data-logout>ログアウト</button></div>
       </div>
 
       <div id="shBanned" hidden>
@@ -738,6 +791,7 @@ base["淡色地図"].addTo(map); seamark.addTo(map);
 const catchLayer = L.layerGroup().addTo(map);
 const trackLayer = L.layerGroup().addTo(map);
 const shareLayer = L.layerGroup();            // おすそわけ・お店の出品（そのタブを開いている間だけ表示）
+const postLayer = L.layerGroup();             // みんなの投稿の釣った位置（ログインした人だけ）
 /* ========== 水深（GEBCO 1度区画を必要な分だけ読み込む） ========== */
 const isoRenderer=L.canvas({padding:0.3});
 const isoGroup=L.layerGroup().addTo(map);
@@ -784,6 +838,27 @@ document.addEventListener("click",e=>{
 const isoNote=L.control({position:"bottomleft"});
 isoNote.onAdd=()=>{ const d=L.DomUtil.create("div"); d.id="isoNote"; d.style.cssText="background:rgba(255,255,255,.85);color:#16263a;font-size:11px;padding:2px 6px;border-radius:2px"; return d; };
 isoNote.addTo(map);
+/* 地図の隅に現在地の緯度・経度（押すとそこへ移動） */
+const here=L.control({position:"bottomleft"});
+here.onAdd=()=>{ const d=L.DomUtil.create("div","here-box"); d.id="hereBox"; d.textContent="現在地：取得中…"; d.title="押すと現在地へ移動";
+  L.DomEvent.disableClickPropagation(d); return d; };
+here.addTo(map);
+let hereWatch=null, hereFix=null, hereMarker=null;
+function hereStart(){
+  if(!navigator.geolocation){ $("hereBox").textContent="現在地：この端末では使えません"; return; }
+  if(hereWatch!=null) return;
+  hereWatch=navigator.geolocation.watchPosition(p=>{
+    const c=p.coords; hereFix={lat:c.latitude,lon:c.longitude,acc:c.accuracy};
+    lastGps={lat:c.latitude,lon:c.longitude,t:Date.now()};
+    $("hereBox").innerHTML=`<span class="mono">${toDM(c.latitude,"N","S")} ${toDM(c.longitude,"E","W")}</span> <small>±${Math.round(c.accuracy)}m</small>`;
+    if(!hereMarker) hereMarker=L.circleMarker([c.latitude,c.longitude],{radius:6,color:"#fff",weight:2,fillColor:"#1a73e8",fillOpacity:1,interactive:false}).addTo(map);
+    else hereMarker.setLatLng([c.latitude,c.longitude]);
+  },e=>{ $("hereBox").textContent = e.code===1 ? "現在地：位置情報が許可されていません" : "現在地：取得できません"; },
+  {enableHighAccuracy:true,maximumAge:10000,timeout:30000});
+}
+function hereStop(){ if(hereWatch!=null){ navigator.geolocation.clearWatch(hereWatch); hereWatch=null; } }
+document.addEventListener("visibilitychange",()=>{ document.visibilityState==="visible"?hereStart():hereStop(); });
+document.getElementById("hereBox").addEventListener("click",()=>{ if(hereFix) map.setView([hereFix.lat,hereFix.lon],Math.max(map.getZoom(),13)); });
 const note=t=>{ const el=document.getElementById("isoNote"); if(el){ el.textContent=t; el.hidden=!t; } };
 
 async function loadIndex(){
@@ -1015,7 +1090,7 @@ function render(){
 
 /* ========== タブとフォーム ========== */
 function showTab(which){
-  const views={list:"viewList",form:"viewForm",track:"viewTrack",share:"viewShare"}, tabs={list:"tabList",form:"tabForm",track:"tabTrack",share:"tabShare"};
+  const views={list:"viewList",form:"viewForm",track:"viewTrack",share:"viewShare",feed:"viewFeed"}, tabs={list:"tabList",form:"tabForm",track:"tabTrack",share:"tabShare",feed:"tabFeed"};
   for(const k in views){ $(views[k]).hidden = k!==which; $(tabs[k]).setAttribute("aria-selected", String(k===which)); }
   const form = which==="form";
   shPickEnd();
@@ -1026,6 +1101,7 @@ function showTab(which){
   if(which==="track") drawTrackList();
   if(which==="share"){ shareLayer.addTo(map); shOpen(); }
   else { map.removeLayer(shareLayer); clearPickup(); }
+  if(which==="feed"){ postLayer.addTo(map); feedOpen(); } else map.removeLayer(postLayer);
   if(isPhone()){                                      // 下の方を見ていたら、タブのすぐ下から表示する
     const top=$("panel").getBoundingClientRect().top+scrollY;
     if(scrollY>top) scrollTo({top});
@@ -1051,6 +1127,7 @@ $("tabList").onclick=()=>showTab("list");
 $("tabForm").onclick=()=>openForm(null);
 $("tabTrack").onclick=()=>showTab("track");
 $("tabShare").onclick=()=>showTab("share");
+$("tabFeed").onclick=()=>showTab("feed");
 $("btnNew").onclick=()=>openForm(null);
 $("btnCancel").onclick=()=>showTab("list");
 
@@ -1176,6 +1253,7 @@ function fillBaitList(){
 /* ---------- フォームを開く ---------- */
 function resetWx(){ $("wxSum").textContent="位置と日時が決まると自動で入ります"; status(""); lastWxKey=""; }
 function openForm(r, pos, carry){
+  if(!memberGate("釣果の記録")) return;
   $("form").reset(); photos=[]; photoDates=[]; resetWx(); autoStatus("");
   isNew = !r;
   $("f_id").value = r?.id || "";
@@ -1525,6 +1603,7 @@ function toGpx(ts,day){
 /* 記録：位置を受け取るたびに、10m以上動いたか30秒たったら1点追加。精度が悪い点は捨てる */
 let rec=null;
 async function startRec(resumeId){
+  if(!memberGate("航跡の記録")) return;
   if(!navigator.geolocation){ trkMsg("この端末では位置情報を使えません。","err"); return; }
   let t = resumeId ? tracks.find(x=>x.id===resumeId) : null;
   if(!t){
@@ -1691,7 +1770,32 @@ async function dataUrlToBlob(u){ return (await fetch(u)).blob(); }
 function setBusy(btn,on,text){ if(!btn) return; if(on){ btn.dataset.t=btn.textContent; btn.textContent=text||"処理中…"; btn.disabled=true; } else { btn.textContent=btn.dataset.t||btn.textContent; btn.disabled=false; } }
 
 /* ---------- 起動・ログイン ---------- */
-function shShow(which){ for(const id of ["shNoConf","shLogin","shProfile","shBanned","shMain"]) $(id).hidden = id!==which; }
+function shShow(which){ for(const id of ["shNoConf","shLogin","shProfile","shBanned","shNotMember","shMain"]) $(id).hidden = id!==which; updateAccountBtn(); }
+/* 会員か（決済を入れるまでは、管理者が会員の期限を設定する。サーバーの設定がない手元の試用では制限しない） */
+function isMember(){
+  if(!SB_URL||!SB_KEY) return true;
+  const p=SH.profile; if(!p||p.banned) return false;
+  return p.role==="admin" || (p.member_until && p.member_until>=todayStr());
+}
+const hasProfile = () => !!(SH.user && !SH.user.is_anonymous && SH.profile && !SH.profile.banned);
+function updateAccountBtn(){
+  const b=$("btnAccount"); if(!b) return;
+  if(!SB_URL||!SB_KEY){ b.hidden=true; return; }
+  b.textContent = hasProfile() ? `${SH.profile.nickname}${isMember()?"":"（無料）"}` : "ログイン";
+}
+$("btnAccount").onclick=()=>showTab("share");
+/* 会員の機能を使おうとしたとき */
+function memberGate(what){
+  if(isMember()) return true;
+  const logged=hasProfile();
+  const b=openDlg(`${what}は会員の機能です`,`<p>釣果・航跡の記録、おすそわけ、写真やブログの投稿は、会員の方が使えます。</p>
+    <p class="hint">${logged?"会員の申し込み方法は準備中です。くわしくは管理者にお問い合わせください。":"会員の方は、ログインしてください。"}</p>
+    <p class="hint">これまでにこの端末で記録した釣果は、会員でなくても「釣果一覧」で見られ、バックアップもできます。</p>
+    <div class="actions">${logged?"":`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
+  b.querySelector("#gtClose").onclick=()=>$("dlg").close();
+  b.querySelector("#gtLogin")?.addEventListener("click",()=>{ $("dlg").close(); showTab("share"); });
+  return false;
+}
 async function shStart(){
   if(SH.started) return; SH.started=true;
   if(!SB_URL||!SB_KEY){ shShow("shNoConf"); return; }
@@ -1708,12 +1812,17 @@ async function shRefreshMe(){
   const {data:{session}} = await SH.sb.auth.getSession();
   SH.user = session?.user || null;
   if(SH.user) shSyncAll();
-  if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; shShow("shLogin"); setBadge(0); shPollStop(); shareLayer.clearLayers(); return; }
-  const {data:p,error} = await SH.sb.from("profiles").select("*").eq("id",SH.user.id).maybeSingle();
-  if(error){ shShow("shLogin"); shMsg("loginMsg",shErr(error),"err"); return; }
+  if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; shShow("shLogin"); setBadge(0); shPollStop(); feedPollStop(); shareLayer.clearLayers(); return; }
+  let {data:p,error} = await SH.sb.from("profiles").select("*").eq("id",SH.user.id).maybeSingle();
+  if(error){                                       // 海の上など電波がないときは、前回の内容で続ける
+    try{ const c=JSON.parse(lsGet("choka-profile")||"null"); if(c&&c.id===SH.user.id){ p=c; error=null; } }catch{}
+    if(error){ shShow("shLogin"); shMsg("loginMsg",shErr(error),"err"); return; }
+  } else lsSet("choka-profile", p?JSON.stringify(p):null);
   SH.profile=p;
   if(!p){ shShow("shProfile"); return; }
   if(p.banned){ shShow("shBanned"); shPollStop(); return; }
+  feedPollStart();
+  if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
   SH.shop=s||null;
   shShow("shMain");
@@ -1723,7 +1832,7 @@ async function shRefreshMe(){
   if(!$("viewShare").hidden) shSub(SH.sub);
   shPollStart();
 }
-function shOpen(){ if(!SH.started) shStart(); else if(SH.user && !SH.user.is_anonymous && SH.profile && !SH.profile.banned) shSub(SH.sub); }
+function shOpen(){ if(!SH.started) shStart(); else if(hasProfile() && isMember()) shSub(SH.sub); }
 
 $("btnMail").onclick=async()=>{
   const email=$("shEmail").value.trim();
@@ -1754,7 +1863,7 @@ $("btnProfile").onclick=async()=>{
 };
 document.addEventListener("click",async e=>{
   if(!e.target.closest("[data-logout]")) return;
-  await SH.sb?.auth.signOut(); SH.cache.clear(); SH.deals.clear(); await shRefreshMe();
+  await SH.sb?.auth.signOut(); SH.cache.clear(); SH.deals.clear(); lsSet("choka-profile",null); await shRefreshMe();
 });
 
 /* ---------- サブ画面の切り替え ---------- */
@@ -2467,18 +2576,321 @@ function shShop(){
   };
 }
 
+/* =====================================================================
+   みんな：写真・ブログの投稿、いいね、コメント、メッセージ
+   ・見るだけならログイン不要（釣った位置はログインした人だけ）
+   ・投稿は会員、いいね・コメント・メッセージはログインして表示名を登録した人なら誰でも
+   ===================================================================== */
+const FD={filter:"all", page:0, list:[], fsub:"posts", pollT:null, dmT:null};
+const POST_REASONS=["釣り場や個人の情報が書かれている","不適切な写真・言葉","他人の写真・うその内容","宣伝・迷惑行為","その他"];
+const postUrl = p => p ? SH.sb.storage.from("posts").getPublicUrl(p).data.publicUrl : "";
+function feedOpen(){
+  if(!SB_URL||!SB_KEY){ $("feedList").innerHTML=`<div class="empty">「みんな」を使うには、サーバー（Supabase）の設定が必要です。</div>`; $("btnPost").hidden=true; return; }
+  if(!SH.started){ shStart().then(feedOpen); return; }
+  $("fdMine").hidden=!hasProfile();
+  $("btnPost").hidden=false;
+  $("fdHint").textContent = hasProfile() ? "" : "見るだけならログインは不要です。いいね・コメント・メッセージは、ログインして表示名を登録すると使えます。釣った位置はログインした人だけに表示されます。";
+  feedSub(FD.fsub);
+}
+$("fdSubs").addEventListener("click",e=>{ const b=e.target.closest("button[data-fsub]"); if(b) feedSub(b.dataset.fsub); });
+function feedSub(n){
+  if(n==="dm" && !hasProfile()){ needProfile("メッセージ"); n="posts"; }
+  FD.fsub=n;
+  document.querySelectorAll("#fdSubs button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.fsub===n)));
+  $("fsub_posts").hidden=n!=="posts"; $("fsub_dm").hidden=n!=="dm";
+  n==="posts" ? feedLoad(true) : dmList();
+}
+function needProfile(what){
+  const b=openDlg(`${what}にはログインが必要です`,`<p>${what}は、ログインして表示名を登録すると使えます（無料）。</p>
+    <div class="actions"><button type="button" class="btn" id="npClose">閉じる</button><button type="button" class="btn primary" id="npGo">ログインする</button></div>`);
+  b.querySelector("#npClose").onclick=()=>$("dlg").close();
+  b.querySelector("#npGo").onclick=()=>{ $("dlg").close(); showTab("share"); };
+  return false;
+}
+$("fdKinds").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return; FD.filter=b.dataset.k; feedLoad(true); });
+$("fdMore").onclick=()=>feedLoad(false);
+async function feedLoad(reset){
+  if(reset){ FD.page=0; FD.list=[]; $("feedList").innerHTML=`<div class="empty">読み込み中…</div>`; }
+  $("fdKinds").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.k===FD.filter)));
+  const N=20;
+  let q=SH.sb.from("post_cards").select("*").order("created_at",{ascending:false}).range(FD.page*N,FD.page*N+N-1);
+  if(FD.filter==="photo"||FD.filter==="blog") q=q.eq("kind",FD.filter);
+  if(FD.filter==="mine") q=q.eq("mine",true); else q=q.eq("status","public");
+  const {data,error}=await q;
+  if(error){ $("feedList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  FD.list=FD.list.concat(data); FD.page++;
+  $("fdMore").hidden=data.length<N;
+  $("feedList").innerHTML = FD.list.length ? FD.list.map(postCard).join("") : `<div class="empty">${FD.filter==="mine"?"まだ投稿していません。":"まだ投稿がありません。"}</div>`;
+  drawPostMarkers();
+}
+function postCard(p){
+  const u=postUrl(p.photos?.[0]);
+  const title=p.kind==="blog"?p.title:[p.species,p.size_cm?`${p.size_cm}cm`:""].filter(Boolean).join(" ")||"写真";
+  return `<div class="card post" data-pid="${p.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
+    <div><div class="t"><span class="kind ${p.kind==="blog"?"shop":"gift"}">${p.kind==="blog"?"ブログ":"写真"}</span><span class="ttl">${esc(title)}</span>${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
+    ${p.body?`<div class="ex">${esc(p.body)}</div>`:""}
+    <div class="meta"><span>${esc(p.owner_name)}</span>${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
+}
+function drawPostMarkers(){
+  postLayer.clearLayers();
+  for(const p of FD.list) if(p.lat!=null && p.status==="public"){
+    L.circleMarker([p.lat,p.lon],{radius:7,color:"#fff",weight:2,fillColor:"#d6336c",fillOpacity:.9})
+      .bindTooltip(esc(p.kind==="blog"?p.title:(p.species||"写真")),{direction:"top"}).on("click",()=>postDetail(p.id)).addTo(postLayer);
+  }
+}
+$("feedList").addEventListener("click",e=>{ const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid); });
+$("feedList").addEventListener("keydown",e=>{ if(e.key==="Enter"){ const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid); } });
+
+async function postDetail(id){
+  const [{data:p},{data:cs}]=await Promise.all([
+    SH.sb.from("post_cards").select("*").eq("id",id).maybeSingle(),
+    SH.sb.from("comment_cards").select("*").eq("post_id",id).order("id")]);
+  if(!p){ openDlg("投稿","<p>この投稿は見られなくなりました。</p>"); return; }
+  const logged=hasProfile(), isAdmin=SH.profile?.role==="admin";
+  const facts=[["魚種",p.species],["大きさ",p.size_cm?`${p.size_cm}cm`:""],["匹数",p.count?`${p.count}匹`:""],["釣法",p.method],["締め方",p.shime],
+    ["釣った日",p.caught_at?fmtJ(p.caught_at):""],["場所",p.place],
+    ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?"ログインすると見られます":"")]].filter(x=>x[1]);
+  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${esc(c.user_name)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
+     <span class="ops">${c.mine||c.on_my_post||isAdmin?`<button type="button" class="btn sm" data-a="cdel">消す</button>`:""}${logged&&!c.mine?`<button type="button" class="btn sm" data-a="crep">通報</button>`:""}</span></div>`).join("");
+  const b=openDlg(p.kind==="blog"?p.title:(p.species||"写真"),
+    `${(p.photos||[]).length?`<div class="gal">${p.photos.map(x=>`<img src="${esc(postUrl(x))}" alt="">`).join("")}</div>`:""}
+     <div class="hint">${esc(p.owner_name)}・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</div>
+     ${p.body?`<div class="pbody">${esc(p.body)}</div>`:""}
+     ${facts.length?`<table class="kv">${facts.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>`:""}
+     <div class="toolbar" style="margin-top:10px">
+       <button type="button" class="btn likebtn" id="pdLike" aria-pressed="${p.liked}">♥ いいね ${p.like_count}</button>
+       ${p.lat!=null?`<button type="button" class="btn sm" id="pdMap">地図で見る</button>`:""}
+       ${!p.mine&&logged?`<button type="button" class="btn sm" id="pdDm">メッセージを送る</button>`:""}
+       ${!p.mine&&logged?`<button type="button" class="btn sm danger" id="pdRep">通報</button>`:""}
+     </div>
+     ${p.mine?`<div class="toolbar"><button type="button" class="btn sm" id="pdEdit">編集</button><button type="button" class="btn sm" id="pdCmtTgl">${p.allow_comments?"コメントを受け付けない":"コメントを受け付ける"}</button><button type="button" class="btn sm danger" id="pdDel">投稿を消す</button></div>`:""}
+     ${isAdmin&&!p.mine&&p.status==="public"?`<div class="toolbar"><button type="button" class="btn sm danger" id="pdRemove">管理者として削除</button></div>`:""}
+     <div class="sec-h">コメント${p.allow_comments?`（${(cs||[]).length}）`:""}</div>
+     ${p.allow_comments?(cmts||`<p class="hint">まだコメントはありません。</p>`):`<p class="hint">この投稿はコメントを受け付けていません。</p>${cmts}`}
+     ${p.allow_comments&&p.status==="public"?(logged?`<div class="row" style="margin-top:8px"><label>コメント<input id="pdCmt" maxlength="500" placeholder="ひとことどうぞ"></label><button type="button" class="btn primary" id="pdCmtSend">送る</button></div>`:`<p class="hint">コメントするにはログインしてください。</p>`):""}
+     <div class="status" id="pdStat"></div>`);
+  const st=(m,c)=>shMsg("pdStat",m,c);
+  b.querySelector("#pdLike").onclick=async e=>{
+    if(!hasProfile()) return needProfile("いいね");
+    const on=e.target.getAttribute("aria-pressed")!=="true";
+    const {error}= on ? await SH.sb.from("post_likes").insert({post_id:id,user_id:SH.user.id})
+                      : await SH.sb.from("post_likes").delete().eq("post_id",id).eq("user_id",SH.user.id);
+    if(error && !/duplicate/i.test(error.message)) return st(shErr(error),"err");
+    p.like_count=Math.max(0,p.like_count+(on?1:-1)); p.liked=on;
+    e.target.setAttribute("aria-pressed",String(on)); e.target.textContent=`♥ いいね ${p.like_count}`;
+    const c=FD.list.find(x=>x.id===id); if(c){ c.like_count=p.like_count; c.liked=on; }
+  };
+  b.querySelector("#pdMap")?.addEventListener("click",()=>{ $("dlg").close(); map.flyTo([p.lat,p.lon],13,{duration:.6}); if(isPhone()) $("map").scrollIntoView({block:"start"}); });
+  b.querySelector("#pdDm")?.addEventListener("click",async()=>{
+    const {data:tid,error}=await SH.sb.rpc("dm_open_post",{p_post:id});
+    if(error) return st(shErr(error),"err");
+    dmThread(tid, p.owner_name);
+  });
+  b.querySelector("#pdRep")?.addEventListener("click",()=>postReport(id,null,p));
+  b.querySelector("#pdCmtSend")?.addEventListener("click",async e=>{
+    const body=$("pdCmt").value.trim(); if(!body) return;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("post_comments").insert({post_id:id,user_id:SH.user.id,body});
+    setBusy(e.target,false);
+    if(error) return st(shErr(error),"err");
+    postDetail(id);
+  });
+  b.querySelectorAll(".cmt button").forEach(x=>x.onclick=async()=>{
+    const cid=+x.closest("[data-cid]").dataset.cid;
+    if(x.dataset.a==="crep") return postReport(id,cid,p);
+    if(!x.dataset.armed){ x.dataset.armed="1"; x.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("post_comments").delete().eq("id",cid);
+    if(error) return st(shErr(error),"err");
+    postDetail(id);
+  });
+  b.querySelector("#pdCmtTgl")?.addEventListener("click",async()=>{
+    const {error}=await SH.sb.from("posts").update({allow_comments:!p.allow_comments}).eq("id",id);
+    if(error) return st(shErr(error),"err");
+    await postDetail(id); feedLoad(true);
+  });
+  b.querySelector("#pdEdit")?.addEventListener("click",()=>postEdit(p));
+  b.querySelector("#pdDel")?.addEventListener("click",async e=>{
+    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("posts").delete().eq("id",id);
+    if(error) return st(shErr(error),"err");
+    if(p.photos?.length) SH.sb.storage.from("posts").remove(p.photos);
+    $("dlg").close(); feedLoad(true);
+  });
+  b.querySelector("#pdRemove")?.addEventListener("click",async e=>{
+    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと削除"; return; }
+    const {error}=await SH.sb.from("posts").update({status:"removed"}).eq("id",id);
+    if(error) return st(shErr(error),"err");
+    $("dlg").close(); feedLoad(true);
+  });
+}
+function postReport(pid,cid,p){
+  const b=openDlg(cid?"コメントを通報":"投稿を通報",`<label>理由<select id="prReason">${POST_REASONS.map(r=>`<option>${r}</option>`).join("")}</select></label>
+    <label style="margin-top:8px">くわしく（任意）<textarea id="prDetail" maxlength="400"></textarea></label>
+    <p class="hint">通報は管理者だけが見ます。</p>
+    <div class="actions"><button type="button" class="btn" id="prBack">戻る</button><button type="button" class="btn primary" id="prSend">通報する</button></div><div class="status" id="prStat"></div>`);
+  b.querySelector("#prBack").onclick=()=>postDetail(pid);
+  b.querySelector("#prSend").onclick=async()=>{
+    const {error}=await SH.sb.from("post_reports").insert({post_id:pid,comment_id:cid,reporter:SH.user.id,reason:$("prReason").value,detail:$("prDetail").value.trim()||null});
+    if(error) return shMsg("prStat",shErr(error),"err");
+    shMsg("prStat","通報しました。ご協力ありがとうございます","ok");
+  };
+}
+function postEdit(p){
+  const b=openDlg("投稿を編集",`<p class="hint">写真・魚種・位置は変えられません。変えたいときは、消して投稿し直してください。</p>
+    ${p.kind==="blog"?`<label>タイトル<input id="peTitle" maxlength="80" value="${esc(p.title||"")}"></label>`:""}
+    <label style="margin-top:8px">本文<textarea id="peBody" maxlength="5000" rows="6">${esc(p.body||"")}</textarea></label>
+    <label style="margin-top:8px">場所（大まかに。誰でも見られます）<input id="pePlace" maxlength="40" value="${esc(p.place||"")}"></label>
+    <div class="actions"><button type="button" class="btn" id="peBack">戻る</button><button type="button" class="btn primary" id="peSave">保存</button></div><div class="status" id="peStat"></div>`);
+  b.querySelector("#peBack").onclick=()=>postDetail(p.id);
+  b.querySelector("#peSave").onclick=async()=>{
+    const patch={body:$("peBody").value.trim()||null,place:$("pePlace").value.trim()||null};
+    if(p.kind==="blog"){ patch.title=$("peTitle").value.trim(); if(!patch.title) return shMsg("peStat","タイトルを入れてください","err"); }
+    const {error}=await SH.sb.from("posts").update(patch).eq("id",p.id);
+    if(error) return shMsg("peStat",shErr(error),"err");
+    await postDetail(p.id); feedLoad(true);
+  };
+}
+
+/* 投稿する（会員） */
+$("btnPost").onclick=()=>{ if(!hasProfile()) return memberGate("投稿"); if(!memberGate("投稿")) return; postForm(); };
+function postForm(){
+  const P={photos:[], rec:null};
+  const recs=records.filter(r=>!r.sample).sort((a,b)=>b.datetime.localeCompare(a.datetime)).slice(0,50);
+  const b=openDlg("投稿する",`<div class="chips sq" id="pfK"><button type="button" class="chip" data-k="photo" aria-pressed="true">写真</button><button type="button" class="chip" data-k="blog" aria-pressed="false">ブログ</button></div>
+    <label style="margin-top:8px">釣果の記録から（任意。魚種・大きさ・写真などが入ります）<select id="pfRec"><option value="">選ばない</option>${recs.map(r=>`<option value="${esc(r.id)}">${esc(fmtDT(r.datetime))} ${esc(r.species)}${r.count?` ${r.count}匹`:""}</option>`).join("")}</select></label>
+    <label class="hidden-blog" style="margin-top:8px" hidden>タイトル<input id="pfTitle" maxlength="80" placeholder="例：ブリしゃぶの作り方"></label>
+    <label style="margin-top:8px">本文<textarea id="pfBody" maxlength="5000" rows="5" placeholder="釣れたときの様子や、料理のことなど"></textarea></label>
+    <div class="thumbs" id="pfThumbs"></div>
+    <label class="btn sm" style="flex-direction:row;color:var(--ink);width:max-content">写真を追加（6枚まで）<input type="file" id="pfFiles" accept="image/*" multiple hidden></label>
+    <label style="margin-top:8px">場所（大まかに。誰でも見られます）<input id="pfPlace" maxlength="40" placeholder="例：氷見沖、富山湾"></label>
+    <div class="checks">
+      <label id="pfPosL" hidden><input type="checkbox" id="pfPos">釣った位置を載せる（ログインした人だけに見えます）</label>
+      <label><input type="checkbox" id="pfCmt" checked>コメントを受け付ける</label>
+    </div>
+    <p class="hint">写真の撮影場所などの情報は、縮小するときに消えます。人の顔や他人の写真を載せるときは、許可を取ってください。</p>
+    <div class="actions"><button type="button" class="btn" id="pfBack2">やめる</button><button type="button" class="btn primary" id="pfSend">投稿する</button></div>
+    <div class="status" id="pfStat2"></div>`);
+  let kind="photo";
+  const drawThumbs=()=>{ $("pfThumbs").innerHTML=P.photos.map((u,i)=>`<figure><img src="${u}" alt=""><button type="button" data-i="${i}" aria-label="外す">×</button></figure>`).join("");
+    $("pfThumbs").querySelectorAll("button").forEach(x=>x.onclick=()=>{ P.photos.splice(+x.dataset.i,1); drawThumbs(); }); };
+  b.querySelector("#pfK").onclick=e=>{ const c=e.target.closest(".chip"); if(!c) return; kind=c.dataset.k;
+    b.querySelectorAll("#pfK .chip").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.k===kind))); b.querySelector(".hidden-blog").hidden=kind!=="blog"; };
+  b.querySelector("#pfRec").onchange=e=>{
+    P.rec=records.find(r=>r.id===e.target.value)||null;
+    $("pfPosL").hidden=!P.rec;
+    if(P.rec){ P.photos=(P.rec.photos||[]).slice(0,6); if(!$("pfPlace").value&&P.rec.spot) $("pfPlace").value=P.rec.spot; }
+    drawThumbs();
+  };
+  b.querySelector("#pfFiles").onchange=async e=>{
+    for(const f of [...e.target.files]){ if(P.photos.length>=6) break; try{ P.photos.push(await shrink(f,1280)); }catch{ shMsg("pfStat2",`${f.name} を読み込めませんでした（HEIC形式はJPEGに変換してください）`,"err"); } }
+    e.target.value=""; drawThumbs();
+  };
+  b.querySelector("#pfBack2").onclick=()=>$("dlg").close();
+  b.querySelector("#pfSend").onclick=async e=>{
+    const title=$("pfTitle").value.trim(), body=$("pfBody").value.trim();
+    if(kind==="blog"&&!title) return shMsg("pfStat2","タイトルを入れてください","err");
+    if(kind==="photo"&&!P.photos.length) return shMsg("pfStat2","写真を1枚以上つけてください","err");
+    if(!body&&!P.photos.length) return shMsg("pfStat2","本文か写真を入れてください","err");
+    setBusy(e.target,true,"写真を送信中…");
+    const base=`${SH.user.id}/${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, paths=[];
+    try{
+      for(let i=0;i<P.photos.length;i++){
+        const path=`${base}-${i}.jpg`;
+        const {error}=await SH.sb.storage.from("posts").upload(path,await dataUrlToBlob(P.photos[i]),{contentType:"image/jpeg",upsert:false});
+        if(error) throw error; paths.push(path);
+      }
+      e.target.textContent="投稿中…";
+      const r=P.rec, pos=r&&$("pfPos").checked;
+      const row={owner:SH.user.id,kind,title:kind==="blog"?title:null,body:body||null,photos:paths,
+        size_cm:r?.length||null,count:r?.count||null,method:r?.method?String(r.method).slice(0,40):null,shime:r?.shime?String(r.shime).slice(0,40):null,species:r?.species?String(r.species).slice(0,40):null,
+        caught_at:r?new Date(r.datetime+":00+09:00").toISOString():null,place:$("pfPlace").value.trim()||null,
+        lat:pos?r.lat:null,lon:pos?r.lon:null,allow_comments:$("pfCmt").checked};
+      const {error}=await SH.sb.from("posts").insert(row);
+      if(error) throw error;
+      $("dlg").close(); FD.filter="all"; feedLoad(true);
+    }catch(err){
+      if(paths.length) SH.sb.storage.from("posts").remove(paths);
+      shMsg("pfStat2",shErr(err),"err");
+    }finally{ setBusy(e.target,false); }
+  };
+}
+
+/* メッセージ */
+function dmSeen(){ try{ return JSON.parse(localStorage.getItem("choka-dmseen")||"{}"); }catch{ return {}; } }
+function dmMark(id,iso){ if(!iso) return; const m=dmSeen(); if(!m[id]||m[id]<iso){ m[id]=iso; try{ localStorage.setItem("choka-dmseen",JSON.stringify(m)); }catch{} } }
+const dmUnread = (t,seen) => t.last_in_at && (!seen[t.id] || seen[t.id] < t.last_in_at);
+async function dmList(){
+  const {data,error}=await SH.sb.from("dm_cards").select("*").order("last_at",{ascending:false}).limit(100);
+  if(error){ $("dmList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  const seen=dmSeen();
+  $("dmList").innerHTML = data.length ? data.map(t=>`<div class="card dmrow" data-tid="${t.id}" data-name="${esc(t.other_name)}" tabindex="0" role="button"><div>
+      <div class="t"><span class="sp">${esc(t.other_name)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
+      <div class="facts"><span>${esc(t.last_body||"（まだメッセージはありません）")}</span></div></div></div>`).join("")
+    : `<div class="empty">まだメッセージはありません。<br>投稿を開いて「メッセージを送る」から始められます。</div>`;
+  feedBadge(data);
+}
+$("dmList").addEventListener("click",e=>{ const c=e.target.closest("[data-tid]"); if(c) dmThread(c.dataset.tid,c.dataset.name); });
+async function dmThread(tid,name){
+  const b=openDlg(`${name}さんとのメッセージ`,`<div class="thread" id="dmThr"></div>
+    <div class="row"><label>メッセージ<textarea id="dmIn" maxlength="1000" rows="2"></textarea></label><button type="button" class="btn primary" id="dmSend">送る</button></div>
+    <div class="toolbar" style="justify-content:flex-end"><button type="button" class="btn sm danger" id="dmBlock">ブロック</button></div>
+    <p class="hint">電話番号や住所を書くときは、相手をよく確かめてください。迷惑な相手はブロックすると、お互いにメッセージを送れなくなります。</p>
+    <div class="status" id="dmStat"></div>`);
+  let blockedByMe=false;
+  const load=async()=>{
+    const [{data:ms},{data:t}]=await Promise.all([
+      SH.sb.from("dm_messages").select("*").eq("thread_id",tid).order("id"),
+      SH.sb.from("dm_cards").select("*").eq("id",tid).maybeSingle()]);
+    const box=$("dmThr"); if(!box) return;
+    box.innerHTML=(ms||[]).map(m=>`<div class="msg ${m.sender===SH.user.id?"me":""}">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`).join("")||`<p class="hint">最初のメッセージを送ってください。</p>`;
+    box.scrollTop=box.scrollHeight;
+    if(t){ blockedByMe=t.i_blocked; $("dmBlock").textContent=t.i_blocked?"ブロックを解除":"ブロック";
+      $("dmSend").disabled=t.blocked; if(t.blocked) shMsg("dmStat",t.i_blocked?"この相手をブロックしています":"この相手とはメッセージをやり取りできません","err"); }
+    dmMark(tid,(ms||[]).filter(m=>m.sender!==SH.user.id).at(-1)?.created_at);
+  };
+  await load(); clearInterval(FD.dmT); FD.dmT=setInterval(()=>{ if($("dlg").open && $("dmThr")) load(); else clearInterval(FD.dmT); },10000);
+  b.querySelector("#dmSend").onclick=async e=>{
+    const body=$("dmIn").value.trim(); if(!body) return;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("dm_messages").insert({thread_id:tid,sender:SH.user.id,body});
+    setBusy(e.target,false);
+    if(error) return shMsg("dmStat",shErr(error),"err");
+    $("dmIn").value=""; load();
+  };
+  b.querySelector("#dmBlock").onclick=async e=>{
+    if(!blockedByMe && !e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すとブロック"; return; }
+    const {error}=await SH.sb.rpc("dm_block",{p_thread:tid,p_on:!blockedByMe});
+    if(error) return shMsg("dmStat",shErr(error),"err");
+    delete e.target.dataset.armed; shMsg("dmStat",""); load();
+  };
+}
+function feedBadge(threads){
+  const seen=dmSeen(), n=(threads||[]).filter(t=>dmUnread(t,seen)).length;
+  for(const id of ["feedBadge","dmBadge"]){ $(id).hidden=!n; $(id).textContent=n||""; }
+}
+async function feedPoll(){
+  if(!hasProfile()||document.visibilityState!=="visible") return;
+  const {data}=await SH.sb.from("dm_cards").select("id,last_in_at").limit(200);
+  if(data) feedBadge(data);
+}
+function feedPollStart(){ feedPollStop(); feedPoll(); FD.pollT=setInterval(feedPoll,60000); }
+function feedPollStop(){ clearInterval(FD.pollT); FD.pollT=null; feedBadge([]); }
+
 /* ---------- 管理（管理者だけ） ---------- */
 async function shAdmin(){
   const box=$("adminBox");
   if(SH.profile?.role!=="admin"){ box.innerHTML=""; return; }
   box.innerHTML=`<div class="empty">読み込み中…</div>`;
-  const [sh,rp,stq,dq,scq,rtq]=await Promise.all([
+  const [sh,rp,stq,dq,scq,rtq,ucq,prq]=await Promise.all([
     SH.sb.from("shop_cards").select("*").order("created_at",{ascending:false}),
     SH.sb.from("report_cards").select("*").eq("status","open").order("created_at",{ascending:false}),
     SH.sb.rpc("admin_stats"),
     SH.sb.from("request_cards").select("*").order("updated_at",{ascending:false}).limit(30),
     SH.sb.from("shared_catch_cards").select("*").order("caught_at",{ascending:false}).limit(300),
-    SH.sb.from("rating_cards").select("*").order("created_at",{ascending:false}).limit(30)]);
+    SH.sb.from("rating_cards").select("*").order("created_at",{ascending:false}).limit(30),
+    SH.sb.from("user_cards").select("*").order("created_at",{ascending:false}).limit(500),
+    SH.sb.from("post_report_cards").select("*").eq("status","open").order("created_at",{ascending:false})]);
+  SH.users=ucq?.data||[]; SH.preports=prq?.data||[];
   SH.ratings=rtq?.data||[];
   const shops=sh.data||[], reports=rp.data||[], deals=dq.data||[];
   SH.shared=scq.data||[];
@@ -2509,6 +2921,17 @@ async function shAdmin(){
       <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span><span class="st">${{pending:"返事待ち",accepted:"受け渡し待ち",done:"受け渡し済み",declined:"見送り",cancelled:"取り消し"}[d.status]||d.status}</span></div>
       <div class="facts"><span>出品 ${esc(d.owner_name)}</span><span>申込 ${esc(d.shop_name||d.requester_name)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.updated_at)}</span></div>
       <div class="ops"><button type="button" class="btn sm" data-a="athread">メッセージを見る（${d.msg_count}）</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">利用者と会員（会員 ${SH.users.filter(u=>u.role==="admin"||(u.member_until&&u.member_until>=todayStr())).length}人／${SH.users.length}人）</div>
+    <p class="hint">決済の仕組みを入れるまでは、ここで会員にします。会員は、釣果・航跡の記録、おすそわけ、投稿が使えます。</p>
+    <input type="search" id="usrQ" placeholder="表示名・メールアドレスで絞り込み" style="margin-bottom:6px">
+    <div id="usrList">${usersHtml("")}</div>
+    <div class="sec-h">投稿の通報（未対応 ${SH.preports.length}件）</div>
+    ${SH.preports.length?SH.preports.map(r=>`<div class="card deal" data-prep="${r.id}" data-pid="${r.post_id}" data-cid="${r.comment_id??""}"><div>
+      <div class="t"><span class="sp">${esc(r.post_title||"（本文なし）")}</span><span class="st hot">${esc(r.reason)}</span></div>
+      <div class="facts"><span>投稿者 ${esc(r.owner_name)}</span><span>通報者 ${esc(r.reporter_name)}</span><span>${fmtJ(r.created_at)}</span></div>
+      ${r.comment_body?`<div class="facts"><span>コメント（${esc(r.comment_user)}）：「${esc(r.comment_body)}」</span></div>`:""}
+      ${r.detail?`<div class="facts"><span>「${esc(r.detail)}」</span></div>`:""}
+      <div class="ops"><button type="button" class="btn sm" data-a="pview">投稿を見る</button>${r.comment_id?`<button type="button" class="btn sm danger" data-a="pcdel">コメントを消す</button>`:`<button type="button" class="btn sm danger" data-a="pdel">投稿を削除</button>`}<button type="button" class="btn sm" data-a="pclose">対応済みにする</button></div></div></div>`).join(""):`<div class="empty">未対応の通報はありません。</div>`}
     <div class="sec-h">最近の評価</div>
     ${(SH.ratings||[]).length?SH.ratings.map(g=>`<div class="card deal" data-rating="${g.id}"><div>
       <div class="t"><span class="sp">${esc(g.ratee_name)}</span><span class="st">${g.ratee_is_owner?"出品者として":"申込者として"}</span><span>★${((g.s1+g.s2+g.s3)/3).toFixed(1)}（${g.s1}・${g.s2}・${g.s3}）</span></div>
@@ -2536,6 +2959,8 @@ function statsHtml(S,err){
       ${tile(S.users,`利用者（7日で+${S.users_7d}）`)}${tile(S.signins_7d,"7日以内にログイン")}${tile(S.active_30d,"30日以内に出品・申込・連絡")}
       ${tile(pre("gift_"),"おすそわけの出品")}${tile(pre("shop_"),"お店向けの出品")}${tile((Ls.gift_done||0)+(Ls.shop_done||0),"受け渡し済み")}
       ${tile(sum(S.requests),"申し込み")}${tile(S.messages,"メッセージ")}${tile(sum(S.shops),`お店（承認${(S.shops||{}).approved||0}）`)}
+      ${tile(S.members??0,"会員")}${tile(`${S.posts??0}（7日で${S.posts_7d??0}）`,"みんなの投稿")}${tile(`♥${S.likes??0}・💬${S.comments??0}`,"いいね・コメント")}
+      ${tile(S.dms??0,"メッセージ")}${tile(S.post_reports_open??0,"未対応の投稿の通報")}
       ${tile(S.wants_open??0,"受付中の買い取り希望")}${tile(S.ratings??0,"評価")}${tile(Object.values(S.cancels||{}).reduce((a,n)=>a+n,0),"理由つきの取り消し")}
       ${tile(`${S.sharing_devices}台`,`釣果を提供中の端末（${S.shared_catches}件・7日で${S.shared_7d}件）`)}${tile(S.reports_open,"未対応の通報")}${tile(S.banned,"利用停止中")}
     </div>
@@ -2588,12 +3013,46 @@ async function sharedCsv(who){
   download(`提供された釣果_${stamp()}.csv`,"\ufeff"+lines.join("\r\n"),"text/csv");
 }
 $("adminBox").addEventListener("change",e=>{ if(e.target.id==="scWho") $("scList").innerHTML=sharedRows(e.target.value); });
+$("adminBox").addEventListener("input",e=>{ if(e.target.id==="usrQ") $("usrList").innerHTML=usersHtml(e.target.value.trim()); });
+function usersHtml(q){
+  const rows=(SH.users||[]).filter(u=>!q||(u.nickname+" "+(u.email||"")).includes(q));
+  return rows.slice(0,50).map(u=>{
+    const mem=u.role==="admin"||(u.member_until&&u.member_until>=todayStr());
+    return `<div class="card deal" data-uid="${u.id}"><div>
+      <div class="t"><span class="sp">${esc(u.nickname)}</span><span class="st ${mem?"good":""}">${u.role==="admin"?"管理者":mem?`会員（${u.member_until.replace(/-/g,"/")}まで）`:u.member_until?"会員の期限切れ":"無料"}</span>${u.banned?'<span class="st hot">停止中</span>':""}</div>
+      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span></div>
+      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
+    + (rows.length>50?`<p class="hint">ほか${rows.length-50}人（絞り込んでください）</p>`:"") || `<div class="empty">該当する利用者はいません。</div>`;
+}
 $("adminBox").addEventListener("click",async e=>{
   const b=e.target.closest("button"); if(!b) return;
   const who=$("scWho")?.value||"";
   if(b.dataset.a==="scmap"){ drawSharedMap(who); return; }
   if(b.dataset.a==="sccsv"){ sharedCsv(who); return; }
   if(b.dataset.a==="athread"){ shThread(b.closest("[data-adeal]").dataset.adeal); return; }
+  const prep=b.closest("[data-prep]");
+  if(prep){
+    const a=b.dataset.a;
+    if(a==="pview"){ postDetail(prep.dataset.pid); return; }
+    if((a==="pdel"||a==="pcdel") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと消す"; return; }
+    const {error}= a==="pdel" ? await SH.sb.from("posts").update({status:"removed"}).eq("id",prep.dataset.pid)
+                 : a==="pcdel" ? await SH.sb.from("post_comments").delete().eq("id",+prep.dataset.cid)
+                 : await SH.sb.from("post_reports").update({status:"closed"}).eq("id",+prep.dataset.prep);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    if(a!=="pclose") await SH.sb.from("post_reports").update({status:"closed"}).eq("id",+prep.dataset.prep);
+    shAdmin(); return;
+  }
+  const usr=b.closest("[data-uid]");
+  if(usr){
+    const a=b.dataset.a, d=new Date(Date.now()+365*86400000);
+    const patch = a==="m1y" ? {member_until:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`}
+                : a==="m0" ? {member_until:null} : a==="ban" ? {banned:true} : a==="unban" ? {banned:false} : null;
+    if(!patch) return;
+    if((a==="m0"||a==="ban") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
+    const {error}=await SH.sb.from("profiles").update(patch).eq("id",usr.dataset.uid);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    shAdmin(); return;
+  }
   if(b.dataset.a==="rdel"){
     if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと消す"; return; }
     const {error}=await SH.sb.from("ratings").delete().eq("id",b.closest("[data-rating]").dataset.rating);
@@ -2650,7 +3109,9 @@ const SAMPLES = [
   if(!records.length && !seeded){ for(const s of SAMPLES) await saveRec(s); records=await loadAll(); try{localStorage.setItem("choka-seeded","1")}catch{} }
   render();
   if(records.length) map.fitBounds(L.latLngBounds(records.map(r=>[r.lat,r.lon])).pad(0.4),{maxZoom:12});
-  if(SB_URL && SB_KEY){ await shStart(); if(fromMail) showTab("share"); shCollectStart(); }   // ログイン済みならやり取りの新着を数える
+  hereStart();
+  if(SB_URL && SB_KEY){ await shStart(); if(fromMail) showTab("share"); shCollectStart(); }
+  updateAccountBtn();   // ログイン済みならやり取りの新着を数える
 })();
 </script>
 </body>
