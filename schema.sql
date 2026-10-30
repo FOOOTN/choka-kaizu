@@ -143,6 +143,8 @@ do $$ begin
   end if;
 end $$;
 alter table public.requests add column if not exists cancel_reason text check (char_length(cancel_reason) <= 100);
+-- ほかの人に決まったために自動で見送りになった申し込み（不成立になったら申し込み直せる）
+alter table public.requests add column if not exists auto_declined boolean not null default false;
 alter table public.listings add column if not exists cancel_reason text check (char_length(cancel_reason) <= 100);
 
 -- 連絡先カード（本人だけが編集。送ったときだけ相手に見える）
@@ -526,12 +528,12 @@ begin
        and created_at > now() - interval '24 hours';
     if v_n >= 5 then raise exception 'おすそわけの申し込みは同時に5件までです'; end if;
   end if;
-  -- 自分で取り消した申し込みなら、申し込み直せる
+  -- 自分で取り消した申し込みと、ほかの人に決まったため見送りになった申し込みは、申し込み直せる
   select id into v_id from requests where listing_id = p_listing and requester = auth.uid();
   if found then
     update requests set status = 'pending', message = p_message, offer_yen = p_offer, shop_id = v_shop,
-                        cancel_reason = null, updated_at = now()
-     where id = v_id and status = 'cancelled';
+                        cancel_reason = null, auto_declined = false, updated_at = now()
+     where id = v_id and (status = 'cancelled' or (status = 'declined' and auto_declined));
     if not found then raise exception 'この出品にはすでに申し込んでいます'; end if;
     perform sysmsg(v_id, 'もう一度申し込みました：' || left(p_message, 300));
     return v_id;
@@ -559,8 +561,8 @@ begin
     update requests set status = 'accepted', updated_at = now() where id = r.id;
     perform sysmsg(r.id, '出品者が申し込みを受けました。受け渡しの場所と時間を決めてください。');
     for o in select id from requests where listing_id = l.id and id <> r.id and status = 'pending' loop
-      update requests set status = 'declined', updated_at = now() where id = o.id;
-      perform sysmsg(o.id, 'ほかの方に決まったため、今回は見送りになりました。');
+      update requests set status = 'declined', auto_declined = true, updated_at = now() where id = o.id;
+      perform sysmsg(o.id, 'ほかの方に決まったため、今回は見送りになりました。取引が成立しなかった場合は、お知らせします。');
     end loop;
     update listings set status = 'reserved' where id = l.id;
   else
@@ -588,7 +590,7 @@ end $$;
 drop function if exists public.cancel_request(uuid);
 create or replace function public.cancel_request(p_request uuid, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
-declare r requests;
+declare r requests; o record;
 begin
   select * into r from requests where id = p_request for update;
   if not found or r.requester <> auth.uid() then raise exception '権限がありません'; end if;
@@ -597,6 +599,11 @@ begin
   perform sysmsg(r.id, '申込者が取り消しました' || coalesce('（理由：' || left(p_reason, 100) || '）', '') || '。');
   if r.status = 'accepted' then
     update listings set status = 'open' where id = r.listing_id and status = 'reserved' and expires_at > now();
+    if found then                                    -- 見送りになっていた人に、また申し込めることを知らせる
+      for o in select id from requests where listing_id = r.listing_id and status = 'declined' and auto_declined loop
+        perform sysmsg(o.id, '決まっていた方の取引が成立しなかったため、出品が受付中に戻りました。「もう一度申し込む」から申し込めます。');
+      end loop;
+    end if;
   end if;
 end $$;
 
@@ -701,7 +708,8 @@ select
       and w.until >= (now() at time zone 'Asia/Tokyo')::date and want_matches(w, l))) as matches_my_want,
   l.cancel_reason,
   (l.owner = auth.uid()) as mine,
-  (select r.id from requests r where r.listing_id = l.id and r.requester = auth.uid()) as my_request,
+  (select r.id from requests r where r.listing_id = l.id and r.requester = auth.uid()
+      and (r.status in ('pending','accepted','done') or (r.status = 'declined' and not r.auto_declined))) as my_request,
   case when is_admin() then l.catch_lat end as catch_lat,  -- 釣った位置は管理者だけ
   case when is_admin() then l.catch_lon end as catch_lon,
   case when is_admin() then l.owner end as owner_id
@@ -731,7 +739,9 @@ select
   (l.owner = auth.uid() or r.requester = auth.uid()) as i_am_party,
   (select count(*) from messages m where m.request_id = r.id) as msg_count,
   (select max(m.created_at) from messages m where m.request_id = r.id and m.sender <> auth.uid()) as last_msg_at,
-  r.cancel_reason,
+  r.cancel_reason, r.auto_declined,
+  (r.requester = auth.uid() and (r.status = 'cancelled' or (r.status = 'declined' and r.auto_declined))
+     and l.status = 'open' and l.expires_at > now()) as can_reapply,
   rating_of(case when l.owner = auth.uid() then r.requester else l.owner end) as other_rating,
   exists(select 1 from ratings g where g.request_id = r.id and g.rater = auth.uid()) as my_rated,
   (r.status = 'done' and r.updated_at > now() - interval '30 days') as can_rate
@@ -988,3 +998,8 @@ create policy "licenses_insert_own" on storage.objects for insert to authenticat
   with check (bucket_id = 'licenses' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "licenses_read" on storage.objects for select to authenticated
   using (bucket_id = 'licenses' and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
+
+-- ---------------------------------------------------------------------
+-- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
+-- ---------------------------------------------------------------------
+notify pgrst, 'reload schema';
