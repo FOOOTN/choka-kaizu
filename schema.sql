@@ -1017,8 +1017,8 @@ where is_admin();
 drop view if exists public.post_cards;
 create view public.post_cards with (security_barrier = true) as
 select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p.method, p.shime, p.caught_at, p.place,
-       case when auth.uid() is not null then p.lat end as lat,
-       case when auth.uid() is not null then p.lon end as lon,
+       case when is_member() or p.owner = auth.uid() then p.lat end as lat,   -- 釣った位置は会員だけ
+       case when is_member() or p.owner = auth.uid() then p.lon end as lon,
        (p.lat is not null) as has_pos,
        p.allow_comments, p.status, p.created_at, p.updated_at,
        u.nickname as owner_name, u.avatar as owner_avatar,
@@ -1355,6 +1355,78 @@ create policy "licenses_insert_own" on storage.objects for insert to authenticat
   with check (bucket_id = 'licenses' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "licenses_read" on storage.objects for select to authenticated
   using (bucket_id = 'licenses' and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
+
+-- ---------------------------------------------------------------------
+-- 10. PCとスマホの同期（会員）：釣果（写真は除く）と航跡を、本人だけが読み書きする
+--     写真は「写真を同期」を押したときだけ cloud バケットに置く
+-- ---------------------------------------------------------------------
+create table if not exists public.cloud_items (
+  owner      uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  kind       text not null check (kind in ('catch','track')),
+  id         text not null check (char_length(id) between 1 and 60),
+  data       jsonb,
+  deleted    boolean not null default false,
+  updated_at timestamptz not null,                 -- 端末で最後に変えた時刻（新しい方を残す）
+  synced_at  timestamptz not null default now(),   -- サーバーに入った時刻（差分の取り出し用）
+  primary key (owner, kind, id)
+);
+create index if not exists cloud_items_pull_idx on public.cloud_items(owner, synced_at);
+
+create or replace function public.cloud_items_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if not is_member() then raise exception '同期は会員の機能です'; end if;
+  new.owner := auth.uid();
+  if new.deleted then new.data := null; end if;
+  if new.data is not null and pg_column_size(new.data) > 3000000 then
+    raise exception '1件のデータが大きすぎます'; end if;
+  if new.updated_at > now() + interval '1 day' then new.updated_at := now(); end if;
+  if tg_op = 'UPDATE' then
+    if new.updated_at < old.updated_at then return null; end if;   -- 古い変更は無視
+    if new.owner <> old.owner then raise exception '権限がありません'; end if;
+  elsif (select count(*) from cloud_items where owner = auth.uid()) >= 20000 then
+    raise exception '同期できる件数の上限です';
+  end if;
+  new.synced_at := clock_timestamp();
+  return new;
+end $$;
+drop trigger if exists cloud_items_guard on public.cloud_items;
+create trigger cloud_items_guard before insert or update on public.cloud_items
+  for each row execute function public.cloud_items_guard();
+
+alter table public.cloud_items enable row level security;
+drop policy if exists cloud_select on public.cloud_items;
+drop policy if exists cloud_insert on public.cloud_items;
+drop policy if exists cloud_update on public.cloud_items;
+create policy cloud_select on public.cloud_items for select to authenticated using (owner = auth.uid());
+create policy cloud_insert on public.cloud_items for insert to authenticated with check (owner = auth.uid());
+create policy cloud_update on public.cloud_items for update to authenticated using (owner = auth.uid()) with check (owner = auth.uid());
+revoke all on public.cloud_items from anon;
+revoke delete on public.cloud_items from authenticated;
+
+-- 同期の使用量（本人）
+create or replace function public.cloud_usage() returns json
+language sql stable security definer set search_path = public as $$
+  select json_build_object(
+    'catches', count(*) filter (where kind = 'catch' and not deleted),
+    'tracks',  count(*) filter (where kind = 'track' and not deleted),
+    'bytes',   coalesce(sum(pg_column_size(data)), 0),
+    'photo_bytes', (select coalesce(sum((o.metadata->>'size')::bigint), 0) from storage.objects o
+                     where o.bucket_id = 'cloud' and (storage.foldername(o.name))[1] = auth.uid()::text))
+  from cloud_items where owner = auth.uid()
+$$;
+revoke execute on function public.cloud_usage() from anon;
+
+insert into storage.buckets (id, name, public) values ('cloud', 'cloud', false) on conflict (id) do nothing;
+drop policy if exists "cloud_insert_own" on storage.objects;
+drop policy if exists "cloud_read_own"   on storage.objects;
+drop policy if exists "cloud_delete_own" on storage.objects;
+create policy "cloud_insert_own" on storage.objects for insert to authenticated
+  with check (bucket_id = 'cloud' and (storage.foldername(name))[1] = auth.uid()::text and public.is_member());
+create policy "cloud_read_own" on storage.objects for select to authenticated
+  using (bucket_id = 'cloud' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "cloud_delete_own" on storage.objects for delete to authenticated
+  using (bucket_id = 'cloud' and (storage.foldername(name))[1] = auth.uid()::text);
 
 -- ---------------------------------------------------------------------
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう

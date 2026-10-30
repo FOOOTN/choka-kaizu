@@ -371,6 +371,15 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
           <label class="btn sm" style="flex-direction:row;color:var(--ink)">復元（JSON）<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
         </div>
         <p class="hint">釣果と航跡はこのブラウザ内（IndexedDB）に保存され、バックアップには両方が入ります。端末を替える前や定期的にバックアップしてください。</p>
+        <div id="cloudBox" class="cloud-box">
+          <div class="sec-h" style="margin-top:12px">PCとスマホで同期（会員）</div>
+          <p class="hint" id="cloudInfo">会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。</p>
+          <div class="toolbar" id="cloudOps" hidden>
+            <button type="button" class="btn sm" id="btnCloudSync">今すぐ同期</button>
+            <button type="button" class="btn sm" id="btnCloudPhotos">写真を同期（手動）</button>
+          </div>
+          <div class="status" id="cloudStat"></div>
+        </div>
         <div id="collectBox" hidden>
           <div class="checks"><label><input type="checkbox" id="collectToggle"><span>釣果をアプリの運営者に提供する<br><small class="hint">登録した釣果（位置・日時・魚種・数・大きさ・釣法・締め方・気象・メモなど。写真は除く）を運営者に送り、釣果の分析とアプリの改善に使います。ほかの利用者には公開しません。オフにすると、この端末から送った記録はサーバーから消えます。</small></span></label></div>
           <div class="status" id="collectStat"></div>
@@ -390,6 +399,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
       <div class="trk-style">
         <label class="trk-opt">線の色<input type="color" class="trk-col" id="trkColor" aria-label="これから記録する線の色"></label>
         <label class="trk-opt">線の太さ<select id="trkWeight"><option value="2">細い</option><option value="3.5">ふつう</option><option value="5">太い</option><option value="7">とても太い</option><option value="9">極太</option></select></label>
+        <button type="button" class="btn sm" id="trkColorSet">色の決め方…</button>
         <p class="hint" style="margin:0;width:100%">色を変えると、そのあと記録する線だけがその色になります（記録済みの線の色は変わりません）。点線は、アプリを閉じていたなどで記録が途切れた区間です（直線でつないでいます）。</p>
       </div>
       <div class="toolbar">
@@ -768,10 +778,10 @@ const DB = {
 let memStore = null, memTracks = new Map();   // IndexedDBが使えない環境用（保存されない）
 async function loadAll(){ return memStore ? [...memStore.values()] : DB.all("catches"); }
 async function saveRec(o){ if(memStore) memStore.set(o.id,o); else await DB.put(o,"catches"); }
-async function delRec(id){ if(memStore) memStore.delete(id); else await DB.del(id,"catches"); }
+async function delRec(id,fromCloud){ if(memStore) memStore.delete(id); else await DB.del(id,"catches"); if(!fromCloud) cloudForget("catch",id); }
 async function loadTrks(){ return memStore ? [...memTracks.values()] : DB.all("tracks"); }
-async function saveTrk(o){ if(memStore) memTracks.set(o.id,o); else await DB.put(o,"tracks"); }
-async function delTrk(id){ if(memStore) memTracks.delete(id); else await DB.del(id,"tracks"); }
+async function saveTrk(o,fromCloud){ if(!fromCloud) o.updatedAt=new Date().toISOString(); if(memStore) memTracks.set(o.id,o); else await DB.put(o,"tracks"); }
+async function delTrk(id,fromCloud){ if(memStore) memTracks.delete(id); else await DB.del(id,"tracks"); if(!fromCloud) cloudForget("track",id); }
 
 /* ========== 地図 ========== */
 const map = L.map("map",{zoomControl:true}).setView([36.80,137.30],11);
@@ -1435,7 +1445,7 @@ async function saveForm(next){
   for(const [k,fid] of Object.entries(FIELDS)){ const v=$(fid).value.trim(); r[k] = NUMERIC.has(k)?num(v):(v||null); }
   r.species = r.species || "不明";
   await saveRec(r);
-  shSyncRec(r);
+  shSyncRec(r); cloudSoon();
   records = records.filter(x=>x.id!==id).concat(r);
   render();
   if(next){                                           // 同じ場所・時刻・条件で次の1匹
@@ -1532,9 +1542,15 @@ buildChips();
 /* ========== 航跡（船の軌跡） ========== */
 let tracks=[];
 const DAY_COLORS=["#ff3b30","#ff9500","#34c759","#af52de","#ff2d92","#007aff","#a2845e","#00c7be"];
+/* 色の決め方：{mode:"day"（日ごとに8色から）|"fixed"（いつも同じ色）, fixed, palette:[8色]} */
+function trkColorCfg(){
+  let c={}; try{ c=JSON.parse(localStorage.getItem("choka-trk-colorcfg")||"{}")||{}; }catch{}
+  const pal=Array.isArray(c.palette)&&c.palette.length===8?c.palette:DAY_COLORS;
+  return {mode:c.mode==="fixed"?"fixed":"day", fixed:c.fixed||"#ff3b30", palette:pal};
+}
 function dayColor(date){
-  const used=tracks.find(t=>t.date===date); if(used) return used.color;
-  let h=0; for(const ch of date) h=(h*31+ch.charCodeAt(0))>>>0; return DAY_COLORS[h%DAY_COLORS.length];
+  const c=trkColorCfg(); if(c.mode==="fixed") return c.fixed;
+  let h=0; for(const ch of date) h=(h*31+ch.charCodeAt(0))>>>0; return c.palette[h%8];
 }
 /* 線の色（その日の色。選び直すとその日のこれからの線に使う）と太さ */
 function trkPrefColor(){ try{ const v=JSON.parse(localStorage.getItem("choka-trk-color")||"null"); if(v&&v.date===todayStr()) return v.color; }catch{} return dayColor(todayStr()); }
@@ -1613,7 +1629,7 @@ $("trkList").addEventListener("change",async e=>{
   const day=e.target.closest(".trk-day")?.dataset.day; if(!day) return;
   if(e.target.classList.contains("trk-col")){ drawTrackList(); return; }
   if(e.target.classList.contains("trk-show")){
-    for(const t of tracks.filter(t=>t.date===day)){ t.visible=e.target.checked; await saveTrk(t); }
+    for(const t of tracks.filter(t=>t.date===day)){ t.visible=e.target.checked; await saveTrk(t,true); }
     drawTracks();
   }
 });
@@ -1623,7 +1639,7 @@ $("trkList").addEventListener("click",async e=>{
   const a=b.dataset.a;
   if(a==="fit"){
     const pts=ts.flatMap(t=>t.points.map(p=>[p[0],p[1]])); if(!pts.length) return;
-    for(const t of ts){ if(!t.visible){ t.visible=true; await saveTrk(t);} }
+    for(const t of ts){ if(!t.visible){ t.visible=true; await saveTrk(t,true);} }
     drawTracks(); drawTrackList(); map.fitBounds(L.latLngBounds(pts).pad(0.15));
     return;
   }
@@ -1636,8 +1652,8 @@ $("trkList").addEventListener("click",async e=>{
     drawTracks(); drawTrackList();
   }
 });
-$("trkShowAll").onclick=async()=>{ for(const t of tracks){ if(!t.visible){ t.visible=true; await saveTrk(t);} } drawTracks(); drawTrackList(); };
-$("trkHideAll").onclick=async()=>{ for(const t of tracks){ if(t.visible){ t.visible=false; await saveTrk(t);} } drawTracks(); drawTrackList(); };
+$("trkShowAll").onclick=async()=>{ for(const t of tracks){ if(!t.visible){ t.visible=true; await saveTrk(t,true);} } drawTracks(); drawTrackList(); };
+$("trkHideAll").onclick=async()=>{ for(const t of tracks){ if(t.visible){ t.visible=false; await saveTrk(t,true);} } drawTracks(); drawTrackList(); };
 
 function toGpx(ts,day){
   const segs=ts.map(t=>`<trkseg>${t.points.map(p=>`<trkpt lat="${p[0].toFixed(6)}" lon="${p[1].toFixed(6)}"><time>${new Date(p[2]).toISOString()}</time></trkpt>`).join("")}</trkseg>`).join("");
@@ -1670,7 +1686,7 @@ async function stopRec(){
   rec.track.end=new Date().toISOString();
   const t=rec.track; rec=null;
   if(t.points.length<2){ await delTrk(t.id); tracks=tracks.filter(x=>x.id!==t.id); trkMsg("動いた記録がなかったので保存しませんでした。"); }
-  else { await saveTrk(t); trkMsg(`保存しました（${(trackLen(t)/1000).toFixed(1)} km）`,"ok"); }
+  else { await saveTrk(t); trkMsg(`保存しました（${(trackLen(t)/1000).toFixed(1)} km）`,"ok"); cloudSoon(); }
   try{ localStorage.removeItem("choka-rec"); }catch{}
   updateRecUi(); drawTrackList(); drawTracks();
 }
@@ -1731,6 +1747,28 @@ async function trkSetRecColor(col,relist=true){
   drawTracks(); if(relist) drawTrackList();
 }
 $("trkColor").addEventListener("input",e=>trkSetRecColor(e.target.value));
+$("trkColorSet").onclick=()=>{
+  const c=trkColorCfg();
+  const b=openDlg("線の色の決め方",`<div class="checks" style="flex-direction:column;align-items:flex-start">
+      <label><input type="radio" name="tcm" value="day" ${c.mode==="day"?"checked":""}>日ごとに自動で変える（下の8色から日付で選ぶ）</label>
+      <label><input type="radio" name="tcm" value="fixed" ${c.mode==="fixed"?"checked":""}>いつも同じ色</label></div>
+    <div id="tcFixed" ${c.mode==="fixed"?"":"hidden"} style="margin:8px 0"><label class="trk-opt">いつもの色<input type="color" class="trk-col" id="tcFix" value="${c.fixed}"></label></div>
+    <div id="tcDay" ${c.mode==="day"?"":"hidden"} style="margin:8px 0"><div class="trk-opt" style="flex-wrap:wrap">${c.palette.map((x,i)=>`<input type="color" class="trk-col tc-pal" data-i="${i}" value="${x}" aria-label="${i+1}番目の色">`).join("")}</div>
+      <button type="button" class="btn sm" id="tcReset" style="margin-top:6px">最初の8色に戻す</button></div>
+    <p class="hint">ここで変えても、記録済みの航跡の色は変わりません。今日の色を「線の色」で選んでいる場合は、今日はその色のままです。</p>
+    <div class="actions"><button type="button" class="btn" id="tcCancel">やめる</button><button type="button" class="btn primary" id="tcSave">保存</button></div>`);
+  const mode=()=>b.querySelector("input[name=tcm]:checked").value;
+  b.querySelectorAll("input[name=tcm]").forEach(r=>r.onchange=()=>{ $("tcFixed").hidden=mode()!=="fixed"; $("tcDay").hidden=mode()!=="day"; });
+  b.querySelector("#tcReset").onclick=()=>b.querySelectorAll(".tc-pal").forEach((x,i)=>x.value=DAY_COLORS[i]);
+  b.querySelector("#tcCancel").onclick=()=>$("dlg").close();
+  b.querySelector("#tcSave").onclick=()=>{
+    const cfg={mode:mode(),fixed:$("tcFix").value,palette:[...b.querySelectorAll(".tc-pal")].map(x=>x.value)};
+    try{ localStorage.setItem("choka-trk-colorcfg",JSON.stringify(cfg)); }catch{}
+    $("dlg").close(); $("trkColor").value=trkPrefColor();
+    if(rec && !rec.track.points.length){ rec.track.color=trkPrefColor(); saveTrk(rec.track); }
+    drawTracks();
+  };
+};
 $("trkWeight").addEventListener("change",e=>{ try{ localStorage.setItem("choka-trk-weight",e.target.value); }catch{} drawTracks(); });
 let resumeId=null;
 $("btnTrk").onclick=()=> rec ? stopRec() : startRec();
@@ -1770,13 +1808,13 @@ $("fileImport").addEventListener("change",async e=>{
     for(const r of list){ if(r&&r.id&&r.lat!=null&&r.lon!=null){ await saveRec(r); records=records.filter(x=>x.id!==r.id).concat(r);} }
     let nt=0; for(const t of (d.tracks||[])){ if(t&&t.id&&Array.isArray(t.points)){ await saveTrk(t); tracks=tracks.filter(x=>x.id!==t.id).concat(t); nt++; } }
     render(); drawTracks(); drawTrackList(); alertStatus(`${list.length}件の釣果${nt?`と${nt}本の航跡`:""}を復元しました。`);
-    shSyncAll();
+    shSyncAll(); if(SH.user) lsSet(clKey("push"),null); cloudSoon();
   }catch{ alertStatus("ファイルを読み込めませんでした。このアプリで出力したJSONを選んでください。"); }
   e.target.value="";
 });
 function alertStatus(msg){ $("summary").textContent=msg; }
 
-$("btnDelSamples").onclick=async()=>{ for(const r of records.filter(r=>r.sample)) await delRec(r.id); records=records.filter(r=>!r.sample); try{localStorage.setItem("choka-seeded","1")}catch{} render(); };
+$("btnDelSamples").onclick=async()=>{ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); try{localStorage.setItem("choka-seeded","1")}catch{} render(); };
 $("filter").addEventListener("input",render);
 
 /* テーマ切替 */
@@ -1876,7 +1914,7 @@ async function shRefreshMe(){
   const {data:{session}} = await SH.sb.auth.getSession();
   SH.user = session?.user || null;
   if(SH.user) shSyncAll();
-  if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; shShow("shLogin"); setBadge(0); shPollStop(); feedPollStop(); shareLayer.clearLayers(); return; }
+  if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; cloudUi(); shShow("shLogin"); setBadge(0); shPollStop(); feedPollStop(); shareLayer.clearLayers(); return; }
   let {data:p,error} = await SH.sb.from("profiles").select("*").eq("id",SH.user.id).maybeSingle();
   if(error){                                       // 海の上など電波がないときは、前回の内容で続ける
     try{ const c=JSON.parse(lsGet("choka-profile")||"null"); if(c&&c.id===SH.user.id){ p=c; error=null; } }catch{}
@@ -1886,6 +1924,7 @@ async function shRefreshMe(){
   if(!p){ shShow("shProfile"); return; }
   if(p.banned){ shShow("shBanned"); shPollStop(); return; }
   feedPollStart();
+  cloudUi(); if(isMember()) cloudSync();
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
   SH.shop=s||null;
@@ -2549,6 +2588,125 @@ $("collectToggle").addEventListener("change",async e=>{
   finally{ e.target.disabled=false; }
 });
 
+/* ---------- PCとスマホの同期（会員）：釣果（写真は除く）と航跡。新しく変えた方を残す ----------
+   ・cloud_items に kind/id ごとに1行。消したら deleted=true を送って、ほかの端末でも消す
+   ・写真は「写真を同期」を押したときだけ cloud バケットへ（r.cloudPhotos にパスを残す） */
+const CL={busy:false, last:0};
+const clKey = k => `choka-cloud-${k}-${SH.user?.id||""}`;
+const cloudOn = () => !!(SH.sb && hasProfile() && isMember());
+function cloudUi(){
+  const on=cloudOn();
+  $("cloudOps").hidden=!on;
+  $("cloudInfo").textContent = on ? "ログイン中は、釣果（写真は除く）と航跡を自動で同期します。写真は「写真を同期（手動）」を押したときだけ送ります。"
+    : (hasProfile() ? "同期は会員の機能です。会員になると、釣果と航跡がPCとスマホで自動でそろいます。" : "会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。");
+}
+function cloudForget(kind,id){            // 消したことを覚えておき、次の同期で送る
+  if(!SH.user) return;
+  let q=[]; try{ q=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+  q.push({kind,id:String(id),at:new Date().toISOString()}); lsSet(clKey("del"),JSON.stringify(q.slice(-2000)));
+  if(cloudOn()) cloudSoon();
+}
+const catchData = r => { const {photos,sample,...d}=r; return d; };
+async function cloudSync(force){
+  if(!cloudOn()||CL.busy) return;
+  if(!force && Date.now()-CL.last<20000) return;
+  CL.busy=true; CL.last=Date.now();
+  let got=0, sent=0; const pulled=new Map();   // 取り込んだばかりのものは送り返さない
+  try{
+    // 1) ほかの端末で変わった分を取り込む
+    let since=lsGet(clKey("pull"))||"1970-01-01T00:00:00Z";
+    for(;;){
+      const {data,error}=await SH.sb.from("cloud_items").select("kind,id,data,deleted,updated_at,synced_at").gt("synced_at",since).order("synced_at").limit(500);
+      if(error) throw error;
+      for(const x of data){
+        const iso=new Date(x.updated_at).toISOString();
+        if(x.kind==="catch"){
+          const loc=records.find(r=>r.id===x.id);
+          if(loc && (loc.updatedAt||"")>iso) continue;
+          if(x.deleted){ if(loc){ await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
+          if(loc && (loc.updatedAt||"")===iso) continue;
+          const r={...x.data, id:x.id, photos:loc?.photos||[], updatedAt:iso};
+          await saveRec(r); records=records.filter(q=>q.id!==x.id).concat(r); got++;
+        }else{
+          if(rec && rec.track.id===x.id) continue;                 // 記録中の航跡はこの端末を優先
+          const loc=tracks.find(t=>t.id===x.id);
+          if(loc && (loc.updatedAt||"")>iso) continue;
+          if(x.deleted){ if(loc){ await delTrk(x.id,true); tracks=tracks.filter(t=>t.id!==x.id); got++; } continue; }
+          if(loc && (loc.updatedAt||"")===iso) continue;
+          const t={...x.data, id:x.id, updatedAt:iso, visible:loc?loc.visible:true};
+          await saveTrk(t,true); tracks=tracks.filter(q=>q.id!==x.id).concat(t); got++;
+        }
+        pulled.set(x.kind+":"+x.id,iso); since=x.synced_at;
+      }
+      lsSet(clKey("pull"),since);
+      if(data.length<500) break;
+    }
+    // 2) この端末で変えた分を送る
+    const pushedAt=lsGet(clKey("push"))||"", started=new Date().toISOString();
+    let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+    const rows=[
+      ...records.filter(r=>!r.sample && (r.updatedAt||"1970")>pushedAt && pulled.get("catch:"+r.id)!==r.updatedAt).map(r=>({kind:"catch",id:String(r.id),data:catchData(r),deleted:false,updated_at:r.updatedAt||"2000-01-01T00:00:00Z"})),
+      ...tracks.filter(t=>(t.updatedAt||"1970")>pushedAt && pulled.get("track:"+t.id)!==t.updatedAt).map(t=>{ const {visible,...d}=t; return {kind:"track",id:String(t.id),data:d,deleted:false,updated_at:t.updatedAt||"2000-01-01T00:00:00Z"}; }),
+      ...dels.map(d=>({kind:d.kind,id:d.id,data:null,deleted:true,updated_at:d.at}))];
+    for(let i=0;i<rows.length;i+=50){
+      const {error}=await SH.sb.from("cloud_items").upsert(rows.slice(i,i+50),{onConflict:"owner,kind,id"});
+      if(error) throw error;
+      sent+=Math.min(50,rows.length-i);
+    }
+    lsSet(clKey("push"),started); lsSet(clKey("del"),null);
+    if(got){ render(); drawTracks(); drawTrackList(); }
+    lsSet(clKey("at"),new Date().toISOString());
+    shMsg("cloudStat",`同期しました（${hm(Date.now())}${got?`・取り込み${got}件`:""}${sent?`・送信${sent}件`:""}）`,"ok");
+  }catch(e){ shMsg("cloudStat","同期できませんでした（電波のよいところで「今すぐ同期」を押してください）："+shErr(e),"err"); }
+  finally{ CL.busy=false; }
+}
+let clT=null; function cloudSoon(){ clearTimeout(clT); clT=setTimeout(()=>cloudSync(true),1500); }
+$("btnCloudSync").onclick=async e=>{ setBusy(e.target,true,"同期中…"); await cloudSync(true); setBusy(e.target,false); };
+document.addEventListener("visibilitychange",()=>{ if(cloudOn()) cloudSync(); });   // 開いたとき・裏に回るとき
+
+/* 写真の同期（手動）：この端末の写真を送り、ほかの端末で送った写真を取り込む */
+$("btnCloudPhotos").onclick=async e=>{
+  if(!cloudOn()) return;
+  const up=records.filter(r=>!r.sample && (r.photos||[]).length && (r.cloudPhotos||[]).length!==(r.photos||[]).length);
+  const down=records.filter(r=>(r.cloudPhotos||[]).length && !(r.photos||[]).length);
+  const bytes=up.reduce((s,r)=>s+r.photos.reduce((a,p)=>a+Math.round(p.length*0.75),0),0);
+  const {data:u}=await SH.sb.rpc("cloud_usage");
+  const MB=n=>(n/1048576).toFixed(1);
+  const b=openDlg("写真を同期",`<table class="kv">
+      <tr><td>送る写真</td><td>${up.reduce((s,r)=>s+r.photos.length,0)}枚（約${MB(bytes)}MB・${up.length}件の釣果）</td></tr>
+      <tr><td>取り込む写真</td><td>${down.reduce((s,r)=>s+r.cloudPhotos.length,0)}枚（${down.length}件の釣果）</td></tr>
+      ${u?`<tr><td>保存済み</td><td>写真 約${MB(u.photo_bytes||0)}MB／記録 約${MB(u.bytes||0)}MB（釣果${u.catches}件・航跡${u.tracks}本）</td></tr>`:""}</table>
+    <p class="hint">写真は通信量が多いので、Wi-Fiのときにおすすめします。送った写真は本人だけが見られます。</p>
+    <div class="actions"><button type="button" class="btn" id="cpNo">やめる</button><button type="button" class="btn primary" id="cpGo" ${up.length||down.length?"":"disabled"}>同期する</button></div>
+    <div class="status" id="cpStat"></div>`);
+  b.querySelector("#cpNo").onclick=()=>$("dlg").close();
+  b.querySelector("#cpGo").onclick=async ev=>{
+    setBusy(ev.target,true,"同期中…"); let n=0, fail=0;
+    for(const r of up){
+      try{
+        const paths=[];
+        for(let i=0;i<r.photos.length;i++){
+          const path=`${SH.user.id}/${String(r.id).replace(/[^\w-]/g,"")}-${i}-${Date.now().toString(36)}.jpg`;
+          const {error}=await SH.sb.storage.from("cloud").upload(path,await dataUrlToBlob(r.photos[i]),{contentType:"image/jpeg",upsert:false});
+          if(error) throw error; paths.push(path); n++;
+          shMsg("cpStat",`送信中… ${n}枚`);
+        }
+        const old=r.cloudPhotos||[]; r.cloudPhotos=paths; r.updatedAt=new Date().toISOString(); await saveRec(r);
+        if(old.length) SH.sb.storage.from("cloud").remove(old);
+      }catch{ fail++; }
+    }
+    for(const r of down){
+      try{
+        const {data,error}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); if(error) throw error;
+        const ph=[]; for(const x of data){ const bl=await (await fetch(x.signedUrl)).blob(); ph.push(await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.readAsDataURL(bl); })); n++; shMsg("cpStat",`取り込み中… ${n}枚`); }
+        r.photos=ph; await saveRec(r);
+      }catch{ fail++; }
+    }
+    setBusy(ev.target,false); render(); await cloudSync(true);
+    shMsg("cpStat",fail?`${n}枚を同期しました。${fail}件は失敗しました（もう一度押すと続きから同期します）`:`${n}枚の写真を同期しました`,fail?"err":"ok");
+  };
+};
+
 /* ---------- お店の買い取り希望 ---------- */
 function wantFormHtml(s){
   const d=new Date(Date.now()+14*86400000), dd=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
@@ -2643,7 +2801,7 @@ function shShop(){
 
 /* =====================================================================
    みんな：写真・ブログの投稿、いいね、コメント、メッセージ
-   ・見るだけならログイン不要（釣った位置はログインした人だけ）
+   ・見るだけならログイン不要（釣った位置は会員だけ）
    ・投稿は会員、いいね・コメント・メッセージはログインして表示名を登録した人なら誰でも
    ===================================================================== */
 const FD={filter:"all", page:0, list:[], fsub:"posts", pollT:null, dmT:null};
@@ -2701,7 +2859,7 @@ function feedOpen(){
   if(!SH.started){ shStart().then(feedOpen); return; }
   $("fdMine").hidden=!hasProfile();
   $("btnPost").hidden=false;
-  $("fdHint").textContent = hasProfile() ? "" : "見るだけならログインは不要です。いいね・コメント・メッセージは、ログインして表示名を登録すると使えます。釣った位置はログインした人だけに表示されます。";
+  $("fdHint").textContent = hasProfile() ? "" : "見るだけならログインは不要です。いいね・コメント・メッセージは、ログインして表示名を登録すると使えます。釣った位置は会員だけに表示されます。";
   feedSub(FD.fsub);
 }
 $("fdSubs").addEventListener("click",e=>{ const b=e.target.closest("button[data-fsub]"); if(b) feedSub(b.dataset.fsub); });
@@ -2761,7 +2919,7 @@ async function postDetail(id){
   const logged=hasProfile(), isAdmin=SH.profile?.role==="admin";
   const facts=[["魚種",p.species],["大きさ",p.size_cm?`${p.size_cm}cm`:""],["匹数",p.count?`${p.count}匹`:""],["釣法",p.method],["締め方",p.shime],
     ["釣った日",p.caught_at?fmtJ(p.caught_at):""],["場所",p.place],
-    ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?"ログインすると見られます":"")]].filter(x=>x[1]);
+    ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?(hasProfile()?"会員になると見られます":"会員がログインすると見られます"):"")]].filter(x=>x[1]);
   const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${whoLine(c.user_avatar,c.user_name,20)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
      <span class="ops">${c.mine||c.on_my_post||isAdmin?`<button type="button" class="btn sm" data-a="cdel">消す</button>`:""}${logged&&!c.mine?`<button type="button" class="btn sm" data-a="crep">通報</button>`:""}</span></div>`).join("");
   const b=openDlg(p.kind==="blog"?p.title:(p.species||"写真"),
@@ -2876,7 +3034,7 @@ function postForm(){
     <label class="btn sm" style="flex-direction:row;color:var(--ink);width:max-content">写真を追加（6枚まで）<input type="file" id="pfFiles" accept="image/*" multiple hidden></label>
     <label style="margin-top:8px">場所（大まかに。誰でも見られます）<input id="pfPlace" maxlength="40" placeholder="例：氷見沖、富山湾"></label>
     <div class="checks">
-      <label id="pfPosL" hidden><input type="checkbox" id="pfPos">釣った位置を載せる（ログインした人だけに見えます）</label>
+      <label id="pfPosL" hidden><input type="checkbox" id="pfPos">釣った位置を載せる（会員だけに見えます）</label>
       <label><input type="checkbox" id="pfCmt" checked>コメントを受け付ける</label>
     </div>
     <p class="hint">写真の撮影場所などの情報は、縮小するときに消えます。人の顔や他人の写真を載せるときは、許可を取ってください。</p>
