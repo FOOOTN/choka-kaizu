@@ -59,20 +59,24 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:1fr 420px}
   html,body{height:auto}
   body{display:block;min-height:100%}
   main{display:block}
-  #mapwrap{height:40vh;isolation:isolate;transition:height .2s}
+  #mapwrap{height:max(40vh,250px);isolation:isolate;transition:height .2s}
   body.map-big #mapwrap{height:72vh}
-  body.form-open:not(.map-big) #mapwrap{height:32vh}
+  body.form-open:not(.map-big) #mapwrap{height:max(32vh,220px)}
   #panel{border-left:0;border-top:2px solid var(--ink);min-height:60vh}
   .tabs{position:sticky;top:0;z-index:900;background:var(--panel)}
   .view{overflow:visible;flex:none}
   .actions{bottom:0}
 }
-.here-box{background:rgba(255,255,255,.9);color:#16263a;font-size:12px;padding:3px 8px;border-radius:3px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);white-space:nowrap}
-.here-box small{color:#4b5a6c}
+.here-box{position:absolute;z-index:700;top:10px;left:50%;transform:translateX(-50%);background:rgba(255,255,255,.92);color:#16263a;font-size:12px;line-height:1.35;padding:3px 8px;border-radius:3px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;text-align:center}
+.here-box small{color:#4b5a6c;margin-left:4px}
+.mapmode{top:44px!important}
 @media (max-width:700px){
   /* 縦向きのスマホでは出典の文字が横いっぱいに広がって左下の現在地を隠すので、右側に寄せて小さくする */
   .leaflet-control-attribution{max-width:52vw;font-size:9px;line-height:1.35}
-  .here-box{font-size:11px;padding:2px 6px}
+  .here-box{font-size:11px;padding:2px 7px}
+  .here-box .ln{display:block}
+  .here-box small{display:block;margin-left:0}
+  .mapmode{top:62px!important}
   #isoNote{max-width:44vw;white-space:normal}
 }
 .map-size{display:none}
@@ -282,6 +286,10 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
 .thumbs figure{margin:0;position:relative}
 .thumbs img{width:72px;height:72px;object-fit:cover;border-radius:3px;display:block}
 .thumbs button{position:absolute;top:2px;right:2px;border:0;background:rgba(0,0,0,.6);color:#fff;border-radius:2px;font-size:11px;cursor:pointer;padding:0 5px}
+.av{display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:50%;overflow:hidden;background:var(--c,#6b7c8f);color:#fff;font-weight:700;vertical-align:middle}
+.av img{width:100%;height:100%;object-fit:cover;display:block}
+.who-line{display:inline-flex;align-items:center;gap:6px}
+.av-edit{display:flex;align-items:center;gap:14px;margin:6px 0 10px}
 .dmrow{grid-template-columns:1fr}
 .dmrow .t{justify-content:space-between}
 [hidden]{display:none!important}
@@ -845,10 +853,8 @@ const isoNote=L.control({position:"bottomleft"});
 isoNote.onAdd=()=>{ const d=L.DomUtil.create("div"); d.id="isoNote"; d.style.cssText="background:rgba(255,255,255,.85);color:#16263a;font-size:11px;padding:2px 6px;border-radius:2px"; return d; };
 isoNote.addTo(map);
 /* 地図の隅に現在地の緯度・経度（押すとそこへ移動） */
-const here=L.control({position:"bottomleft"});
-here.onAdd=()=>{ const d=L.DomUtil.create("div","here-box"); d.id="hereBox"; d.textContent="現在地：取得中…"; d.title="押すと現在地へ移動";
-  L.DomEvent.disableClickPropagation(d); return d; };
-here.addTo(map);
+{ const d=document.createElement("div"); d.className="here-box"; d.id="hereBox"; d.setAttribute("role","button"); d.textContent="現在地：取得中…"; d.title="押すと現在地へ移動";
+  document.getElementById("mapwrap").appendChild(d); }
 let hereWatch=null, hereFix=null, hereMarker=null;
 function hereStart(){
   if(!navigator.geolocation){ $("hereBox").textContent="現在地：この端末では使えません"; return; }
@@ -856,7 +862,7 @@ function hereStart(){
   hereWatch=navigator.geolocation.watchPosition(p=>{
     const c=p.coords; hereFix={lat:c.latitude,lon:c.longitude,acc:c.accuracy};
     lastGps={lat:c.latitude,lon:c.longitude,t:Date.now()};
-    $("hereBox").innerHTML=`<span class="mono">${toDM(c.latitude,"N","S")} ${toDM(c.longitude,"E","W")}</span> <small>${c.accuracy>=1000?`±${(c.accuracy/1000).toFixed(c.accuracy<10000?1:0)}km（おおよそ）`:`±${Math.round(c.accuracy)}m`}</small>`;
+    $("hereBox").innerHTML=`<span class="mono"><span class="ln">${toDM(c.latitude,"N","S")}</span> <span class="ln">${toDM(c.longitude,"E","W")}</span></span><small>${c.accuracy>=1000?`±${(c.accuracy/1000).toFixed(c.accuracy<10000?1:0)}km（おおよそ）`:`±${Math.round(c.accuracy)}m`}</small>`;
     $("hereBox").title = c.accuracy>=1000 ? "GPSがない機器（PCなど）では、Wi-Fiや回線から推定するため数kmずれます。スマホでは数m〜数十mになります。" : "現在地（押すとこの場所へ移動）";
     if(!hereMarker) hereMarker=L.circleMarker([c.latitude,c.longitude],{radius:6,color:"#fff",weight:2,fillColor:"#1a73e8",fillOpacity:1,interactive:false}).addTo(map);
     else hereMarker.setLatLng([c.latitude,c.longitude]);
@@ -1790,7 +1796,7 @@ function updateAccountBtn(){
   if(!SB_URL||!SB_KEY){ b.hidden=true; return; }
   b.textContent = hasProfile() ? `${SH.profile.nickname}${isMember()?"":"（無料）"}` : "ログイン";
 }
-$("btnAccount").onclick=()=>showTab("share");
+$("btnAccount").onclick=()=>{ if(hasProfile()) profileDlg(); else showTab("share"); };
 /* 会員の機能を使おうとしたとき */
 function memberGate(what){
   if(isMember()) return true;
@@ -2591,6 +2597,53 @@ function shShop(){
 const FD={filter:"all", page:0, list:[], fsub:"posts", pollT:null, dmT:null};
 const POST_REASONS=["釣り場や個人の情報が書かれている","不適切な写真・言葉","他人の写真・うその内容","宣伝・迷惑行為","その他"];
 const postUrl = p => p ? SH.sb.storage.from("posts").getPublicUrl(p).data.publicUrl : "";
+const avUrl = p => p ? SH.sb.storage.from("avatars").getPublicUrl(p).data.publicUrl : "";
+/* アイコン：画像がなければ表示名の1文字目を色つきの丸で */
+function avatar(path,name,px=22){
+  const st=`width:${px}px;height:${px}px;font-size:${Math.round(px*.5)}px;--c:${spColor(name||"?")}`;
+  return path ? `<span class="av" style="${st}"><img src="${esc(avUrl(path))}" alt="" loading="lazy"></span>`
+              : `<span class="av" style="${st}" aria-hidden="true">${esc([...(name||"?")][0])}</span>`;
+}
+const whoLine = (path,name,px) => `<span class="who-line">${avatar(path,name,px)}<span>${esc(name||"")}</span></span>`;
+/* 正方形に切り抜いて縮小 */
+function squareShrink(file,px){ return new Promise((res,rej)=>{
+  const img=new Image(), url=URL.createObjectURL(file);
+  img.onload=()=>{ const m=Math.min(img.width,img.height), c=document.createElement("canvas"); c.width=c.height=px;
+    c.getContext("2d").drawImage(img,(img.width-m)/2,(img.height-m)/2,m,m,0,0,px,px); URL.revokeObjectURL(url); res(c.toDataURL("image/jpeg",0.85)); };
+  img.onerror=rej; img.src=url; }); }
+/* プロフィール（アイコン・表示名） */
+function profileDlg(){
+  const P=SH.profile; let pick=null, clear=false;
+  const b=openDlg("プロフィール",`<div class="av-edit"><span id="avPrev">${avatar(P.avatar,P.nickname,72)}</span>
+      <div class="toolbar" style="margin:0"><label class="btn sm" style="flex-direction:row;color:var(--ink)">画像を選ぶ<input type="file" id="avFile" accept="image/*" hidden></label>
+      <button type="button" class="btn sm" id="avClear">アイコンを外す</button></div></div>
+    <label>表示名（20文字まで）<input id="avNick" maxlength="20" value="${esc(P.nickname)}"></label>
+    <p class="hint">アイコンと表示名は、投稿・コメント・メッセージで誰でも見られます。正方形に切り抜いて小さくします。人の顔や他人の画像を使うときは許可を取ってください。</p>
+    <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員（${(P.member_until||"").replace(/-/g,"/")}まで）`):"無料（コメント・いいね・メッセージができます）"}　ログアウトやお店の登録は「おすそわけ」タブから。</p>
+    <div class="actions"><button type="button" class="btn" id="avShare">おすそわけタブへ</button><button type="button" class="btn primary" id="avSave">保存</button></div>
+    <div class="status" id="avStat"></div>`);
+  b.querySelector("#avFile").onchange=async e=>{ const f=e.target.files[0]; if(!f) return;
+    try{ pick=await squareShrink(f,256); clear=false; $("avPrev").innerHTML=`<span class="av" style="width:72px;height:72px"><img src="${pick}" alt=""></span>`; }
+    catch{ shMsg("avStat","画像を読み込めませんでした（HEIC形式はJPEGに変換してください）","err"); } };
+  b.querySelector("#avClear").onclick=()=>{ pick=null; clear=true; $("avPrev").innerHTML=avatar(null,$("avNick").value||P.nickname,72); };
+  b.querySelector("#avShare").onclick=()=>{ $("dlg").close(); showTab("share"); };
+  b.querySelector("#avSave").onclick=async e=>{
+    const nick=$("avNick").value.trim(); if(!nick) return shMsg("avStat","表示名を入れてください","err");
+    const patch={nickname:nick}, old=P.avatar;
+    setBusy(e.target,true,"保存中…");
+    try{
+      if(pick){ const path=`${SH.user.id}/avatar-${Date.now().toString(36)}.jpg`;
+        const {error}=await SH.sb.storage.from("avatars").upload(path,await dataUrlToBlob(pick),{contentType:"image/jpeg",upsert:false});
+        if(error) throw error; patch.avatar=path; }
+      else if(clear) patch.avatar=null;
+      const {error}=await SH.sb.from("profiles").update(patch).eq("id",SH.user.id);
+      if(error){ if(patch.avatar) SH.sb.storage.from("avatars").remove([patch.avatar]); throw error; }
+      if(old && "avatar" in patch && old!==patch.avatar) SH.sb.storage.from("avatars").remove([old]);
+      Object.assign(SH.profile,patch); try{ localStorage.setItem("choka-profile",JSON.stringify(SH.profile)); }catch{}
+      updateAccountBtn(); $("dlg").close(); if(!$("viewFeed").hidden) feedOpen();
+    }catch(err){ shMsg("avStat",shErr(err),"err"); }finally{ setBusy(e.target,false); }
+  };
+}
 function feedOpen(){
   if(!SB_URL||!SB_KEY){ $("feedList").innerHTML=`<div class="empty">「みんな」を使うには、サーバー（Supabase）の設定が必要です。</div>`; $("btnPost").hidden=true; return; }
   if(!SH.started){ shStart().then(feedOpen); return; }
@@ -2636,7 +2689,7 @@ function postCard(p){
   return `<div class="card post" data-pid="${p.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
     <div><div class="t"><span class="kind ${p.kind==="blog"?"shop":"gift"}">${p.kind==="blog"?"ブログ":"写真"}</span><span class="ttl">${esc(title)}</span>${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
     ${p.body?`<div class="ex">${esc(p.body)}</div>`:""}
-    <div class="meta"><span>${esc(p.owner_name)}</span>${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
+    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,20)}${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
 }
 function drawPostMarkers(){
   postLayer.clearLayers();
@@ -2657,11 +2710,11 @@ async function postDetail(id){
   const facts=[["魚種",p.species],["大きさ",p.size_cm?`${p.size_cm}cm`:""],["匹数",p.count?`${p.count}匹`:""],["釣法",p.method],["締め方",p.shime],
     ["釣った日",p.caught_at?fmtJ(p.caught_at):""],["場所",p.place],
     ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?"ログインすると見られます":"")]].filter(x=>x[1]);
-  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${esc(c.user_name)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
+  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${whoLine(c.user_avatar,c.user_name,20)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
      <span class="ops">${c.mine||c.on_my_post||isAdmin?`<button type="button" class="btn sm" data-a="cdel">消す</button>`:""}${logged&&!c.mine?`<button type="button" class="btn sm" data-a="crep">通報</button>`:""}</span></div>`).join("");
   const b=openDlg(p.kind==="blog"?p.title:(p.species||"写真"),
     `${(p.photos||[]).length?`<div class="gal">${p.photos.map(x=>`<img src="${esc(postUrl(x))}" alt="">`).join("")}</div>`:""}
-     <div class="hint">${esc(p.owner_name)}・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</div>
+     <div class="hint" style="display:flex;align-items:center;gap:6px">${whoLine(p.owner_avatar,p.owner_name,28)}<span>・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</span></div>
      ${p.body?`<div class="pbody">${esc(p.body)}</div>`:""}
      ${facts.length?`<table class="kv">${facts.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>`:""}
      <div class="toolbar" style="margin-top:10px">
@@ -2831,7 +2884,7 @@ async function dmList(){
   if(error){ $("dmList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
   const seen=dmSeen();
   $("dmList").innerHTML = data.length ? data.map(t=>`<div class="card dmrow" data-tid="${t.id}" data-name="${esc(t.other_name)}" tabindex="0" role="button"><div>
-      <div class="t"><span class="sp">${esc(t.other_name)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
+      <div class="t"><span class="sp">${whoLine(t.other_avatar,t.other_name,26)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
       <div class="facts"><span>${esc(t.last_body||"（まだメッセージはありません）")}</span></div></div></div>`).join("")
     : `<div class="empty">まだメッセージはありません。<br>投稿を開いて「メッセージを送る」から始められます。</div>`;
   feedBadge(data);

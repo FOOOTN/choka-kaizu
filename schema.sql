@@ -21,6 +21,8 @@ create table if not exists public.profiles (
 alter table public.profiles add column if not exists share_catches boolean not null default false;
 -- 会員（有償）の期限。決済を入れるまでは管理者が設定する
 alter table public.profiles add column if not exists member_until date;
+-- アイコン（avatars バケットの「利用者ID/ファイル名」）。誰でも見られる
+alter table public.profiles add column if not exists avatar text check (char_length(avatar) <= 200);
 
 -- お店（魚介類販売業の許可を持つ店。管理者が許可証を確認して承認）
 create table if not exists public.shops (
@@ -415,6 +417,9 @@ begin
        or new.member_until is distinct from old.member_until or new.id <> old.id then
       raise exception '権限がありません';
     end if;
+  end if;
+  if new.avatar is not null and new.avatar not like new.id::text || '/%' then
+    raise exception 'アイコンは自分のフォルダの画像だけ設定できます';
   end if;
   return new;
 end $$;
@@ -1016,7 +1021,7 @@ select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p
        case when auth.uid() is not null then p.lon end as lon,
        (p.lat is not null) as has_pos,
        p.allow_comments, p.status, p.created_at, p.updated_at,
-       u.nickname as owner_name,
+       u.nickname as owner_name, u.avatar as owner_avatar,
        (p.owner = auth.uid()) as mine,
        (select count(*) from post_likes k where k.post_id = p.id) as like_count,
        (select count(*) from post_comments c where c.post_id = p.id) as comment_count,
@@ -1026,7 +1031,7 @@ where (p.status = 'public' and not u.banned) or p.owner = auth.uid() or is_admin
 
 drop view if exists public.comment_cards;
 create view public.comment_cards with (security_barrier = true) as
-select c.id, c.post_id, c.body, c.created_at, u.nickname as user_name,
+select c.id, c.post_id, c.body, c.created_at, u.nickname as user_name, u.avatar as user_avatar,
        (c.user_id = auth.uid()) as mine,
        exists(select 1 from posts p where p.id = c.post_id and p.owner = auth.uid()) as on_my_post
 from public.post_comments c
@@ -1037,7 +1042,7 @@ where (p.status = 'public' and not u.banned) or p.owner = auth.uid() or is_admin
 -- メッセージの一覧（自分の分だけ）
 drop view if exists public.dm_cards;
 create view public.dm_cards with (security_barrier = true) as
-select t.id, t.last_at, o.nickname as other_name,
+select t.id, t.last_at, o.nickname as other_name, o.avatar as other_avatar,
        exists(select 1 from blocks k where k.blocker = auth.uid() and k.blocked = o.id) as i_blocked,
        is_blocked(t.a, t.b) as blocked,
        (select m.body from dm_messages m where m.thread_id = t.id order by m.id desc limit 1) as last_body,
@@ -1293,7 +1298,7 @@ grant select on public.blocked_terms to anon, authenticated;
 revoke update on public.listings from authenticated;
 grant  update (status) on public.listings to authenticated;          -- 管理者の削除（removed）用。RLSで管理者に限定
 revoke update on public.profiles from authenticated;
-grant  update (nickname, banned, share_catches, member_until) on public.profiles to authenticated; -- banned・member_until はトリガーで管理者に限定
+grant  update (nickname, banned, share_catches, member_until, avatar) on public.profiles to authenticated; -- banned・member_until はトリガーで管理者に限定
 revoke update on public.posts from authenticated;
 grant  update (title, body, place, allow_comments, status) on public.posts to authenticated;
 
@@ -1318,8 +1323,9 @@ grant  execute on function public.admin_stats() to authenticated;   -- 中で管
 --    どちらも「利用者ID/ファイル名」の形で、自分のフォルダにだけ置ける
 -- ---------------------------------------------------------------------
 insert into storage.buckets (id, name, public)
-values ('photos', 'photos', false), ('licenses', 'licenses', false), ('posts', 'posts', true)
+values ('photos', 'photos', false), ('licenses', 'licenses', false), ('posts', 'posts', true), ('avatars', 'avatars', true)
 on conflict (id) do nothing;
+-- avatars : アイコン。誰でも見られる。ログインして表示名を登録した人が、自分のフォルダにだけ置ける
 -- posts : みんなの投稿の写真。誰でも見られる（位置情報は縮小のときに消してある）。置けるのは会員の自分のフォルダだけ
 
 drop policy if exists "photos_insert_own" on storage.objects;
@@ -1329,6 +1335,12 @@ drop policy if exists "licenses_insert_own" on storage.objects;
 drop policy if exists "licenses_read"       on storage.objects;
 drop policy if exists "posts_insert_own"    on storage.objects;
 drop policy if exists "posts_delete_own"    on storage.objects;
+drop policy if exists "avatars_insert_own"  on storage.objects;
+drop policy if exists "avatars_delete_own"  on storage.objects;
+create policy "avatars_insert_own" on storage.objects for insert to authenticated
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text and public.is_active_user());
+create policy "avatars_delete_own" on storage.objects for delete to authenticated
+  using (bucket_id = 'avatars' and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
 create policy "posts_insert_own" on storage.objects for insert to authenticated
   with check (bucket_id = 'posts' and (storage.foldername(name))[1] = auth.uid()::text and public.is_member());
 create policy "posts_delete_own" on storage.objects for delete to authenticated
