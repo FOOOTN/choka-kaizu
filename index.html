@@ -850,7 +850,8 @@ function hereStart(){
   hereWatch=navigator.geolocation.watchPosition(p=>{
     const c=p.coords; hereFix={lat:c.latitude,lon:c.longitude,acc:c.accuracy};
     lastGps={lat:c.latitude,lon:c.longitude,t:Date.now()};
-    $("hereBox").innerHTML=`<span class="mono">${toDM(c.latitude,"N","S")} ${toDM(c.longitude,"E","W")}</span> <small>±${Math.round(c.accuracy)}m</small>`;
+    $("hereBox").innerHTML=`<span class="mono">${toDM(c.latitude,"N","S")} ${toDM(c.longitude,"E","W")}</span> <small>${c.accuracy>=1000?`±${(c.accuracy/1000).toFixed(c.accuracy<10000?1:0)}km（おおよそ）`:`±${Math.round(c.accuracy)}m`}</small>`;
+    $("hereBox").title = c.accuracy>=1000 ? "GPSがない機器（PCなど）では、Wi-Fiや回線から推定するため数kmずれます。スマホでは数m〜数十mになります。" : "現在地（押すとこの場所へ移動）";
     if(!hereMarker) hereMarker=L.circleMarker([c.latitude,c.longitude],{radius:6,color:"#fff",weight:2,fillColor:"#1a73e8",fillOpacity:1,interactive:false}).addTo(map);
     else hereMarker.setLatLng([c.latitude,c.longitude]);
   },e=>{ $("hereBox").textContent = e.code===1 ? "現在地：位置情報が許可されていません" : "現在地：取得できません"; },
