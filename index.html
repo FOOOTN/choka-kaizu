@@ -190,6 +190,12 @@ details.more[open] summary{margin-bottom:8px}
 .trk-vis input{width:20px;height:20px}
 .trk-km{margin-left:auto;font-size:13px;color:var(--ink-2)}
 .trk-ops{display:flex;gap:6px;flex-wrap:wrap}
+.trk-style{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:10px 0;border-bottom:1px solid var(--rule);margin-bottom:6px}
+.trk-opt{display:flex;flex-direction:row;align-items:center;gap:8px;font-size:13px}
+.trk-opt select{width:auto}
+.trk-sw{display:inline-flex;gap:2px;flex:none}
+.trk-sw i{width:14px;height:14px;border-radius:2px;display:block;border:1px solid rgba(0,0,0,.15)}
+.trk-segs .trk-col{width:30px;height:24px}
 .trk-segs{list-style:none;margin:0;padding:0;font-size:12px;color:var(--ink-2)}
 .trk-segs li{display:flex;align-items:center;gap:10px;padding:3px 0}
 .trk-segs li .btn{margin-left:auto}
@@ -381,6 +387,11 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
         <div class="status" id="trkMsg"></div>
         <p class="hint">記録中は画面を点けたまま、このアプリを開いておいてください。スマホの画面を消したり別のアプリに切り替えたりすると、その間は記録されません。10m以上動くか30秒ごとに1点を残します。</p>
       </div>
+      <div class="trk-style">
+        <label class="trk-opt">線の色<input type="color" class="trk-col" id="trkColor" aria-label="これから記録する線の色"></label>
+        <label class="trk-opt">線の太さ<select id="trkWeight"><option value="2">細い</option><option value="3.5">ふつう</option><option value="5">太い</option><option value="7">とても太い</option><option value="9">極太</option></select></label>
+        <p class="hint" style="margin:0;width:100%">色を変えると、そのあと記録する線だけがその色になります（記録済みの線の色は変わりません）。点線は、アプリを閉じていたなどで記録が途切れた区間です（直線でつないでいます）。</p>
+      </div>
       <div class="toolbar">
         <button type="button" class="btn sm" id="trkShowAll">すべて表示</button>
         <button type="button" class="btn sm" id="trkHideAll">すべて隠す</button>
@@ -552,7 +563,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
 
       <div id="shLogin" hidden>
         <div class="rules"><b>おすそわけ</b>：釣りすぎた魚を、取りに来てくれる人に無料で譲ります。<br><b>お店向け</b>：魚介類販売業の許可を持ち、管理者の承認を受けたお店に限って、価格を決めて譲れます。<br>どちらも富山県内だけで使えます。</div>
-        <label>メールアドレス<input id="shEmail" type="email" autocomplete="email" inputmode="email" placeholder="you@example.com"></label>
+        <label>メールアドレス<input id="shEmail" name="email" type="email" autocomplete="username email" inputmode="email" placeholder="you@example.com"></label>
         <div class="actions"><button type="button" class="btn primary" id="btnMail">ログイン用のメールを送る</button></div>
         <div class="row" id="codeRow" hidden>
           <label>メールに書かれた6桁のコード<input id="shCode" inputmode="numeric" maxlength="10" autocomplete="one-time-code"></label>
@@ -1525,6 +1536,13 @@ function dayColor(date){
   const used=tracks.find(t=>t.date===date); if(used) return used.color;
   let h=0; for(const ch of date) h=(h*31+ch.charCodeAt(0))>>>0; return DAY_COLORS[h%DAY_COLORS.length];
 }
+/* 線の色（その日の色。選び直すとその日のこれからの線に使う）と太さ */
+function trkPrefColor(){ try{ const v=JSON.parse(localStorage.getItem("choka-trk-color")||"null"); if(v&&v.date===todayStr()) return v.color; }catch{} return dayColor(todayStr()); }
+function trkWeight(){ try{ const w=+localStorage.getItem("choka-trk-weight"); if(w) return w; }catch{} return 5; }
+/* 航跡の色の履歴：t.color が最初の色、t.colorAt=[[点の番号, 色], …] で途中から色が変わる */
+function colorAtIdx(t,i){ let c=t.color; for(const [k,col] of (t.colorAt||[])) if(i>=k) c=col; return c; }
+const trkColors = t => [...new Set([t.color,...(t.colorAt||[]).map(x=>x[1])])];
+const GAP_MS = 120000;   // 2分以上あいた区間は「途切れ」として点線
 function haversine(a,b){                         // m
   const R=6371000, toR=Math.PI/180, dLa=(b[0]-a[0])*toR, dLo=(b[1]-a[1])*toR;
   const s=Math.sin(dLa/2)**2+Math.cos(a[0]*toR)*Math.cos(b[0]*toR)*Math.sin(dLo/2)**2;
@@ -1536,15 +1554,25 @@ const todayStr=()=>nowLocal().slice(0,10);
 
 function drawTracks(){
   trackLayer.clearLayers();
+  const w=trkWeight();
   for(const t of tracks){
     if(!t.visible || t.points.length<2) continue;
-    L.polyline(t.points.map(p=>[p[0],p[1]]),{color:t.color,weight:3.5,opacity:.9,lineJoin:"round"})
-      .bindTooltip(`${t.date.slice(5).replace("-","/")} ${hm(t.points[0][2])}〜${hm(t.points.at(-1)[2])}`,{sticky:true})
-      .addTo(trackLayer);
+    const tip=`${t.date.slice(5).replace("-","/")} ${hm(t.points[0][2])}〜${hm(t.points.at(-1)[2])}`;
+    // 同じ色・同じ線種が続く区間ごとに1本の線にする
+    let run=null;
+    const flush=()=>{ if(run&&run.pts.length>1){
+      L.polyline(run.pts,{color:run.col,weight:run.gap?Math.max(2,w*.7):w,opacity:run.gap?.75:.9,lineJoin:"round",lineCap:"round",dashArray:run.gap?`${Math.round(w*1.6)} ${Math.round(w*2.2)}`:null})
+        .bindTooltip(run.gap?`${tip}（記録が途切れた区間）`:tip,{sticky:true}).addTo(trackLayer); } };
+    for(let i=1;i<t.points.length;i++){
+      const a=t.points[i-1], b=t.points[i], col=colorAtIdx(t,i), gap=(b[2]-a[2])>GAP_MS;
+      if(!run||run.col!==col||run.gap!==gap){ flush(); run={col,gap,pts:[[a[0],a[1]]]}; }
+      run.pts.push([b[0],b[1]]);
+    }
+    flush();
   }
   if(rec && rec.track.points.length){
     const p=rec.track.points.at(-1);
-    L.circleMarker([p[0],p[1]],{radius:7,color:"#fff",weight:2,fillColor:rec.track.color,fillOpacity:1}).addTo(trackLayer);
+    L.circleMarker([p[0],p[1]],{radius:7,color:"#fff",weight:2,fillColor:colorAtIdx(rec.track,rec.track.points.length),fillOpacity:1}).addTo(trackLayer);
   }
 }
 
@@ -1555,10 +1583,10 @@ function drawTrackList(){
   const days=[...new Set(tracks.map(t=>t.date))].sort().reverse();
   box.innerHTML=days.map(day=>{
     const ts=tracks.filter(t=>t.date===day).sort((a,b)=>a.start.localeCompare(b.start));
-    const km=ts.reduce((s,t)=>s+trackLen(t),0)/1000, vis=ts.some(t=>t.visible), col=ts[0].color;
+    const km=ts.reduce((s,t)=>s+trackLen(t),0)/1000, vis=ts.some(t=>t.visible), cols=[...new Set(ts.flatMap(trkColors))];
     return `<div class="trk-day" data-day="${day}">
       <div class="trk-h">
-        <input type="color" class="trk-col" value="${col}" aria-label="${day}の航跡の色">
+        <span class="trk-sw" aria-hidden="true">${cols.slice(0,6).map(c=>`<i style="background:${c}"></i>`).join("")}</span>
         <label class="trk-vis"><input type="checkbox" class="trk-show" ${vis?"checked":""}> ${day.replace(/-/g,"/")}</label>
         <span class="trk-km mono">${km.toFixed(1)} km</span>
       </div>
@@ -1567,7 +1595,7 @@ function drawTrackList(){
         <button type="button" class="btn sm" data-a="gpx">GPX出力</button>
         <button type="button" class="btn sm danger" data-a="del">この日を削除</button>
       </div>
-      <ul class="trk-segs">${ts.map(t=>`<li data-id="${t.id}"><span class="mono">${t.points.length?hm(t.points[0][2])+"〜"+hm(t.points.at(-1)[2]):"（点なし）"}</span>
+      <ul class="trk-segs">${ts.map(t=>`<li data-id="${t.id}"><input type="color" class="trk-col" value="${t.colorAt?.length?t.colorAt.at(-1)[1]:t.color}" title="この区間の色をまとめて変える" aria-label="この区間の色"><span class="mono">${t.points.length?hm(t.points[0][2])+"〜"+hm(t.points.at(-1)[2]):"（点なし）"}</span>
         <span class="mono">${(trackLen(t)/1000).toFixed(1)} km</span>${rec&&rec.track.id===t.id?'<span class="tag">記録中</span>':`<button type="button" class="btn sm danger" data-a="delone">削除</button>`}</li>`).join("")}</ul>
     </div>`;
   }).join("");
@@ -1575,12 +1603,15 @@ function drawTrackList(){
 $("trkList").addEventListener("input",async e=>{
   const day=e.target.closest(".trk-day")?.dataset.day; if(!day) return;
   if(e.target.classList.contains("trk-col")){
-    for(const t of tracks.filter(t=>t.date===day)){ t.color=e.target.value; await saveTrk(t); }
-    drawTracks();
+    // 区間の色をまとめて変える（記録中の区間は、ここから先の色だけ変える）
+    const t=tracks.find(x=>x.id===e.target.closest("li")?.dataset.id); if(!t) return;
+    if(rec&&rec.track.id===t.id) trkSetRecColor(e.target.value,false);
+    else { t.color=e.target.value; delete t.colorAt; await saveTrk(t); drawTracks(); }
   }
 });
 $("trkList").addEventListener("change",async e=>{
   const day=e.target.closest(".trk-day")?.dataset.day; if(!day) return;
+  if(e.target.classList.contains("trk-col")){ drawTrackList(); return; }
   if(e.target.classList.contains("trk-show")){
     for(const t of tracks.filter(t=>t.date===day)){ t.visible=e.target.checked; await saveTrk(t); }
     drawTracks();
@@ -1621,7 +1652,7 @@ async function startRec(resumeId){
   let t = resumeId ? tracks.find(x=>x.id===resumeId) : null;
   if(!t){
     const date=todayStr();
-    t={id:"t"+Date.now().toString(36),date,start:new Date().toISOString(),points:[],color:dayColor(date),visible:true};
+    t={id:"t"+Date.now().toString(36),date,start:new Date().toISOString(),points:[],color:trkPrefColor(),visible:true};
     tracks.push(t); await saveTrk(t);
   }
   rec={track:t,watch:null,wake:null,lastSave:0,lastFix:0};
@@ -1683,6 +1714,24 @@ function updateRecUi(acc){
   $("recPill").classList.toggle("paused",!on);
   $("btnResume").hidden=!resumeId || on;
 }
+/* これから記録する色 */
+async function trkSetRecColor(col,relist=true){
+  try{ localStorage.setItem("choka-trk-color",JSON.stringify({date:todayStr(),color:col})); }catch{}
+  $("trkColor").value=col;
+  const t=rec?.track || (resumeId && tracks.find(x=>x.id===resumeId));
+  if(t){
+    const n=t.points.length;
+    if(!n){ t.color=col; delete t.colorAt; }
+    else if(colorAtIdx(t,n)!==col){
+      t.colorAt=(t.colorAt||[]).filter(x=>x[0]<n); if(colorAtIdx(t,n)!==col) t.colorAt.push([n,col]);
+      if(!t.colorAt.length) delete t.colorAt;
+    }
+    await saveTrk(t);
+  }
+  drawTracks(); if(relist) drawTrackList();
+}
+$("trkColor").addEventListener("input",e=>trkSetRecColor(e.target.value));
+$("trkWeight").addEventListener("change",e=>{ try{ localStorage.setItem("choka-trk-weight",e.target.value); }catch{} drawTracks(); });
 let resumeId=null;
 $("btnTrk").onclick=()=> rec ? stopRec() : startRec();
 $("btnResume").onclick=()=>{ const id=resumeId; resumeId=null; startRec(id); };
@@ -1690,6 +1739,7 @@ $("recPill").onclick=()=>showTab("track");
 
 async function initTracks(){
   tracks=await loadTrks();
+  $("trkColor").value=trkPrefColor(); $("trkWeight").value=String(trkWeight());
   let rid=null; try{ rid=localStorage.getItem("choka-rec"); }catch{}
   if(rid && tracks.some(t=>t.id===rid)){ resumeId=rid; trkMsg("前回の記録が途中で止まっています（アプリが閉じられたため）。「続きを記録」で同じ航跡に追加できます。","err"); }
   else { try{ localStorage.removeItem("choka-rec"); }catch{} }
@@ -1783,7 +1833,8 @@ async function dataUrlToBlob(u){ return (await fetch(u)).blob(); }
 function setBusy(btn,on,text){ if(!btn) return; if(on){ btn.dataset.t=btn.textContent; btn.textContent=text||"処理中…"; btn.disabled=true; } else { btn.textContent=btn.dataset.t||btn.textContent; btn.disabled=false; } }
 
 /* ---------- 起動・ログイン ---------- */
-function shShow(which){ for(const id of ["shNoConf","shLogin","shProfile","shBanned","shNotMember","shMain"]) $(id).hidden = id!==which; updateAccountBtn(); }
+function shShow(which){ for(const id of ["shNoConf","shLogin","shProfile","shBanned","shNotMember","shMain"]) $(id).hidden = id!==which; updateAccountBtn();
+  if(which==="shLogin" && !$("shEmail").value){ try{ $("shEmail").value=localStorage.getItem("choka-email")||""; }catch{} } }
 /* 会員か（決済を入れるまでは、管理者が会員の期限を設定する。サーバーの設定がない手元の試用では制限しない） */
 function isMember(){
   if(!SB_URL||!SB_KEY) return true;
@@ -1849,6 +1900,7 @@ function shOpen(){ if(!SH.started) shStart(); else if(hasProfile() && isMember()
 
 $("btnMail").onclick=async()=>{
   const email=$("shEmail").value.trim();
+  try{ if(email) localStorage.setItem("choka-email",email); }catch{}
   if(!/^\S+@\S+\.\S+$/.test(email)){ shMsg("loginMsg","メールアドレスを確認してください","err"); return; }
   setBusy($("btnMail"),true,"送信中…");
   const {error}=await SH.sb.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin+location.pathname,shouldCreateUser:true}});
