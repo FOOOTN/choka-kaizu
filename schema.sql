@@ -616,6 +616,37 @@ begin
   end loop;
 end $$;
 
+-- 出品者が出品の内容を直す（魚種・釣った日時・写真・位置は変えられない。申し込んでいる人にはお知らせが届く）
+create or replace function public.update_listing(p_listing uuid, p_patch jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+declare l listings; o record; v_shime_at timestamptz; v_treat text[];
+begin
+  select * into l from listings where id = p_listing for update;
+  if not found or l.owner <> auth.uid() then raise exception '権限がありません'; end if;
+  if not is_active_user() then raise exception '利用が停止されています'; end if;
+  if l.status not in ('open','reserved') or l.expires_at <= now() then raise exception '受付中の出品だけ編集できます'; end if;
+  v_shime_at := nullif(p_patch->>'shime_at', '')::timestamptz;
+  if v_shime_at is not null and (v_shime_at < l.caught_at - interval '10 minutes' or v_shime_at > now() + interval '10 minutes') then
+    raise exception '締めた日時は、釣った日時（%）より後で、今より前にしてください', to_char(l.caught_at at time zone 'Asia/Tokyo', 'MM/DD HH24:MI');
+  end if;
+  v_treat := coalesce(array(select jsonb_array_elements_text(p_patch->'treat')), '{}');
+  update listings set
+    count       = (p_patch->>'count')::int,
+    length_cm   = nullif(p_patch->>'length_cm', '')::numeric,
+    shime       = p_patch->>'shime',
+    treat       = v_treat,
+    shime_at    = v_shime_at,
+    cooling     = nullif(p_patch->>'cooling', ''),
+    pickup_area = p_patch->>'pickup_area',
+    handoff     = case when l.kind = 'gift' then '取りに来てもらう' else coalesce(nullif(p_patch->>'handoff', ''), l.handoff) end,
+    price_yen   = case when l.kind = 'gift' then null else nullif(p_patch->>'price_yen', '')::int end,
+    memo        = nullif(left(p_patch->>'memo', 400), '')
+  where id = l.id;
+  for o in select id from requests where listing_id = l.id and status in ('pending','accepted') loop
+    perform sysmsg(o.id, '出品者が出品の内容を変更しました。「探す」や出品の詳細で確認してください。');
+  end loop;
+end $$;
+
 -- 連絡先カードを相手に送る（申し込みを受けたあとだけ）
 create or replace function public.send_card(p_request uuid)
 returns void language plpgsql security definer set search_path = public as $$
@@ -922,10 +953,10 @@ grant  update (nickname, banned, share_catches) on public.profiles to authentica
 
 revoke execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
   public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
-  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text) from public, anon;
+  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text), public.update_listing(uuid, jsonb) from public, anon;
 grant execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
   public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
-  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text) to authenticated;
+  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text), public.update_listing(uuid, jsonb) to authenticated;
 revoke execute on function public.sysmsg(uuid, text) from public, anon, authenticated;   -- 関数の中からだけ使う
 revoke execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) from public, anon;
 grant  execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) to authenticated;

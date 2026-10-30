@@ -370,6 +370,11 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
           <span class="depth-est" id="posDepth"></span>
         </div>
         <label class="row-dt">釣った日時<input id="f_dt" type="datetime-local" required></label>
+        <div class="chips sq" id="dtQuick">
+          <button type="button" class="chip" data-m="0">今</button><button type="button" class="chip" data-m="30">30分前</button>
+          <button type="button" class="chip" data-m="60">1時間前</button><button type="button" class="chip" data-m="120">2時間前</button><button type="button" class="chip" data-m="180">3時間前</button>
+        </div>
+        <p class="hint">開いた時刻が入っています。あとから登録するときは、釣った日時に直してください（写真を選ぶと撮影日時が入ります）。</p>
 
         <section class="q">
           <div class="q-h"><span>魚種</span></div>
@@ -416,7 +421,9 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
         </section>
 
         <section class="q">
-          <div class="q-h"><span>締め・保冷</span><label class="tm">締めた時刻<input id="f_shimeAt" type="time"></label></div>
+          <div class="q-h"><span>締め・保冷</span></div>
+          <label>締めた日時<input id="f_shimeAt" type="datetime-local"></label>
+          <div class="status" id="timeWarn"></div>
           <p class="sub-h">締め方（1つ選ぶ）</p>
           <div class="chips sq" data-for="f_shime" data-values="活魚,脳締め,氷締め,野締め" data-labels="活魚（生かしたまま）,脳締め,氷締め,野締め"></div>
           <input type="hidden" id="f_shime">
@@ -563,7 +570,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
               <label>匹数<div class="unit"><input id="pf_count" type="number" min="1" inputmode="numeric"><span>匹</span></div></label>
               <label>最大全長<div class="unit"><input id="pf_len" type="number" step="0.5" min="0" inputmode="decimal"><span>cm</span></div></label>
               <label>締め方（1つ選ぶ）<select id="pf_shime"><option value=""></option><option>活魚</option><option>脳締め</option><option>氷締め</option><option>野締め</option></select></label>
-              <label>締めた時刻<input id="pf_shimeAt" type="time"></label>
+              <label>締めた日時<input id="pf_shimeAt" type="datetime-local"></label>
               <label>保冷<select id="pf_cooling"><option value=""></option><option>氷</option><option>潮氷</option><option>クーラーのみ</option></select></label>
               <p class="sub-h full">締めたあとの処理（いくつでも）</p>
               <div class="checks inline full" id="pfTreat">
@@ -914,7 +921,28 @@ function spColor(s){ let h=0; for(const c of (s||"")) h=(h*31+c.codePointAt(0))>
 /* ========== 状態と描画 ========== */
 let records = [];
 const markers = new Map();
-const shimeLine = r => [r.shime, ...(r.treat?String(r.treat).split(","):[]), r.cooling?`保冷：${r.cooling}`:"", r.shimeAt?`${r.shimeAt}締め`:""].filter(Boolean).join("・");
+/* 締めた日時（前の版の「時刻だけ」の記録は、釣った日に当てはめる。釣った時刻より前なら翌日） */
+function fullShime(r){
+  const v=r?.shimeAt; if(!v) return "";
+  if(/^\d{2}:\d{2}$/.test(v) && r.datetime){
+    let d=new Date(`${r.datetime.slice(0,10)}T${v}:00+09:00`).getTime();
+    if(d<new Date(r.datetime+":00+09:00").getTime()-10*60000) d+=86400000;
+    return toLocalInput(d);
+  }
+  return String(v).slice(0,16);
+}
+function toLocalInput(ms){ const d=new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+const localMs = v => v ? new Date(v+":00+09:00").getTime() : NaN;
+const mdhm = v => v ? `${+v.slice(5,7)}/${+v.slice(8,10)} ${v.slice(11,16)}` : "";
+const shimeLine = r => [r.shime, ...(r.treat?String(r.treat).split(","):[]), r.cooling?`保冷：${r.cooling}`:"", fullShime(r)?`${mdhm(fullShime(r))}締め`:""].filter(Boolean).join("・");
+/* 釣った日時と締めた日時の食い違いを調べる */
+function timeProblem(dt,sh){
+  const now=Date.now(), a=localMs(dt), b=localMs(sh);
+  if(!isNaN(a) && a>now+10*60000) return {msg:`釣った日時（${mdhm(dt)}）が未来になっています。`};
+  if(!isNaN(b) && b>now+10*60000) return {msg:`締めた日時（${mdhm(sh)}）が未来になっています。`};
+  if(!isNaN(a) && !isNaN(b) && b<a-10*60000) return {msg:`締めた日時（${mdhm(sh)}）が、釣った日時（${mdhm(dt)}）より前になっています。`, fix:true};
+  return null;
+}
 
 function popupHtml(r){
   const rows = [
@@ -1120,7 +1148,8 @@ document.addEventListener("click",e=>{
     const seg=box.classList.contains("seg");
     inp.value = (!seg && inp.value===b.dataset.v) ? "" : b.dataset.v;
   }
-  if(box.dataset.for==="f_shime" && inp.value && !$("f_shimeAt").value) $("f_shimeAt").value=$("f_dt").value.slice(11,16);
+  if(box.dataset.for==="f_shime" && inp.value && !$("f_shimeAt").value) $("f_shimeAt").value=$("f_dt").value;
+  if(box.dataset.for==="f_shime") checkTimes();
   inp.dispatchEvent(new Event("input",{bubbles:true}));
   syncChips();
 });
@@ -1155,6 +1184,7 @@ function openForm(r, pos, carry){
   $("f_dt").value = r?.datetime || carry?.datetime || nowLocal();
   const src = r || carry;
   if(src) for(const [k,id] of Object.entries(FIELDS)) if(src[k]!=null) $(id).value = src[k];
+  $("f_shimeAt").value = r ? fullShime(r) : "";        // 新規・次の1匹は空から（締め方を選ぶと釣った日時が入る）
   if(!r && !carry){                                  // 新規：前回の釣法・締め方などを引き継ぐ
     const last=lastRecord();
     if(last) for(const k of ["method","bait","tanaRef","spot","shime","treat","cooling"]) if(last[k]) $(FIELDS[k]).value=last[k];
@@ -1169,7 +1199,7 @@ function openForm(r, pos, carry){
   }
   if(!r && !carry) fillTideCalc();
   if(r || carry) wxSummary();
-  drawPhotos(); syncChips(); showTab("form");
+  drawPhotos(); syncChips(); checkTimes(); showTab("form");
   $("btnSave").textContent = r ? "変更を保存" : "保存";
   $("btnSaveNext").hidden = !!r;
   if(!r) scheduleWx(false);
@@ -1177,7 +1207,22 @@ function openForm(r, pos, carry){
 
 function onLatLonInput(){ const a=num($("f_lat").value), b=num($("f_lon").value); if(a!=null&&b!=null&&!isNaN(a)&&!isNaN(b)) setDraft(a,b,true); }
 $("f_lat").addEventListener("change",onLatLonInput); $("f_lon").addEventListener("change",onLatLonInput);
-$("f_dt").addEventListener("change",()=>{ fillTideCalc(); scheduleWx(true); });
+$("f_dt").addEventListener("change",()=>{ fillTideCalc(); scheduleWx(true); checkTimes(); });
+$("f_shimeAt").addEventListener("change",checkTimes);
+$("dtQuick").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-m]"); if(!b) return;
+  $("f_dt").value=toLocalInput(Date.now()-b.dataset.m*60000);
+  $("f_dt").dispatchEvent(new Event("change"));
+});
+function checkTimes(){
+  const p=timeProblem($("f_dt").value,$("f_shimeAt").value), w=$("timeWarn");
+  if(!p){ w.innerHTML=""; w.className="status"; return true; }
+  w.className="status err";
+  w.innerHTML=esc(p.msg)+(p.fix?` <button type="button" class="btn sm" id="fixDt">釣った日時を${esc(mdhm($("f_shimeAt").value))}に直す</button> <button type="button" class="btn sm" id="fixSh">締めた日時を釣った日時に合わせる</button>`:"");
+  $("fixDt")?.addEventListener("click",()=>{ $("f_dt").value=$("f_shimeAt").value; $("f_dt").dispatchEvent(new Event("change")); });
+  $("fixSh")?.addEventListener("click",()=>{ $("f_shimeAt").value=$("f_dt").value; checkTimes(); });
+  return false;
+}
 
 function fillTideCalc(){
   const dt=$("f_dt").value; if(!dt) return;
@@ -1251,7 +1296,7 @@ $("f_photo").addEventListener("change",async e=>{
       const dt=ex?exifToLocal(ex.date):null;
       if(isNew && !used && ex){
         const got=[];
-        if(dt){ $("f_dt").value=dt; fillTideCalc(); got.push("日時"); }
+        if(dt){ $("f_dt").value=dt; fillTideCalc(); checkTimes(); got.push("日時"); }
         if(ex.lat!=null){ setDraft(ex.lat,ex.lon,true); got.push("位置"); }
         if(got.length){ used=true; sawExif=true; autoStatus(`写真から${got.join("と")}を入れました`,"ok"); scheduleWx(true); }
       }
@@ -1280,6 +1325,7 @@ function drawPhotos(){
 async function saveForm(next){
   const lat=num($("f_lat").value), lon=num($("f_lon").value);
   if(lat==null||lon==null){ autoStatus("位置が未指定です。地図をタップするか「現在地」を押してください。","err"); $("autoStatus").scrollIntoView({block:"center"}); return; }
+  if(!checkTimes()){ $("timeWarn").scrollIntoView({block:"center"}); return; }
   const id = $("f_id").value || (Date.now().toString(36)+Math.random().toString(36).slice(2,7));
   const r = {id,lat,lon,datetime:$("f_dt").value,photos,photoDates,updatedAt:new Date().toISOString()};
   for(const [k,fid] of Object.entries(FIELDS)){ const v=$(fid).value.trim(); r[k] = NUMERIC.has(k)?num(v):(v||null); }
@@ -1842,7 +1888,7 @@ async function shDetail(id){
   ].filter(x=>x[1]);
   let act="";
   if(l.mine){
-    act = ["open","reserved"].includes(l.status) ? `<button type="button" class="btn danger" id="dtCancel">出品を取り下げる</button>` : "";
+    act = ["open","reserved"].includes(l.status) ? `<button type="button" class="btn" id="dtEdit">出品内容を編集</button><button type="button" class="btn danger" id="dtCancel">出品を取り下げる</button>` : "";
     act = `<span class="hint" style="flex:1">自分の出品です。申し込みは「やり取り」に届きます。</span>${act}`;
   } else if(l.my_request){
     act = `<span class="hint" style="flex:1">申し込み済みです。</span><button type="button" class="btn primary" id="dtDeals">やり取りを見る</button>`;
@@ -1866,6 +1912,7 @@ async function shDetail(id){
   b.querySelector("#dtReq")?.addEventListener("click",()=>reqForm(l));
   b.querySelector("#dtDeals")?.addEventListener("click",()=>{ $("dlg").close(); shSub("deals"); });
   b.querySelector("#dtReport")?.addEventListener("click",()=>reportForm(l));
+  b.querySelector("#dtEdit")?.addEventListener("click",()=>editListing(l));
   b.querySelector("#dtCancel")?.addEventListener("click",async()=>{
     const reason=await reasonDlg("出品を取り下げる","取り下げると、申し込んでいる人に理由つきでお知らせが届きます。",REASONS.listing,"取り下げる");
     if(reason==null){ shDetail(l.id); return; }
@@ -1888,6 +1935,42 @@ async function shDetail(id){
   });
 }
 
+function editListing(l){
+  const caughtL=toLocalInput(new Date(l.caught_at).getTime()), shL=l.shime_at?toLocalInput(new Date(l.shime_at).getTime()):"";
+  const opt=(list,v)=>list.map(x=>`<option ${x===v?"selected":""}>${x}</option>`).join("");
+  const b=openDlg(`${l.species}の出品を編集`,`<p class="hint">釣った日時（${mdhm(caughtL)}）・魚種・写真・位置は変えられません。変えたいときは取り下げて出し直してください。申し込んでいる人には、変更のお知らせが届きます。</p>
+    <div class="grid">
+      <label>匹数<div class="unit"><input id="ed_count" type="number" min="1" value="${l.count}" inputmode="numeric"><span>匹</span></div></label>
+      <label>最大全長<div class="unit"><input id="ed_len" type="number" step="0.5" min="0" value="${l.length_cm??""}" inputmode="decimal"><span>cm</span></div></label>
+      <label>締め方（1つ選ぶ）<select id="ed_shime">${opt(["活魚","脳締め","氷締め","野締め"],l.shime)}</select></label>
+      <label>締めた日時<input id="ed_shimeAt" type="datetime-local" value="${shL}"></label>
+      <p class="sub-h full">締めたあとの処理（いくつでも）</p>
+      <div class="checks inline full" id="ed_treat">${["血抜き","神経締め","内臓除去"].map(v=>`<label><input type="checkbox" value="${v}" ${(l.treat||[]).includes(v)?"checked":""}>${v}</label>`).join("")}</div>
+      <label>保冷<select id="ed_cool"><option value=""></option>${opt(["氷","潮氷","クーラーのみ"],l.cooling)}</select></label>
+      <label>受け渡し場所の名前<input id="ed_area" maxlength="40" value="${esc(l.pickup_area)}"></label>
+      ${l.kind==="shop"?`<label>受け渡し方法<select id="ed_hand">${opt(["どちらでも","店に持ち込む","取りに来てもらう"],l.handoff)}</select></label>
+      <label>希望価格<div class="unit"><input id="ed_price" type="number" min="0" step="100" value="${l.price_yen??""}" inputmode="numeric"><span>円</span></div></label>`:""}
+      <label class="full">ひとこと<textarea id="ed_memo" maxlength="400">${esc(l.memo||"")}</textarea></label>
+    </div>
+    <div class="actions"><button type="button" class="btn" id="edBack">戻る</button><button type="button" class="btn primary" id="edSave">変更を保存</button></div>
+    <div class="status" id="edStat"></div>`);
+  b.querySelector("#edBack").onclick=()=>shDetail(l.id);
+  b.querySelector("#edSave").onclick=async e=>{
+    const sh=$("ed_shimeAt").value, tp=timeProblem(caughtL,sh);
+    if(tp) return shMsg("edStat",tp.msg,"err");
+    const count=num($("ed_count").value); if(!count||count<1) return shMsg("edStat","匹数を入れてください","err");
+    const area=$("ed_area").value.trim(); if(!area) return shMsg("edStat","受け渡し場所の名前を入れてください","err");
+    const patch={count,length_cm:num($("ed_len").value),shime:$("ed_shime").value,shime_at:sh?new Date(localMs(sh)).toISOString():null,
+      treat:[...$("ed_treat").querySelectorAll("input:checked")].map(i=>i.value),cooling:$("ed_cool").value||null,pickup_area:area,
+      handoff:l.kind==="shop"?$("ed_hand").value:null,price_yen:l.kind==="shop"?num($("ed_price").value):null,memo:$("ed_memo").value.trim()||null};
+    setBusy(e.target,true,"保存中…");
+    const {error}=await SH.sb.rpc("update_listing",{p_listing:l.id,p_patch:patch});
+    setBusy(e.target,false);
+    if(error) return shMsg("edStat",shErr(error),"err");
+    SH.cache.delete(l.id); await shDetail(l.id); shMsg("dtStat","変更を保存しました","ok");
+    if(SH.sub==="post") shMine();
+  };
+}
 function reqForm(l){
   const b=openDlg(`${l.species}に申し込む`,
     `<p class="hint">${l.kind==="gift"?"おすそわけは無料です。お礼としてお金や物を渡す約束はしないでください。":"価格はここで提示し、支払いは受け渡しのときに当事者間で行います。"}</p>
@@ -1950,7 +2033,7 @@ $("postCatches").addEventListener("click",e=>{
 function shPostStart(r){
   SH.post={rec:r, kind:null, pickup:null};
   $("pf_count").value=r.count||1; $("pf_len").value=r.length??"";
-  $("pf_shime").value=r.shime||""; $("pf_shimeAt").value=r.shimeAt||""; $("pf_cooling").value=r.cooling||"";
+  $("pf_shime").value=r.shime||""; $("pf_shimeAt").value=fullShime(r); $("pf_cooling").value=r.cooling||"";
   const tr=r.treat?String(r.treat).split(","):[];
   $("pfTreat").querySelectorAll("input").forEach(i=>i.checked=tr.includes(i.value));
   $("pf_area").value=""; $("pf_price").value=""; $("pf_memo").value=""; $("pf_handoff").value="どちらでも";
@@ -2008,8 +2091,9 @@ $("pfSubmit").onclick=async()=>{
   if([...$("pfChecks").querySelectorAll("label")].filter(l=>!l.hidden).some(l=>!l.querySelector("input").checked)) return err("確認事項すべてにチェックしてください");
   const caught=recTime(r);
   if(Date.now()-caught>24*3600000) return err("出品できるのは24時間以内に釣った魚だけです");
-  let shimeAt=null; const t=$("pf_shimeAt").value;
-  if(t){ let d=new Date(`${r.datetime.slice(0,10)}T${t}:00+09:00`).getTime(); if(d<caught-10*60000) d+=86400000; shimeAt=new Date(d).toISOString(); }
+  const t=$("pf_shimeAt").value, tp=timeProblem(r.datetime,t);
+  if(tp) return err(tp.msg+(tp.fix?"締めた日時を直すか、「釣果一覧」でこの釣果の釣った日時を直してください。":""));
+  const shimeAt=t?new Date(localMs(t)).toISOString():null;
   const src=(r.photos||[]).slice(0,4); if(!src.length) return err("写真がない釣果は出品できません");
   const btn=$("pfSubmit"); setBusy(btn,true,"写真を送信中…");
   const base=`${SH.user.id}/${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, paths=[];
