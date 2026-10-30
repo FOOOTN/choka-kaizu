@@ -135,6 +135,71 @@ create table if not exists public.shared_catches (
 create index if not exists shared_catches_time_idx on public.shared_catches(caught_at desc);
 create index if not exists shared_catches_owner_idx on public.shared_catches(owner);
 
+-- やり取りの自動のお知らせ（取り消し・受けた・連絡先カードなど）と、取り消しの理由
+alter table public.messages add column if not exists kind text not null default 'user';
+do $$ begin
+  if not exists(select 1 from pg_constraint where conname = 'messages_kind_check') then
+    alter table public.messages add constraint messages_kind_check check (kind in ('user','system'));
+  end if;
+end $$;
+alter table public.requests add column if not exists cancel_reason text check (char_length(cancel_reason) <= 100);
+alter table public.listings add column if not exists cancel_reason text check (char_length(cancel_reason) <= 100);
+
+-- 連絡先カード（本人だけが編集。送ったときだけ相手に見える）
+create table if not exists public.contact_cards (
+  owner       uuid primary key default auth.uid() references public.profiles(id) on delete cascade,
+  phone       text check (char_length(phone) <= 20),
+  line_id     text check (char_length(line_id) <= 40),
+  address     text check (char_length(address) <= 100),
+  hours       text check (char_length(hours) <= 60),
+  note        text check (char_length(note) <= 200),
+  updated_at  timestamptz not null default now()
+);
+
+-- やり取りの中で送られた連絡先カード（送った時点の内容。受け渡し済みから3日たつと相手から見えなくなる）
+create table if not exists public.deal_cards (
+  request_id  uuid not null references public.requests(id) on delete cascade,
+  sender      uuid not null references public.profiles(id) on delete cascade,
+  data        jsonb not null,
+  created_at  timestamptz not null default now(),
+  primary key (request_id, sender)
+);
+
+-- お店の買い取り希望
+create table if not exists public.wants (
+  id          uuid primary key default gen_random_uuid(),
+  shop_id     uuid not null references public.shops(id) on delete cascade,
+  owner       uuid not null default auth.uid() references public.profiles(id) on delete cascade,
+  species     text not null check (char_length(species) between 1 and 40),
+  min_len     numeric(5,1) check (min_len > 0 and min_len < 400),
+  max_len     numeric(5,1) check (max_len > 0 and max_len < 400),
+  shime       text[] not null default '{}' check (shime <@ array['活魚','脳締め','氷締め','野締め']::text[]),
+  treat       text[] not null default '{}' check (treat <@ array['血抜き','神経締め','内臓除去']::text[]),
+  price_yen   int check (price_yen between 0 and 1000000),
+  price_unit  text not null default '1匹' check (price_unit in ('1匹','1kg')),
+  area        text check (char_length(area) <= 40),
+  until       date not null,
+  memo        text check (char_length(memo) <= 400),
+  status      text not null default 'open' check (status in ('open','closed')),
+  created_at  timestamptz not null default now()
+);
+create index if not exists wants_open_idx on public.wants(status, until);
+
+-- 受け渡し済みの取引の評価（お互いに1回ずつ。3項目×1〜5）
+create table if not exists public.ratings (
+  id          bigint generated always as identity primary key,
+  request_id  uuid not null references public.requests(id) on delete cascade,
+  rater       uuid not null references public.profiles(id) on delete cascade,
+  ratee       uuid not null references public.profiles(id) on delete cascade,
+  s1          smallint not null check (s1 between 1 and 5),
+  s2          smallint not null check (s2 between 1 and 5),
+  s3          smallint not null check (s3 between 1 and 5),
+  comment     text check (char_length(comment) <= 200),
+  created_at  timestamptz not null default now(),
+  unique (request_id, rater)
+);
+create index if not exists ratings_ratee_idx on public.ratings(ratee);
+
 -- ---------------------------------------------------------------------
 -- 2. 出品できない種類の初期値
 --    ひらがな・カタカナどちらで入力されても止まるように、照合はカタカナに直して行う
@@ -201,6 +266,30 @@ language sql stable security definer set search_path = public as $$
   select exists(
     select 1 from requests r join listings l on l.id = r.listing_id
      where r.id = p_request and (r.requester = auth.uid() or l.owner = auth.uid()))
+$$;
+
+-- やり取りに自動のお知らせを書く
+create or replace function public.sysmsg(p_request uuid, p_body text) returns void
+language sql security definer set search_path = public as $$
+  insert into messages(request_id, sender, body, kind) values (p_request, auth.uid(), left(p_body, 1000), 'system')
+$$;
+
+-- 評価のまとめ（3件未満は平均を出さない）
+create or replace function public.rating_of(p_user uuid) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('n', count(*),
+           'avg', case when count(*) >= 3 then round(avg((s1 + s2 + s3) / 3.0), 1) end)
+    from ratings where ratee = p_user
+$$;
+
+-- 買い取り希望と出品が合うか
+create or replace function public.want_matches(w public.wants, l public.listings) returns boolean
+language sql stable as $$
+  select (position(kana_norm(w.species) in kana_norm(l.species)) > 0 or position(kana_norm(l.species) in kana_norm(w.species)) > 0)
+     and (w.min_len is null or l.length_cm >= w.min_len)
+     and (w.max_len is null or l.length_cm <= w.max_len)
+     and (cardinality(w.shime) = 0 or l.shime = any(w.shime))
+     and (w.treat <@ l.treat)
 $$;
 
 -- ---------------------------------------------------------------------
@@ -316,6 +405,48 @@ drop trigger if exists listings_before_insert on public.listings;
 create trigger listings_before_insert before insert on public.listings
   for each row execute function public.listings_before_insert();
 
+-- 買い取り希望：承認済みのお店だけ。期限は60日以内、同時に10件まで
+create or replace function public.wants_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare v_reason text; v_n int;
+begin
+  if auth.uid() is null then return new; end if;
+  if tg_op = 'UPDATE' then
+    if new.owner <> old.owner or new.shop_id <> old.shop_id then raise exception '権限がありません'; end if;
+    return new;
+  end if;
+  new.owner := auth.uid(); new.status := 'open'; new.created_at := now();
+  new.shop_id := my_shop();
+  if new.shop_id is null then raise exception '買い取り希望を出せるのは、承認済みのお店だけです'; end if;
+  v_reason := blocked_reason(new.species);
+  if v_reason is not null then raise exception 'この種類は扱えません（%）', v_reason; end if;
+  if new.min_len is not null and new.max_len is not null and new.min_len > new.max_len then
+    raise exception 'サイズの範囲が逆になっています';
+  end if;
+  if new.until < (now() at time zone 'Asia/Tokyo')::date or new.until > (now() at time zone 'Asia/Tokyo')::date + 60 then
+    raise exception '期限は今日から60日以内にしてください';
+  end if;
+  select count(*) into v_n from wants where shop_id = new.shop_id and status = 'open'
+     and until >= (now() at time zone 'Asia/Tokyo')::date;
+  if v_n >= 10 then raise exception '受付中の買い取り希望は10件までです'; end if;
+  return new;
+end $$;
+drop trigger if exists wants_guard on public.wants;
+create trigger wants_guard before insert or update on public.wants
+  for each row execute function public.wants_guard();
+
+-- 連絡先カード：本人のものだけ
+create or replace function public.contact_cards_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then return new; end if;
+  new.owner := auth.uid(); new.updated_at := now();
+  return new;
+end $$;
+drop trigger if exists contact_cards_guard on public.contact_cards;
+create trigger contact_cards_guard before insert or update on public.contact_cards
+  for each row execute function public.contact_cards_guard();
+
 -- 前の版の仕組み（本人ごとの共有オン・オフ）は使わないので外す
 drop trigger if exists profiles_share_off on public.profiles;
 drop function if exists public.profiles_share_off();
@@ -395,6 +526,16 @@ begin
        and created_at > now() - interval '24 hours';
     if v_n >= 5 then raise exception 'おすそわけの申し込みは同時に5件までです'; end if;
   end if;
+  -- 自分で取り消した申し込みなら、申し込み直せる
+  select id into v_id from requests where listing_id = p_listing and requester = auth.uid();
+  if found then
+    update requests set status = 'pending', message = p_message, offer_yen = p_offer, shop_id = v_shop,
+                        cancel_reason = null, updated_at = now()
+     where id = v_id and status = 'cancelled';
+    if not found then raise exception 'この出品にはすでに申し込んでいます'; end if;
+    perform sysmsg(v_id, 'もう一度申し込みました：' || left(p_message, 300));
+    return v_id;
+  end if;
   insert into requests(listing_id, requester, shop_id, message, offer_yen)
   values (p_listing, auth.uid(), v_shop, p_message, p_offer)
   returning id into v_id;
@@ -406,7 +547,7 @@ end $$;
 -- 出品者が申し込みを受ける／断る
 create or replace function public.respond_request(p_request uuid, p_accept boolean)
 returns void language plpgsql security definer set search_path = public as $$
-declare r requests; l listings;
+declare r requests; l listings; o record;
 begin
   select * into r from requests where id = p_request for update;
   if not found then raise exception '申し込みが見つかりません'; end if;
@@ -416,11 +557,15 @@ begin
   if p_accept then
     if l.status <> 'open' or l.expires_at <= now() then raise exception 'この出品は受付を終了しています'; end if;
     update requests set status = 'accepted', updated_at = now() where id = r.id;
-    update requests set status = 'declined', updated_at = now()
-     where listing_id = l.id and id <> r.id and status = 'pending';
+    perform sysmsg(r.id, '出品者が申し込みを受けました。受け渡しの場所と時間を決めてください。');
+    for o in select id from requests where listing_id = l.id and id <> r.id and status = 'pending' loop
+      update requests set status = 'declined', updated_at = now() where id = o.id;
+      perform sysmsg(o.id, 'ほかの方に決まったため、今回は見送りになりました。');
+    end loop;
     update listings set status = 'reserved' where id = l.id;
   else
     update requests set status = 'declined', updated_at = now() where id = r.id;
+    perform sysmsg(r.id, '出品者が今回は見送りました。');
   end if;
 end $$;
 
@@ -436,33 +581,74 @@ begin
   if r.status <> 'accepted' then raise exception '受けた申し込みだけ完了にできます'; end if;
   update requests set status = 'done', updated_at = now() where id = r.id;
   update listings set status = 'done' where id = l.id;
+  perform sysmsg(r.id, '受け渡しが完了しました。よければお互いに評価してください。');
 end $$;
 
--- 申込者が申し込みを取り消す（受けてもらった後なら出品は受付中に戻る）
-create or replace function public.cancel_request(p_request uuid)
+-- 申込者が申し込みを取り消す（受けてもらった後なら出品は受付中に戻る）。理由は相手に伝わる
+drop function if exists public.cancel_request(uuid);
+create or replace function public.cancel_request(p_request uuid, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare r requests;
 begin
   select * into r from requests where id = p_request for update;
   if not found or r.requester <> auth.uid() then raise exception '権限がありません'; end if;
   if r.status not in ('pending','accepted') then raise exception 'この申し込みは取り消せません'; end if;
-  update requests set status = 'cancelled', updated_at = now() where id = r.id;
+  update requests set status = 'cancelled', cancel_reason = left(p_reason, 100), updated_at = now() where id = r.id;
+  perform sysmsg(r.id, '申込者が取り消しました' || coalesce('（理由：' || left(p_reason, 100) || '）', '') || '。');
   if r.status = 'accepted' then
-    update listings set status = 'open' where id = r.listing_id and status = 'reserved';
+    update listings set status = 'open' where id = r.listing_id and status = 'reserved' and expires_at > now();
   end if;
 end $$;
 
--- 出品者が出品を取り下げる（申し込みはすべて取り消しになる）
-create or replace function public.cancel_listing(p_listing uuid)
+-- 出品者が出品を取り下げる（申し込みはすべて取り消しになり、相手にお知らせが届く）
+drop function if exists public.cancel_listing(uuid);
+create or replace function public.cancel_listing(p_listing uuid, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
-declare l listings;
+declare l listings; o record;
 begin
   select * into l from listings where id = p_listing for update;
   if not found or l.owner <> auth.uid() then raise exception '権限がありません'; end if;
   if l.status not in ('open','reserved') then raise exception 'この出品は取り下げられません'; end if;
-  update listings set status = 'cancelled' where id = l.id;
-  update requests set status = 'cancelled', updated_at = now()
-   where listing_id = l.id and status in ('pending','accepted');
+  update listings set status = 'cancelled', cancel_reason = left(p_reason, 100) where id = l.id;
+  for o in select id from requests where listing_id = l.id and status in ('pending','accepted') loop
+    update requests set status = 'cancelled', cancel_reason = left(p_reason, 100), updated_at = now() where id = o.id;
+    perform sysmsg(o.id, '出品者が出品を取り下げました' || coalesce('（理由：' || left(p_reason, 100) || '）', '') || '。');
+  end loop;
+end $$;
+
+-- 連絡先カードを相手に送る（申し込みを受けたあとだけ）
+create or replace function public.send_card(p_request uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests; c contact_cards; d jsonb; nick text;
+begin
+  select * into r from requests where id = p_request;
+  if not found or not is_request_party(p_request) then raise exception '権限がありません'; end if;
+  if r.status <> 'accepted' then raise exception '連絡先カードを送れるのは、申し込みを受けたあとだけです'; end if;
+  select * into c from contact_cards where owner = auth.uid();
+  d := jsonb_strip_nulls(jsonb_build_object('phone', nullif(c.phone, ''), 'line_id', nullif(c.line_id, ''),
+         'address', nullif(c.address, ''), 'hours', nullif(c.hours, ''), 'note', nullif(c.note, '')));
+  if not found or d = '{}'::jsonb then raise exception '先に「連絡先カード」を作ってください'; end if;
+  insert into deal_cards(request_id, sender, data) values (p_request, auth.uid(), d)
+  on conflict (request_id, sender) do update set data = excluded.data, created_at = now();
+  select nickname into nick from profiles where id = auth.uid();
+  perform sysmsg(p_request, nick || 'さんが連絡先カードを送りました。');
+end $$;
+
+-- 受け渡し済みの取引を評価する（30日以内・1回だけ）
+create or replace function public.rate_deal(p_request uuid, p_s1 int, p_s2 int, p_s3 int, p_comment text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests; l listings; v_ratee uuid;
+begin
+  select * into r from requests where id = p_request;
+  if not found or not is_request_party(p_request) then raise exception '権限がありません'; end if;
+  if r.status <> 'done' then raise exception '評価できるのは受け渡し済みの取引だけです'; end if;
+  if r.updated_at < now() - interval '30 days' then raise exception '評価できるのは受け渡しから30日以内です'; end if;
+  select * into l from listings where id = r.listing_id;
+  v_ratee := case when l.owner = auth.uid() then r.requester else l.owner end;
+  insert into ratings(request_id, rater, ratee, s1, s2, s3, comment)
+  values (p_request, auth.uid(), v_ratee, p_s1, p_s2, p_s3, nullif(left(p_comment, 200), ''));
+exception when unique_violation then
+  raise exception 'この取引はすでに評価しました';
 end $$;
 
 -- ---------------------------------------------------------------------
@@ -479,6 +665,10 @@ select
   case when l.status = 'open' and l.expires_at <= now() then 'expired' else l.status end as status,
   l.expires_at, l.created_at,
   p.nickname as owner_name,
+  rating_of(l.owner) as owner_rating,
+  (my_shop() is not null and exists(select 1 from wants w where w.shop_id = my_shop() and w.status = 'open'
+      and w.until >= (now() at time zone 'Asia/Tokyo')::date and want_matches(w, l))) as matches_my_want,
+  l.cancel_reason,
   (l.owner = auth.uid()) as mine,
   (select r.id from requests r where r.listing_id = l.id and r.requester = auth.uid()) as my_request,
   case when is_admin() then l.catch_lat end as catch_lat,  -- 釣った位置は管理者だけ
@@ -509,7 +699,11 @@ select
   (r.requester = auth.uid()) as i_am_requester,
   (l.owner = auth.uid() or r.requester = auth.uid()) as i_am_party,
   (select count(*) from messages m where m.request_id = r.id) as msg_count,
-  (select max(m.created_at) from messages m where m.request_id = r.id) as last_msg_at
+  (select max(m.created_at) from messages m where m.request_id = r.id and m.sender <> auth.uid()) as last_msg_at,
+  r.cancel_reason,
+  rating_of(case when l.owner = auth.uid() then r.requester else l.owner end) as other_rating,
+  exists(select 1 from ratings g where g.request_id = r.id and g.rater = auth.uid()) as my_rated,
+  (r.status = 'done' and r.updated_at > now() - interval '30 days') as can_rate
 from public.requests r
 join public.listings l  on l.id = r.listing_id
 join public.profiles rp on rp.id = r.requester
@@ -537,6 +731,28 @@ create view public.shop_cards with (security_barrier = true) as
 select s.*, p.nickname as owner_name
 from public.shops s join public.profiles p on p.id = s.owner
 where is_admin() or s.owner = auth.uid();
+
+-- 買い取り希望の一覧（ログインした人が見られる。受付中のもの＋自分のお店のもの）
+drop view if exists public.want_cards;
+create view public.want_cards with (security_barrier = true) as
+select w.*, s.name as shop_name, s.area as shop_area, (w.owner = auth.uid()) as mine,
+       (w.status = 'open' and w.until >= (now() at time zone 'Asia/Tokyo')::date) as active
+from public.wants w join public.shops s on s.id = w.shop_id
+where auth.uid() is not null
+  and (w.owner = auth.uid() or is_admin()
+       or (w.status = 'open' and w.until >= (now() at time zone 'Asia/Tokyo')::date and s.status = 'approved' and is_active_user()));
+
+-- 管理者用：評価の一覧
+drop view if exists public.rating_cards;
+create view public.rating_cards with (security_barrier = true) as
+select g.id, g.request_id, g.s1, g.s2, g.s3, g.comment, g.created_at,
+       a.nickname as rater_name, b.nickname as ratee_name, l.species, l.kind, (l.owner = g.ratee) as ratee_is_owner
+from public.ratings g
+join public.profiles a on a.id = g.rater
+join public.profiles b on b.id = g.ratee
+join public.requests r on r.id = g.request_id
+join public.listings l on l.id = r.listing_id
+where is_admin();
 
 -- 管理者用：提供された釣果（ログインしていない端末は「匿名-端末番号の頭4文字」）
 drop view if exists public.shared_catch_cards;
@@ -572,6 +788,10 @@ begin
     'messages',       (select count(*) from messages),
     'shops',          (select coalesce(jsonb_object_agg(status, n), '{}'::jsonb) from (select status, count(*) n from shops group by 1) t),
     'reports_open',   (select count(*) from reports where status = 'open'),
+    'wants_open',     (select count(*) from wants where status = 'open' and until >= (now() at time zone 'Asia/Tokyo')::date),
+    'ratings',        (select count(*) from ratings),
+    'cancels',        (select coalesce(jsonb_object_agg(cancel_reason, n), '{}'::jsonb) from (
+                         select cancel_reason, count(*) n from requests where cancel_reason is not null group by 1) t),
     'top_species',    (select coalesce(jsonb_agg(t), '[]'::jsonb) from (
                          select species, count(*) n, sum(count) fish from listings where status <> 'removed'
                          group by species order by 2 desc, 1 limit 10) t),
@@ -598,6 +818,10 @@ alter table public.requests      enable row level security;
 alter table public.messages      enable row level security;
 alter table public.reports       enable row level security;
 alter table public.shared_catches enable row level security;
+alter table public.contact_cards enable row level security;
+alter table public.deal_cards    enable row level security;
+alter table public.wants         enable row level security;
+alter table public.ratings       enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 drop policy if exists profiles_insert on public.profiles;
@@ -636,7 +860,7 @@ create policy messages_select on public.messages for select to authenticated
   using (is_request_party(request_id) or is_admin());
 create policy messages_insert on public.messages for insert to authenticated
   with check (
-    sender = auth.uid() and is_active_user() and is_request_party(request_id)
+    sender = auth.uid() and kind = 'user' and is_active_user() and is_request_party(request_id)
     and exists(select 1 from requests r where r.id = request_id and r.status in ('pending','accepted'))
   );
 
@@ -655,10 +879,40 @@ drop policy if exists shared_delete on public.shared_catches;
 create policy shared_select on public.shared_catches for select to authenticated using (is_admin());
 revoke insert, update, delete on public.shared_catches from authenticated;
 
+drop policy if exists cards_own on public.contact_cards;
+create policy cards_own on public.contact_cards for all to authenticated
+  using (owner = auth.uid()) with check (owner = auth.uid() and is_active_user());
+
+-- 送られたカード：当事者が見られるのは、取引中か、受け渡し済みから3日以内。管理者はいつでも
+drop policy if exists deal_cards_select on public.deal_cards;
+create policy deal_cards_select on public.deal_cards for select to authenticated
+  using (is_admin() or (is_request_party(request_id) and exists(
+    select 1 from requests r where r.id = request_id
+       and (r.status in ('pending','accepted') or (r.status = 'done' and r.updated_at > now() - interval '3 days')))));
+revoke insert, update, delete on public.deal_cards from authenticated;
+
+drop policy if exists wants_select on public.wants;
+drop policy if exists wants_insert on public.wants;
+drop policy if exists wants_update on public.wants;
+create policy wants_select on public.wants for select to authenticated using (owner = auth.uid() or is_admin());
+create policy wants_insert on public.wants for insert to authenticated with check (owner = auth.uid());
+create policy wants_update on public.wants for update to authenticated using (owner = auth.uid() or is_admin());
+
+drop policy if exists ratings_select on public.ratings;
+drop policy if exists ratings_delete on public.ratings;
+create policy ratings_select on public.ratings for select to authenticated using (rater = auth.uid() or is_admin());
+create policy ratings_delete on public.ratings for delete to authenticated using (is_admin());
+revoke insert, update on public.ratings from authenticated;
+
 -- ログインしていない人（anon）には何も見せない。操作は関数経由
-revoke all on public.profiles, public.shops, public.listings, public.requests, public.messages, public.reports, public.shared_catches from anon;
-revoke all on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards from anon;
-grant select on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards to authenticated;
+revoke all on public.profiles, public.shops, public.listings, public.requests, public.messages, public.reports, public.shared_catches,
+  public.contact_cards, public.deal_cards, public.wants, public.ratings from anon;
+revoke all on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards,
+  public.want_cards, public.rating_cards from anon;
+grant select on public.listing_cards, public.request_cards, public.report_cards, public.shop_cards, public.shared_catch_cards,
+  public.want_cards, public.rating_cards to authenticated;
+revoke update on public.wants from authenticated;
+grant  update (status) on public.wants to authenticated;
 grant select on public.blocked_terms to anon, authenticated;
 -- 画面から直接さわれるのは必要な列・操作だけ
 revoke update on public.listings from authenticated;
@@ -667,9 +921,12 @@ revoke update on public.profiles from authenticated;
 grant  update (nickname, banned, share_catches) on public.profiles to authenticated; -- banned はトリガーで管理者に限定
 
 revoke execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
-  public.finish_request(uuid), public.cancel_request(uuid), public.cancel_listing(uuid) from public, anon;
+  public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
+  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text) from public, anon;
 grant execute on function public.make_request(uuid, text, int), public.respond_request(uuid, boolean),
-  public.finish_request(uuid), public.cancel_request(uuid), public.cancel_listing(uuid) to authenticated;
+  public.finish_request(uuid), public.cancel_request(uuid, text), public.cancel_listing(uuid, text),
+  public.send_card(uuid), public.rate_deal(uuid, int, int, int, text) to authenticated;
+revoke execute on function public.sysmsg(uuid, text) from public, anon, authenticated;   -- 関数の中からだけ使う
 revoke execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) from public, anon;
 grant  execute on function public.push_catches(text, jsonb), public.forget_catch(text, text), public.forget_device(text) to authenticated;
 revoke execute on function public.admin_stats() from public, anon;

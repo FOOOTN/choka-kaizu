@@ -243,6 +243,22 @@ dialog#dlg::backdrop{background:rgba(10,20,30,.45)}
 .mini td,.mini th{padding:3px 6px 3px 0;border-bottom:1px solid var(--rule);text-align:left;font-weight:400}
 .mini th{color:var(--ink-2)}
 .mini td.n{font-family:var(--f-mono);text-align:right}
+.msg.sys{align-self:center;max-width:95%;background:none;border:1px dashed var(--rule);color:var(--ink-2);font-size:12px;text-align:center}
+.ccard{align-self:stretch;border:1px solid var(--ok);border-radius:6px;padding:8px 10px;font-size:13px;background:var(--panel)}
+.ccard h5{margin:0 0 4px;font-size:12px;color:var(--ok)}
+.ccard dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}
+.ccard dt{color:var(--ink-2)} .ccard dd{margin:0;word-break:break-all}
+.stars{display:flex;gap:2px}
+.stars button{font-size:26px;line-height:1;background:none;border:0;color:var(--rule);cursor:pointer;padding:2px 3px;min-width:36px;min-height:40px}
+.stars button.on{color:#e0a400}
+.rate-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--rule);padding:4px 0}
+.reasons{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.reasons label{flex-direction:row;align-items:center;gap:8px;font-size:14px;color:var(--ink)}
+.reasons input{width:20px;height:20px;padding:0}
+.want{grid-template-columns:1fr;cursor:default}
+.tag.ok{border-color:var(--ok);color:var(--ok)}
+details.box{border:1px solid var(--rule);border-radius:4px;padding:6px 10px;margin-bottom:10px;background:var(--paper)}
+details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;align-items:center;gap:6px}
 [hidden]{display:none!important}
 
 /* 地図 */
@@ -517,6 +533,11 @@ dialog#dlg::backdrop{background:rgba(10,20,30,.45)}
             <button type="button" class="btn sm" id="btnFindReload" style="margin-left:auto">更新</button>
           </div>
           <p class="hint">地図の「贈」「¥」は受け渡し場所のおおよその位置（約1km単位）です。正確な場所は、申し込んだ後のやり取りで決めます。</p>
+          <details class="box" id="wantBox" hidden>
+            <summary>お店の買い取り希望 <span class="badge" id="wantN"></span></summary>
+            <p class="hint">お店が「こんな魚がほしい」と出している希望です。条件に合う釣果を「お店向け」で出品すると、そのお店の「探す」に「希望に合う」と表示されます。</p>
+            <div id="wantList"></div>
+          </details>
           <div id="findList"></div>
         </div>
 
@@ -576,6 +597,19 @@ dialog#dlg::backdrop{background:rgba(10,20,30,.45)}
 
         <div id="sub_deals" hidden>
           <div class="toolbar"><span class="hint" style="flex:1;margin:0">受け渡しの場所と時間は、各やり取りのメッセージで決めます。</span><button type="button" class="btn sm" id="btnDealsReload">更新</button></div>
+          <details class="box" id="cardBox">
+            <summary>自分の連絡先カード <span class="hint" id="cardSum" style="margin:0"></span></summary>
+            <p class="hint">電話番号などをメッセージに直接書くかわりに、ここに保存しておき、申し込みが決まった相手にだけ「連絡先カードを送る」で渡せます。相手から見えるのは、取引中と受け渡し済みから3日間だけです。</p>
+            <div class="grid">
+              <label>電話番号<input id="cc_phone" maxlength="20" inputmode="tel" autocomplete="tel"></label>
+              <label>LINE ID<input id="cc_line" maxlength="40"></label>
+              <label class="full">住所（お店など。受け渡し場所に使う場合）<input id="cc_addr" maxlength="100"></label>
+              <label>連絡がつく時間帯<input id="cc_hours" maxlength="60" placeholder="例：平日9〜17時"></label>
+              <label>ひとこと<input id="cc_note" maxlength="200" placeholder="例：港では赤い軽トラです"></label>
+            </div>
+            <div class="actions"><button type="button" class="btn primary" id="cc_save">保存</button></div>
+            <div class="status" id="ccStat"></div>
+          </details>
           <div id="dealsList"></div>
         </div>
 
@@ -1698,6 +1732,28 @@ async function signed(paths,bucket="photos"){
   return paths.map(p=>SH.urls.get(key(p))?.u||"");
 }
 
+/* ---------- 共通：評価・理由 ---------- */
+function ratingText(r){
+  if(!r||!r.n) return "評価なし";
+  return r.avg!=null ? `★${Number(r.avg).toFixed(1)}（${r.n}件）` : `評価${r.n}件（3件以上で平均を表示）`;
+}
+const REASONS = {
+  request:["魚の状態が説明と違う","サイズ・数が違う","時間が合わなくなった","相手と連絡がつかない","ほかで手に入った","その他"],
+  listing:["自分で食べることにした","ほかの人に譲った","時間が合わなくなった","魚の状態が悪くなった","その他"]};
+function reasonDlg(title,note,list,okText){
+  return new Promise(res=>{
+    const b=openDlg(title,`<p class="hint">${note}</p>
+      <div class="reasons">${list.map((r,i)=>`<label><input type="radio" name="rsn" value="${esc(r)}" ${i===0?"checked":""}>${esc(r)}</label>`).join("")}</div>
+      <label>くわしく（任意・相手に伝わります）<input id="rsnMore" maxlength="60"></label>
+      <div class="actions"><button type="button" class="btn" id="rsnBack">やめる</button><button type="button" class="btn danger" id="rsnOk">${okText}</button></div>`);
+    b.querySelector("#rsnBack").onclick=()=>{ $("dlg").close(); res(null); };
+    b.querySelector("#rsnOk").onclick=()=>{
+      const r=b.querySelector("input[name=rsn]:checked").value, m=$("rsnMore").value.trim();
+      res(m?`${r}：${m}`.slice(0,100):r);
+    };
+  });
+}
+
 /* ---------- 探す ---------- */
 $("fltKinds").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return; SH.filter=b.dataset.k; shFind(); });
 $("btnFindReload").onclick=()=>shFind();
@@ -1705,9 +1761,9 @@ function shimeText(l){ return [l.shime, ...(l.treat||[]), l.cooling?`保冷：${
 function listingCard(l,u){
   const stat = l.status==="open" ? leftText(l.expires_at) : `<span class="st">${L_STATUS[l.status]||l.status}</span>`;
   return `<div class="card" data-lid="${l.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
-    <div><div class="t"><span class="kind ${l.kind}">${KIND_JA[l.kind]}</span><span class="sp">${esc(l.species)}</span><span>${l.count}匹${l.length_cm?` ・${l.length_cm}cm`:""}</span></div>
+    <div><div class="t"><span class="kind ${l.kind}">${KIND_JA[l.kind]}</span><span class="sp">${esc(l.species)}</span><span>${l.count}匹${l.length_cm?` ・${l.length_cm}cm`:""}</span>${l.matches_my_want?'<span class="tag ok">希望に合う</span>':""}</div>
     <div class="facts"><span>${esc(l.pickup_area)}</span><span>${esc(shimeText(l))}</span>${l.kind==="shop"&&l.price_yen!=null?`<span>希望 ${yen(l.price_yen)}</span>`:""}</div>
-    <div class="facts"><span>釣った ${fmtJ(l.caught_at)}</span><span>${stat}</span><span>${esc(l.owner_name)}</span></div></div></div>`;
+    <div class="facts"><span>釣った ${fmtJ(l.caught_at)}</span><span>${stat}</span><span>${esc(l.owner_name)}</span>${l.kind==="shop"&&l.owner_rating?.n?`<span>${esc(ratingText(l.owner_rating))}</span>`:""}</div></div></div>`;
 }
 async function drawListings(boxId,list,empty){
   const box=$(boxId);
@@ -1723,9 +1779,32 @@ async function shFind(){
   if(SH.filter!=="all") q=q.eq("kind",SH.filter);
   const {data,error}=await q;
   if(error){ box.innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  data.sort((a,b)=>(b.matches_my_want?1:0)-(a.matches_my_want?1:0));
   drawShareMarkers(data);
+  shWants();
   await drawListings("findList",data,"いま受付中の出品はありません。");
 }
+function wantLine(w){
+  const size=w.min_len||w.max_len?`${w.min_len?w.min_len+"cm":""}〜${w.max_len?w.max_len+"cm":""}`:"サイズ問わず";
+  const sh=w.shime?.length?w.shime.join("か"):"締め方問わず";
+  const tr=w.treat?.length?`（${w.treat.join("・")}あり）`:"";
+  return {size, cond:sh+tr, price:w.price_yen!=null?`${yen(w.price_yen)}／${w.price_unit}`:"価格は相談"};
+}
+function wantCard(w,own){
+  const t=wantLine(w);
+  return `<div class="card want" data-want="${w.id}"><div>
+    <div class="t"><span class="sp">${esc(w.species)}</span><span>${esc(t.size)}</span>${own?`<span class="st ${w.active?"good":""}">${w.active?"受付中":"終了"}</span>`:`<span class="st">${esc(w.shop_name)}</span>`}</div>
+    <div class="facts"><span>${esc(t.cond)}</span><span>${esc(t.price)}</span><span>${esc(w.area||w.shop_area)}</span><span>${w.until.slice(5).replace("-","/")}まで</span></div>
+    ${w.memo?`<div class="facts"><span>「${esc(w.memo)}」</span></div>`:""}
+    <div class="ops">${own?(w.active?`<button type="button" class="btn sm" data-a="wclose">締め切る</button>`:""):`<button type="button" class="btn sm primary" data-a="wpost">この希望に合う釣果を出品する</button>`}</div></div></div>`;
+}
+async function shWants(){
+  const {data}=await SH.sb.from("want_cards").select("*").eq("active",true).eq("mine",false).order("created_at",{ascending:false}).limit(50);
+  const list=data||[];
+  $("wantBox").hidden=!list.length; $("wantN").textContent=list.length||"";
+  $("wantList").innerHTML=list.map(w=>wantCard(w,false)).join("");
+}
+$("wantList").addEventListener("click",e=>{ if(e.target.closest("button[data-a=wpost]")) shSub("post"); });
 function drawShareMarkers(list){
   shareLayer.clearLayers();
   for(const l of list){
@@ -1756,7 +1835,8 @@ async function shDetail(id){
     ["締め方", shimeText(l)+(l.shime_at?`（${fmtJ(l.shime_at)}）`:"")],
     ["受け渡し", `${l.pickup_area}・${l.handoff}`],
     ["受付", l.status==="open"?`${leftText(l.expires_at)}（${fmtJ(l.expires_at)}まで）`:(L_STATUS[l.status]||l.status)],
-    ["出品者", l.owner_name],
+    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}）`],
+    ["取り下げの理由", l.status==="cancelled"?(l.cancel_reason||""):""],
     ["写真の日時", l.photo_checked?"釣った時刻と一致":"確認できず（撮影日時の情報なし）"],
     ["ひとこと", l.memo||""],
   ].filter(x=>x[1]);
@@ -1786,10 +1866,11 @@ async function shDetail(id){
   b.querySelector("#dtReq")?.addEventListener("click",()=>reqForm(l));
   b.querySelector("#dtDeals")?.addEventListener("click",()=>{ $("dlg").close(); shSub("deals"); });
   b.querySelector("#dtReport")?.addEventListener("click",()=>reportForm(l));
-  b.querySelector("#dtCancel")?.addEventListener("click",async e=>{
-    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと取り下げ"; return; }
-    const {error}=await SH.sb.rpc("cancel_listing",{p_listing:l.id});
-    if(error){ shMsg("dtStat",shErr(error),"err"); return; }
+  b.querySelector("#dtCancel")?.addEventListener("click",async()=>{
+    const reason=await reasonDlg("出品を取り下げる","取り下げると、申し込んでいる人に理由つきでお知らせが届きます。",REASONS.listing,"取り下げる");
+    if(reason==null){ shDetail(l.id); return; }
+    const {error}=await SH.sb.rpc("cancel_listing",{p_listing:l.id,p_reason:reason});
+    if(error){ shDetail(l.id); setTimeout(()=>shMsg("dtStat",shErr(error),"err"),300); return; }
     $("dlg").close(); shSub(SH.sub);
   });
   b.querySelector("#dtWhere")?.addEventListener("click",()=>{
@@ -1979,14 +2060,18 @@ function dealCard(d,seen){
   if(d.i_am_owner && d.status==="pending") ops.push(`<button type="button" class="btn sm primary" data-a="accept">受ける</button><button type="button" class="btn sm" data-a="decline">断る</button>`);
   if(d.i_am_owner && d.status==="accepted") ops.push(`<button type="button" class="btn sm primary" data-a="finish">受け渡し完了</button>`);
   if(!d.i_am_owner && ["pending","accepted"].includes(d.status)) ops.push(`<button type="button" class="btn sm danger" data-a="cancel">申し込みを取り消す</button>`);
+  if(d.status==="done" && d.can_rate && !d.my_rated) ops.push(`<button type="button" class="btn sm primary" data-a="rate">相手を評価する</button>`);
+  if(d.status==="done" && d.my_rated) ops.push(`<span class="hint" style="margin:0">評価済み</span>`);
   return `<div class="card deal" data-rqid="${d.id}"><div>
     <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span>${dealStatus(d)}</div>
-    <div class="facts"><span>${d.i_am_owner?"申込者":"出品者"}：${esc(who)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.created_at)}</span></div>
+    <div class="facts"><span>${d.i_am_owner?"申込者":"出品者"}：${esc(who)}（${esc(ratingText(d.other_rating))}）</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.created_at)}</span></div>
     <div class="facts"><span>「${esc(d.message)}」</span></div>
+    ${d.cancel_reason?`<div class="facts"><span>理由：${esc(d.cancel_reason)}</span></div>`:""}
     <div class="ops">${ops.join("")}</div></div></div>`;
 }
 async function shDeals(){
   const box=$("dealsList"); box.innerHTML=`<div class="empty">読み込み中…</div>`;
+  loadMyCard();
   const {data,error}=await SH.sb.from("request_cards").select("*").eq("i_am_party",true).order("updated_at",{ascending:false}).limit(100);
   if(error){ box.innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
   data.forEach(d=>SH.deals.set(d.id,d));
@@ -1999,35 +2084,108 @@ $("dealsList").addEventListener("click",async e=>{
   const b=e.target.closest("button[data-a]"); if(!b) return;
   const id=b.closest("[data-rqid]").dataset.rqid, a=b.dataset.a;
   if(a==="thread"){ shThread(id); return; }
-  if((a==="decline"||a==="cancel") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
+  if(a==="rate"){ rateDlg(SH.deals.get(id)); return; }
+  let reason=null;
+  if(a==="cancel"){
+    reason=await reasonDlg("申し込みを取り消す","取り消すと、出品者に理由つきでお知らせが届きます。受け渡しの場で魚を見てやめる場合も、ここから取り消してください。",REASONS.request,"取り消す");
+    if(reason==null) return;
+    $("dlg").close();
+  }
+  if(a==="decline" && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
+  if(a==="finish" && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="受け渡しが済んだら、もう一度押す"; return; }
   const call={accept:["respond_request",{p_request:id,p_accept:true}],decline:["respond_request",{p_request:id,p_accept:false}],
-    finish:["finish_request",{p_request:id}],cancel:["cancel_request",{p_request:id}]}[a];
+    finish:["finish_request",{p_request:id}],cancel:["cancel_request",{p_request:id,p_reason:reason}]}[a];
   setBusy(b,true);
   const {error}=await SH.sb.rpc(call[0],call[1]);
   if(error){ setBusy(b,false); alert(shErr(error)); return; }
   await shDeals();
   if(a==="accept") shThread(id);
 });
+function rateDlg(d){
+  if(!d) return;
+  const items = d.i_am_owner ? ["時間を守った","やり取りが丁寧だった","また取引したい"] : ["説明どおりだった","鮮度・扱いがよかった","時間を守った"];
+  const who=d.i_am_owner?(d.shop_name||d.requester_name):d.owner_name;
+  const v=[0,0,0];
+  const b=openDlg(`${who}さんを評価`,`<p class="hint">${esc(d.species)} ${d.count}匹の取引について、5段階で評価してください。評価は1回だけで、相手には平均（3件以上たまってから）だけが表示されます。</p>
+    ${items.map((t,i)=>`<div class="rate-row"><span>${t}</span><div class="stars" data-i="${i}">${[1,2,3,4,5].map(n=>`<button type="button" data-n="${n}" aria-label="${t} ${n}">★</button>`).join("")}</div></div>`).join("")}
+    <label style="margin-top:8px">ひとこと（任意・管理者だけが見ます）<input id="rtCom" maxlength="200"></label>
+    <div class="actions"><button type="button" class="btn" id="rtBack">あとで</button><button type="button" class="btn primary" id="rtSend">評価する</button></div>
+    <div class="status" id="rtStat"></div>`);
+  b.querySelectorAll(".stars").forEach(g=>g.addEventListener("click",e=>{
+    const x=e.target.closest("button"); if(!x) return; const i=+g.dataset.i; v[i]=+x.dataset.n;
+    g.querySelectorAll("button").forEach(y=>y.classList.toggle("on",+y.dataset.n<=v[i]));
+  }));
+  b.querySelector("#rtBack").onclick=()=>$("dlg").close();
+  b.querySelector("#rtSend").onclick=async e=>{
+    if(v.some(n=>!n)) return shMsg("rtStat","3つとも星を選んでください","err");
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.rpc("rate_deal",{p_request:d.id,p_s1:v[0],p_s2:v[1],p_s3:v[2],p_comment:$("rtCom").value.trim()||null});
+    setBusy(e.target,false);
+    if(error) return shMsg("rtStat",shErr(error),"err");
+    $("dlg").close(); shDeals();
+  };
+}
+
+/* 連絡先カード */
+async function loadMyCard(){
+  const {data}=await SH.sb.from("contact_cards").select("*").eq("owner",SH.user.id).maybeSingle();
+  const c=data||{};
+  $("cc_phone").value=c.phone||""; $("cc_line").value=c.line_id||""; $("cc_addr").value=c.address||""; $("cc_hours").value=c.hours||""; $("cc_note").value=c.note||"";
+  $("cardSum").textContent = (c.phone||c.line_id||c.address) ? "（保存済み）" : "（まだ作っていません）";
+  return c;
+}
+$("cc_save").onclick=async e=>{
+  const row={owner:SH.user.id,phone:$("cc_phone").value.trim()||null,line_id:$("cc_line").value.trim()||null,address:$("cc_addr").value.trim()||null,hours:$("cc_hours").value.trim()||null,note:$("cc_note").value.trim()||null};
+  setBusy(e.target,true,"保存中…");
+  const {error}=await SH.sb.from("contact_cards").upsert(row);
+  setBusy(e.target,false);
+  if(error) return shMsg("ccStat",shErr(error),"err");
+  shMsg("ccStat","保存しました。決まった相手のやり取りで「連絡先カードを送る」を押すと渡せます","ok");
+  $("cardSum").textContent="（保存済み）";
+};
+const CARD_LABELS=[["phone","電話"],["line_id","LINE"],["address","住所"],["hours","時間帯"],["note","ひとこと"]];
+function cardHtml(c,name){
+  const d=c.data||{};
+  return `<div class="ccard"><h5>${esc(name)}さんの連絡先カード</h5><dl>${CARD_LABELS.filter(([k])=>d[k]).map(([k,t])=>`<dt>${t}</dt><dd>${k==="phone"?`<a href="tel:${esc(String(d[k]).replace(/[^0-9+]/g,""))}">${esc(d[k])}</a>`:esc(d[k])}</dd>`).join("")}</dl></div>`;
+}
+
 async function shThread(rid){
   const d=SH.deals.get(rid); if(!d) return;
   const party=d.i_am_party!==false;
   const open=party && ["pending","accepted"].includes(d.status);
   const who=d.i_am_owner?(d.shop_name||d.requester_name):d.owner_name;
   const b=openDlg(party?`${d.species}：${who}さんとのやり取り`:`${d.species}：${d.owner_name} ⇔ ${d.shop_name||d.requester_name}（閲覧のみ）`,
-    `<p class="hint">受け渡しの場所と時間を決めてください。住所や電話番号はなるべく書かず、港の駐車場など人目のある場所で受け渡しましょう。</p>
+    `<p class="hint">受け渡しの場所と時間を決めてください。電話番号などはメッセージに書かず、申し込みが決まったら「連絡先カードを送る」で渡しましょう。受け渡しは港の駐車場など人目のある場所で。魚を見てやめるときは「申し込みを取り消す」から理由を選べます。</p>
      <div class="thread" id="thr"></div>
+     ${party&&d.status==="accepted"?`<div class="toolbar"><button type="button" class="btn sm" id="thrCard">連絡先カードを送る</button><span class="hint" style="margin:0">電話番号などを安全に渡せます</span></div>`:""}
      ${!party?`<p class="hint">管理者として閲覧しています。書き込みはできません。</p>`:open?`<div class="row"><label>メッセージ<textarea id="thrIn" maxlength="1000" rows="2" placeholder="例：17時に水橋漁港の駐車場でどうですか"></textarea></label><button type="button" class="btn primary" id="thrSend">送る</button></div>`:`<p class="hint">このやり取りは終わっています。</p>`}
      <div class="status" id="thrStat"></div>`);
   const first=`<div class="msg ${d.i_am_requester?"me":""}">${esc(d.message)}${d.offer_yen!=null?`\n（提示 ${yen(d.offer_yen)}）`:""}<small>申し込み ${fmtJ(d.created_at)}</small></div>`;
   const load=async()=>{
-    const {data,error}=await SH.sb.from("messages").select("*").eq("request_id",rid).order("id");
+    const [{data,error},{data:cards}]=await Promise.all([
+      SH.sb.from("messages").select("*").eq("request_id",rid).order("id"),
+      SH.sb.from("deal_cards").select("*").eq("request_id",rid)]);
     const box=$("thr"); if(!box||error) return;
     const atEnd=box.scrollHeight-box.scrollTop-box.clientHeight<40;
-    box.innerHTML=first+data.map(m=>`<div class="msg ${m.sender===SH.user.id?"me":""}">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`).join("");
+    const nameOf=uid=>uid===SH.user.id?"あなた":(d.i_am_owner?(d.shop_name||d.requester_name):(d.i_am_requester?d.owner_name:"相手"));
+    box.innerHTML=first+data.map(m=>m.kind==="system"
+        ? `<div class="msg sys">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`
+        : `<div class="msg ${m.sender===SH.user.id?"me":""}">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`).join("")
+      + (cards||[]).map(c=>cardHtml(c,nameOf(c.sender))).join("");
     if(atEnd||!box.dataset.init){ box.scrollTop=box.scrollHeight; box.dataset.init="1"; }
     if(party) markSeen(rid,data.at(-1)?.created_at);
   };
   await load(); clearInterval(SH.threadT); SH.threadT=setInterval(load,10000);
+  b.querySelector("#thrCard")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.rpc("send_card",{p_request:rid});
+    setBusy(e.target,false);
+    if(error){
+      shMsg("thrStat",shErr(error)+(/先に/.test(error.message)?"（「やり取り」の上の「自分の連絡先カード」で作れます）":""),"err");
+      return;
+    }
+    shMsg("thrStat","連絡先カードを送りました","ok"); await load(); $("thr").scrollTop=$("thr").scrollHeight;
+  });
   b.querySelector("#thrSend")?.addEventListener("click",async e=>{
     const body=$("thrIn").value.trim(); if(!body) return;
     setBusy(e.target,true,"送信中…");
@@ -2128,11 +2286,64 @@ $("collectToggle").addEventListener("change",async e=>{
   finally{ e.target.disabled=false; }
 });
 
+/* ---------- お店の買い取り希望 ---------- */
+function wantFormHtml(s){
+  const d=new Date(Date.now()+14*86400000), dd=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const mx=new Date(Date.now()+60*86400000), mxs=`${mx.getFullYear()}-${pad(mx.getMonth()+1)}-${pad(mx.getDate())}`;
+  return `<div class="sec-h">買い取り希望を出す</div>
+  <p class="hint">ほしい魚の条件を出しておくと、釣り人が見て出品してくれます。条件に合う出品は「探す」で「希望に合う」と表示され、先頭に並びます。受付中は10件まで、期限は60日以内です。</p>
+  <div class="grid">
+    <label class="full">魚種<input id="wf_sp" maxlength="40" placeholder="例：ブリ"></label>
+    <label>サイズ（下限）<div class="unit"><input id="wf_min" type="number" min="0" step="1" inputmode="numeric"><span>cm</span></div></label>
+    <label>サイズ（上限）<div class="unit"><input id="wf_max" type="number" min="0" step="1" inputmode="numeric"><span>cm</span></div></label>
+    <p class="sub-h full">受け付ける締め方（選ばなければ問わない）</p>
+    <div class="checks inline full" id="wf_shime">${["活魚","脳締め","氷締め","野締め"].map(v=>`<label><input type="checkbox" value="${v}">${v}</label>`).join("")}</div>
+    <p class="sub-h full">必ずしてほしい処理</p>
+    <div class="checks inline full" id="wf_treat">${["血抜き","神経締め","内臓除去"].map(v=>`<label><input type="checkbox" value="${v}">${v}</label>`).join("")}</div>
+    <label>買い取り価格の目安<div class="unit"><input id="wf_price" type="number" min="0" step="100" inputmode="numeric"><span>円</span></div></label>
+    <label>単位<select id="wf_unit"><option>1匹</option><option>1kg</option></select></label>
+    <label>受け渡し地域<input id="wf_area" maxlength="40" value="${esc(s.area||"")}"></label>
+    <label>期限<input id="wf_until" type="date" value="${dd}" max="${mxs}"></label>
+    <label class="full">ひとこと<input id="wf_memo" maxlength="400" placeholder="例：神経締めなら高く買います"></label>
+  </div>
+  <div class="actions"><button type="button" class="btn primary" id="wf_send">希望を出す</button></div>
+  <div class="status" id="wfStat"></div>
+  <div class="sec-h">自分のお店の買い取り希望</div><div id="myWants"></div>`;
+}
+async function drawMyWants(){
+  const {data}=await SH.sb.from("want_cards").select("*").eq("mine",true).order("created_at",{ascending:false}).limit(30);
+  $("myWants").innerHTML=(data||[]).length?data.map(w=>wantCard(w,true)).join(""):`<div class="empty">まだ出していません。</div>`;
+}
+function wantFormInit(s){
+  drawMyWants();
+  $("wf_send").onclick=async e=>{
+    const sp=$("wf_sp").value.trim(); if(!sp) return shMsg("wfStat","魚種を入れてください","err");
+    const br=blockedReason(sp); if(br) return shMsg("wfStat",`この種類は扱えません（${br}）`,"err");
+    const row={owner:SH.user.id,shop_id:s.id,species:sp,min_len:num($("wf_min").value),max_len:num($("wf_max").value),
+      shime:[...$("wf_shime").querySelectorAll("input:checked")].map(i=>i.value),treat:[...$("wf_treat").querySelectorAll("input:checked")].map(i=>i.value),
+      price_yen:num($("wf_price").value),price_unit:$("wf_unit").value,area:$("wf_area").value.trim()||null,until:$("wf_until").value,memo:$("wf_memo").value.trim()||null};
+    if(!row.until) return shMsg("wfStat","期限を入れてください","err");
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("wants").insert(row);
+    setBusy(e.target,false);
+    if(error) return shMsg("wfStat",shErr(error),"err");
+    shMsg("wfStat","買い取り希望を出しました","ok"); $("wf_sp").value=""; $("wf_memo").value="";
+    drawMyWants();
+  };
+  $("myWants").onclick=async e=>{
+    const b=e.target.closest("button[data-a=wclose]"); if(!b) return;
+    if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと締め切る"; return; }
+    const {error}=await SH.sb.from("wants").update({status:"closed"}).eq("id",b.closest("[data-want]").dataset.want);
+    if(error) return shMsg("wfStat",shErr(error),"err");
+    drawMyWants();
+  };
+}
+
 /* ---------- お店の登録 ---------- */
 function shShop(){
   const s=SH.shop, box=$("shopBox");
   const intro=`<div class="rules">お店向けの出品を見て申し込めるのは、<b>魚介類販売業の許可を持つお店</b>だけです。許可番号と許可証の写真を送ってください。管理者が確認して承認します。<br>支払いはアプリを通さず、受け渡しのときに当事者間で行います。</div>`;
-  if(s?.status==="approved"){ box.innerHTML=intro+`<p class="status ok">承認済み：${esc(s.name)}（${esc(s.area)}）</p><p class="hint">「探す」でお店向けの出品が見られ、申し込めます。内容を変えるときは管理者に連絡してください。</p>`; return; }
+  if(s?.status==="approved"){ box.innerHTML=intro+`<p class="status ok">承認済み：${esc(s.name)}（${esc(s.area)}）</p><p class="hint">「探す」でお店向けの出品が見られ、申し込めます。内容を変えるときは管理者に連絡してください。</p>`+wantFormHtml(s); wantFormInit(s); return; }
   if(s?.status==="suspended"){ box.innerHTML=intro+`<p class="status err">このお店の登録は停止されています。管理者に連絡してください。</p>`; return; }
   const head = s?.status==="pending" ? `<p class="status">審査待ちです。内容を直して送り直すこともできます。</p>`
             : s?.status==="rejected" ? `<p class="status err">差し戻されました${s.admin_note?`：${esc(s.admin_note)}`:""}。直して送り直してください。</p>` : "";
@@ -2172,12 +2383,14 @@ async function shAdmin(){
   const box=$("adminBox");
   if(SH.profile?.role!=="admin"){ box.innerHTML=""; return; }
   box.innerHTML=`<div class="empty">読み込み中…</div>`;
-  const [sh,rp,stq,dq,scq]=await Promise.all([
+  const [sh,rp,stq,dq,scq,rtq]=await Promise.all([
     SH.sb.from("shop_cards").select("*").order("created_at",{ascending:false}),
     SH.sb.from("report_cards").select("*").eq("status","open").order("created_at",{ascending:false}),
     SH.sb.rpc("admin_stats"),
     SH.sb.from("request_cards").select("*").order("updated_at",{ascending:false}).limit(30),
-    SH.sb.from("shared_catch_cards").select("*").order("caught_at",{ascending:false}).limit(300)]);
+    SH.sb.from("shared_catch_cards").select("*").order("caught_at",{ascending:false}).limit(300),
+    SH.sb.from("rating_cards").select("*").order("created_at",{ascending:false}).limit(30)]);
+  SH.ratings=rtq?.data||[];
   const shops=sh.data||[], reports=rp.data||[], deals=dq.data||[];
   SH.shared=scq.data||[];
   deals.forEach(d=>SH.deals.set(d.id,d));
@@ -2207,6 +2420,12 @@ async function shAdmin(){
       <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span><span class="st">${{pending:"返事待ち",accepted:"受け渡し待ち",done:"受け渡し済み",declined:"見送り",cancelled:"取り消し"}[d.status]||d.status}</span></div>
       <div class="facts"><span>出品 ${esc(d.owner_name)}</span><span>申込 ${esc(d.shop_name||d.requester_name)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.updated_at)}</span></div>
       <div class="ops"><button type="button" class="btn sm" data-a="athread">メッセージを見る（${d.msg_count}）</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">最近の評価</div>
+    ${(SH.ratings||[]).length?SH.ratings.map(g=>`<div class="card deal" data-rating="${g.id}"><div>
+      <div class="t"><span class="sp">${esc(g.ratee_name)}</span><span class="st">${g.ratee_is_owner?"出品者として":"申込者として"}</span><span>★${((g.s1+g.s2+g.s3)/3).toFixed(1)}（${g.s1}・${g.s2}・${g.s3}）</span></div>
+      <div class="facts"><span>評価した人 ${esc(g.rater_name)}</span><span>${esc(g.species)}</span><span>${fmtJ(g.created_at)}</span></div>
+      ${g.comment?`<div class="facts"><span>「${esc(g.comment)}」</span></div>`:""}
+      <div class="ops"><button type="button" class="btn sm danger" data-a="rdel">不当な評価として消す</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
     <div class="sec-h">提供された釣果</div>
     ${sharedHtml()}
     <div class="sec-h">出品できない種類</div>
@@ -2228,6 +2447,7 @@ function statsHtml(S,err){
       ${tile(S.users,`利用者（7日で+${S.users_7d}）`)}${tile(S.signins_7d,"7日以内にログイン")}${tile(S.active_30d,"30日以内に出品・申込・連絡")}
       ${tile(pre("gift_"),"おすそわけの出品")}${tile(pre("shop_"),"お店向けの出品")}${tile((Ls.gift_done||0)+(Ls.shop_done||0),"受け渡し済み")}
       ${tile(sum(S.requests),"申し込み")}${tile(S.messages,"メッセージ")}${tile(sum(S.shops),`お店（承認${(S.shops||{}).approved||0}）`)}
+      ${tile(S.wants_open??0,"受付中の買い取り希望")}${tile(S.ratings??0,"評価")}${tile(Object.values(S.cancels||{}).reduce((a,n)=>a+n,0),"理由つきの取り消し")}
       ${tile(`${S.sharing_devices}台`,`釣果を提供中の端末（${S.shared_catches}件・7日で${S.shared_7d}件）`)}${tile(S.reports_open,"未対応の通報")}${tile(S.banned,"利用停止中")}
     </div>
     <p class="hint" style="margin-top:8px">直近30日の出品（緑：おすそわけ／茶：お店向け）・合計 ${S.listings_30d}件</p>
@@ -2285,6 +2505,12 @@ $("adminBox").addEventListener("click",async e=>{
   if(b.dataset.a==="scmap"){ drawSharedMap(who); return; }
   if(b.dataset.a==="sccsv"){ sharedCsv(who); return; }
   if(b.dataset.a==="athread"){ shThread(b.closest("[data-adeal]").dataset.adeal); return; }
+  if(b.dataset.a==="rdel"){
+    if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("ratings").delete().eq("id",b.closest("[data-rating]").dataset.rating);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    shAdmin(); return;
+  }
   const st=m=>shMsg("admStat",m.text,m.cls);
   if(b.id==="blkAdd"){
     const term=$("blkTerm").value.trim(), reason=$("blkReason").value.trim()||"管理者が追加";
