@@ -250,7 +250,6 @@ dialog#dlg::backdrop{background:rgba(10,20,30,.45)}
 .share-pin.shop{background:#9a6a12}
 .lic{max-width:100%;max-height:260px;border-radius:3px;display:block;margin:6px 0}
 .sub-h{margin:4px 0 -2px;font-size:12px;color:var(--ink-2)}
-#collectBox .checks{margin:10px 0 0}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin:6px 0 4px}
 .tile{border:1px solid var(--rule);border-radius:3px;padding:6px 8px;background:var(--paper)}
 .tile b{display:block;font:500 20px/1.2 var(--f-mono);color:var(--ink)}
@@ -381,10 +380,6 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
             <button type="button" class="btn sm" id="btnCloudPhotos">写真の同期…</button>
           </div>
           <div class="status" id="cloudStat"></div>
-        </div>
-        <div id="collectBox" hidden>
-          <div class="checks"><label><input type="checkbox" id="collectToggle"><span>釣果をアプリの運営者に提供する<br><small class="hint">登録した釣果（位置・日時・魚種・数・大きさ・釣法・締め方・気象・メモなど。写真は除く）を運営者に送り、釣果の分析とアプリの改善に使います。ほかの利用者には公開しません。オフにすると、この端末から送った記録はサーバーから消えます。</small></span></label></div>
-          <div class="status" id="collectStat"></div>
         </div>
       </fieldset>
     </div>
@@ -594,6 +589,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
           <label><input type="checkbox">受け取った魚の保存・調理・食べるときの安全（寄生虫・毒など）は、受け取った人が確認します</label>
           <label><input type="checkbox">決まりに反した出品は管理者が削除し、利用を停止することがあります</label>
           <label><input type="checkbox">出品の内容・申し込み・やり取りのメッセージは、トラブル対応とアプリの改善のため管理者が見ることがあります</label>
+          <label><input type="checkbox">記録した釣果（位置・日時・魚種・数・大きさ・釣法・気象・メモなど。写真は除く）は、釣果の分析とアプリの改善のため運営者に送られます（ほかの利用者には公開しません）</label>
         </div>
         <button type="button" class="btn primary" id="btnProfile">同意して始める</button>
         <div class="status" id="profMsg"></div>
@@ -1916,7 +1912,6 @@ async function loadBlocked(){
 async function shRefreshMe(){
   const {data:{session}} = await SH.sb.auth.getSession();
   SH.user = session?.user || null;
-  if(SH.user) shSyncAll();
   if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; cloudUi(); shShow("shLogin"); setBadge(0); shPollStop(); feedPollStop(); shareLayer.clearLayers(); return; }
   let {data:p,error} = await SH.sb.from("profiles").select("*").eq("id",SH.user.id).maybeSingle();
   if(error){                                       // 海の上など電波がないときは、前回の内容で続ける
@@ -1927,7 +1922,7 @@ async function shRefreshMe(){
   if(!p){ shShow("shProfile"); return; }
   if(p.banned){ shShow("shBanned"); shPollStop(); return; }
   feedPollStart();
-  cloudUi(); if(isMember()) cloudSync();
+  cloudUi(); if(isMember()){ cloudSync(); shSyncAll(); }
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
   SH.shop=s||null;
@@ -2517,17 +2512,16 @@ async function shPoll(){
 function shPollStart(){ shPollStop(); shPoll(); SH.pollT=setInterval(shPoll,60000); }
 function shPollStop(){ clearInterval(SH.pollT); SH.pollT=null; }
 
-/* ---------- 釣果の提供（同意した端末から、ログイン中に送る。写真は送らない） ---------- */
-const CONSENT_KEY="choka-collect", SYNC_KEY="choka-synced2";
+/* ---------- 釣果の提供（はじめの確認事項に同意した会員の釣果を、ログイン中に送る。写真は送らない） ---------- */
+const SYNC_KEY="choka-synced2";
 function lsGet(k){ try{ return localStorage.getItem(k); }catch{ return null; } }
 function lsSet(k,v){ try{ v==null?localStorage.removeItem(k):localStorage.setItem(k,v); }catch{} }
-const consent = () => lsGet(CONSENT_KEY);          // "yes" / "no" / null（まだ聞いていない）
 function deviceId(){
   let d=lsGet("choka-device");
   if(!d){ d=(crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)); lsSet("choka-device",d); }
   return d;
 }
-const sharingOn = () => !!(SH.sb && SH.user && consent()==="yes" && !SH.profile?.banned);
+const sharingOn = () => !!(SH.sb && hasProfile() && isMember());   // 確認事項に同意して表示名を登録した会員の釣果を送る
 function catchRow(r){
   const {id,lat,lon,datetime,species,count,photos,photoDates,sample,...rest}=r;
   if(rest.memo) rest.memo=String(rest.memo).slice(0,1000);
@@ -2554,45 +2548,10 @@ async function shSyncAll(){                     // 前回送ったあとに変�
       if(error) throw error;
     }
     lsSet(SYNC_KEY,started);
-    if(recs.length) shMsg("collectStat",`${recs.length}件の釣果を提供しました`,"ok");
     return recs.length;
-  }catch(e){ shMsg("collectStat","釣果を送れませんでした（次に開いたときに送り直します）","err"); return 0; }
+  }catch(e){ return 0; }                         // 送れなかった分は次に開いたときに送り直す
   finally{ syncing=false; }
 }
-async function shCollectStart(){                // 同意していれば、ログイン中に送る（ログインした時点でまとめて送る）
-  if(!SH.sb) return;
-  $("collectBox").hidden=false; $("collectToggle").checked = consent()==="yes";
-  if(consent()===null){ askConsent(); return; }
-  if(consent()!=="yes") return;
-  const {data:{session}}=await SH.sb.auth.getSession();
-  if(session) await shSyncAll();
-  else shMsg("collectStat","ログインすると、登録した釣果が送られます（「おすそわけ」タブからログイン）");
-}
-function askConsent(){
-  const b=openDlg("釣果データの提供のお願い",
-    `<p>このアプリで登録した釣果を、アプリの運営者に送らせてください。</p>
-     <table class="kv"><tr><td>送るもの</td><td>位置・日時・魚種・数・大きさ・釣法・仕掛け・棚・水深・締め方・気象・潮・メモ（写真は送りません）</td></tr>
-     <tr><td>使いみち</td><td>釣果の傾向の分析と、アプリの改善</td></tr>
-     <tr><td>公開</td><td>ほかの利用者には公開しません</td></tr>
-     <tr><td>やめるとき</td><td>「釣果一覧」の下の設定でいつでもやめられます。やめると、この端末から送った記録はサーバーから消えます</td></tr></table>
-     <div class="actions"><button type="button" class="btn" id="cnNo">提供しない</button><button type="button" class="btn primary" id="cnYes">同意して提供する</button></div>`);
-  b.querySelector("#cnYes").onclick=()=>{ lsSet(CONSENT_KEY,"yes"); lsSet(SYNC_KEY,null); $("dlg").close(); shCollectStart(); };
-  b.querySelector("#cnNo").onclick=()=>{ lsSet(CONSENT_KEY,"no"); $("dlg").close(); $("collectToggle").checked=false; shMsg("collectStat","提供していません。気が変わったら、ここでオンにできます"); };
-}
-$("collectToggle").addEventListener("change",async e=>{
-  const on=e.target.checked; e.target.disabled=true;
-  try{
-    if(on){ lsSet(CONSENT_KEY,"yes"); lsSet(SYNC_KEY,null); shMsg("collectStat","提供を始めています…"); await shCollectStart(); }
-    else{
-      shMsg("collectStat","提供をやめています…");
-      if(SH.user){ const {error}=await SH.sb.rpc("forget_device",{p_device:deviceId()}); if(error) throw error; }
-      lsSet(CONSENT_KEY,"no"); lsSet(SYNC_KEY,null);
-      shMsg("collectStat","提供をやめ、この端末から送った記録をサーバーから消しました","ok");
-    }
-  }catch(err){ e.target.checked=!on; shMsg("collectStat",shErr(err),"err"); }
-  finally{ e.target.disabled=false; }
-});
-
 /* ---------- 電話番号（SMS）の認証：おすそわけの出品・申し込みの前に1回だけ ----------
    Supabase の認証で番号を確かめ（phone_change）、phone_verify でアプリ側の「認証済み」にする。
    1つの番号で1アカウント、日本の携帯（070/080/090）だけ、利用停止した人の番号は使えない（サーバーで確認） */
@@ -3308,7 +3267,7 @@ function statsHtml(S,err){
 }
 function sharedHtml(){
   const rows=SH.shared||[];
-  if(!rows.length) return `<p class="hint">まだ届いていません。アプリの初回に「同意して提供する」を選んだ端末から、登録した釣果が届きます（ログイン中の利用者から届きます）。</p>`;
+  if(!rows.length) return `<p class="hint">まだ届いていません。はじめの確認事項に同意した会員の端末から、登録した釣果が届きます（ログイン中の利用者から届きます）。</p>`;
   const names=[...new Set(rows.map(r=>r.nickname))];
   return `<div class="toolbar"><select id="scWho" style="flex:1"><option value="">全員（${rows.length}件）</option>${names.map(n=>`<option>${esc(n)}</option>`).join("")}</select>
       <button type="button" class="btn sm" data-a="scmap">地図に表示</button><button type="button" class="btn sm" data-a="sccsv">CSV出力</button></div>
@@ -3458,7 +3417,7 @@ const SAMPLES = [
   render();
   if(records.length) map.fitBounds(L.latLngBounds(records.map(r=>[r.lat,r.lon])).pad(0.4),{maxZoom:12});
   hereStart();
-  if(SB_URL && SB_KEY){ await shStart(); if(fromMail) showTab("share"); shCollectStart(); }
+  if(SB_URL && SB_KEY){ await shStart(); if(fromMail) showTab("share"); }
   updateAccountBtn();   // ログイン済みならやり取りの新着を数える
 })();
 </script>
