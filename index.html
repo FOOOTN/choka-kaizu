@@ -292,6 +292,8 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
 .thumbs figure{margin:0;position:relative}
 .thumbs img{width:72px;height:72px;object-fit:cover;border-radius:3px;display:block}
 .thumbs button{position:absolute;top:2px;right:2px;border:0;background:rgba(0,0,0,.6);color:#fff;border-radius:2px;font-size:11px;cursor:pointer;padding:0 5px}
+.phone-note{background:#fff7e0;border:1px solid #e6c46a;border-radius:4px;padding:8px 10px;font-size:13px;margin:6px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.vbadge{display:inline-block;font-size:11px;color:#1d6b3a;border:1px solid #6fb98a;border-radius:3px;padding:0 4px;margin-left:4px;white-space:nowrap}
 .av{display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:50%;overflow:hidden;background:var(--c,#6b7c8f);color:#fff;font-weight:700;vertical-align:middle}
 .av img{width:100%;height:100%;object-fit:cover;display:block}
 .who-line{display:inline-flex;align-items:center;gap:6px}
@@ -610,6 +612,7 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
       </div>
 
       <div id="shMain" hidden>
+        <div class="phone-note" id="phoneNote" hidden>おすそわけの出品・申し込みの前に、<b>電話番号の認証</b>（SMS・最初の1回だけ）が必要です。<button type="button" class="btn sm primary" id="btnPhone">認証する</button></div>
         <div class="subtabs" id="shSubs" role="tablist">
           <button type="button" data-sub="find" aria-selected="true">探す</button>
           <button type="button" data-sub="post" aria-selected="false">出品する</button>
@@ -1928,7 +1931,7 @@ async function shRefreshMe(){
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
   SH.shop=s||null;
-  shShow("shMain");
+  await loadSettings(); shShow("shMain"); phoneUi();
   $("shWho").textContent = `ログイン中：${p.nickname}${p.role==="admin"?"（管理者）":""}${SH.shop?.status==="approved"?`・${SH.shop.name}`:""}`;
   $("subAdminBtn").hidden = p.role!=="admin";
   $("fltShop").hidden = !(SH.shop?.status==="approved" || p.role==="admin");
@@ -2024,7 +2027,7 @@ function listingCard(l,u){
   return `<div class="card" data-lid="${l.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
     <div><div class="t"><span class="kind ${l.kind}">${KIND_JA[l.kind]}</span><span class="sp">${esc(l.species)}</span><span>${l.count}匹${l.length_cm?` ・${l.length_cm}cm`:""}</span>${l.matches_my_want?'<span class="tag ok">希望に合う</span>':""}</div>
     <div class="facts"><span>${esc(l.pickup_area)}</span><span>${esc(shimeText(l))}</span>${l.kind==="shop"&&l.price_yen!=null?`<span>希望 ${yen(l.price_yen)}</span>`:""}</div>
-    <div class="facts"><span>釣った ${fmtJ(l.caught_at)}</span><span>${stat}</span><span>${esc(l.owner_name)}</span>${l.kind==="shop"&&l.owner_rating?.n?`<span>${esc(ratingText(l.owner_rating))}</span>`:""}</div></div></div>`;
+    <div class="facts"><span>釣った ${fmtJ(l.caught_at)}</span><span>${stat}</span><span>${esc(l.owner_name)}${l.owner_verified?VB:""}</span>${l.kind==="shop"&&l.owner_rating?.n?`<span>${esc(ratingText(l.owner_rating))}</span>`:""}</div></div></div>`;
 }
 async function drawListings(boxId,list,empty){
   const box=$(boxId);
@@ -2096,7 +2099,7 @@ async function shDetail(id){
     ["締め方", shimeText(l)+(l.shime_at?`（${fmtJ(l.shime_at)}）`:"")],
     ["受け渡し", `${l.pickup_area}・${l.handoff}`],
     ["受付", l.status==="open"?`${leftText(l.expires_at)}（${fmtJ(l.expires_at)}まで）`:(L_STATUS[l.status]||l.status)],
-    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}）`],
+    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}${l.owner_verified?"・電話番号を認証済み":""}）`],
     ["取り下げの理由", l.status==="cancelled"?(l.cancel_reason||""):""],
     ["写真の日時", l.photo_checked?"釣った時刻と一致":"確認できず（撮影日時の情報なし）"],
     ["ひとこと", l.memo||""],
@@ -2187,6 +2190,7 @@ function editListing(l){
   };
 }
 function reqForm(l){
+  if(!phoneGate()) return;
   const b=openDlg(`${l.species}に申し込む`,
     `<p class="hint">${l.kind==="gift"?"おすそわけは無料です。お礼としてお金や物を渡す約束はしないでください。":"価格はここで提示し、支払いは受け渡しのときに当事者間で行います。"}</p>
      <label>ひとこと（取りに行ける時間など）<textarea id="rqMsg" maxlength="400" placeholder="例：今日17時以降なら${esc(l.pickup_area)}まで取りに行けます"></textarea></label>
@@ -2294,6 +2298,7 @@ $("pfGps").onclick=()=>{
 };
 $("pfCancel").onclick=()=>{ SH.post=null; shPickEnd(); clearPickup(); shPost(); };
 $("pfSubmit").onclick=async()=>{
+  if(!phoneGate()) return;
   const P=SH.post; if(!P) return; const r=P.rec;
   const err=m=>{ shMsg("pfStat",m,"err"); };
   if(!P.kind) return err("「おすそわけ」か「お店向け」かを選んでください");
@@ -2365,7 +2370,7 @@ function dealCard(d,seen){
   if(d.status==="done" && d.my_rated) ops.push(`<span class="hint" style="margin:0">評価済み</span>`);
   return `<div class="card deal" data-rqid="${d.id}"><div>
     <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span>${dealStatus(d)}</div>
-    <div class="facts"><span>${d.i_am_owner?"申込者":"出品者"}：${esc(who)}（${esc(ratingText(d.other_rating))}）</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.created_at)}</span></div>
+    <div class="facts"><span>${d.i_am_owner?"申込者":"出品者"}：${esc(who)}${d.other_verified?VB:""}（${esc(ratingText(d.other_rating))}）</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.created_at)}</span></div>
     <div class="facts"><span>「${esc(d.message)}」</span></div>
     ${d.cancel_reason?`<div class="facts"><span>理由：${esc(d.cancel_reason)}</span></div>`:""}
     <div class="ops">${ops.join("")}</div></div></div>`;
@@ -2587,6 +2592,61 @@ $("collectToggle").addEventListener("change",async e=>{
   }catch(err){ e.target.checked=!on; shMsg("collectStat",shErr(err),"err"); }
   finally{ e.target.disabled=false; }
 });
+
+/* ---------- 電話番号（SMS）の認証：おすそわけの出品・申し込みの前に1回だけ ----------
+   Supabase の認証で番号を確かめ（phone_change）、phone_verify でアプリ側の「認証済み」にする。
+   1つの番号で1アカウント、日本の携帯（070/080/090）だけ、利用停止した人の番号は使えない（サーバーで確認） */
+const phoneOk = () => SH.profile?.role==="admin" || !SH.requirePhone || !!SH.profile?.phone_verified_at;
+async function loadSettings(){
+  const {data}=await SH.sb.from("app_settings").select("k,v");
+  if(data) SH.requirePhone = data.some(x=>x.k==="require_phone"&&x.v==="on");
+}
+const VB = '<span class="vbadge" title="電話番号を認証済み">認証済み</span>';
+function phoneGate(){ if(phoneOk()) return true; phoneDlg(); return false; }
+function phoneUi(){ $("phoneNote").hidden = !hasProfile() || phoneOk(); }
+function toE164(v){ const d=String(v).replace(/[^\d]/g,"").replace(/^81/,"0"); return /^0[789]0\d{8}$/.test(d) ? "+81"+d.slice(1) : null; }
+function phoneErr(e){
+  const m=(e?.message||String(e));
+  if(/already|exists|registered/i.test(m)) return "この電話番号はほかのアカウントで使われています";
+  if(/provider|unsupported|disabled|not enabled/i.test(m)) return "SMS認証の準備がまだです（管理者がSMSの設定をすると使えます）";
+  if(/expired|invalid|token/i.test(m)) return "コードが違うか、有効期限が切れています。もう一度SMSを送ってください";
+  if(/rate|too many|seconds/i.test(m)) return "短い時間に送りすぎました。しばらく待ってからもう一度お試しください";
+  return shErr(e);
+}
+function phoneDlg(){
+  let phone=null, cool=0, timer=null;
+  const b=openDlg("電話番号の認証",`<p>おすそわけを安心して使えるように、最初の1回だけ携帯電話番号を確かめます。</p>
+    <ul class="hint" style="margin:0 0 8px 1.2em;padding:0"><li>番号はほかの利用者には見えません（「認証済み」の印だけが出ます）</li>
+      <li>1つの番号で認証できるのは1つのアカウントだけです</li><li>日本の携帯電話番号（070・080・090）が使えます。SMSの受信は無料です</li></ul>
+    <div class="row"><label>携帯電話番号<input id="phNum" type="tel" inputmode="tel" autocomplete="tel" placeholder="090-1234-5678"></label><button type="button" class="btn primary" id="phSend">SMSを送る</button></div>
+    <div class="row" id="phCodeRow" hidden style="margin-top:8px"><label>SMSに書かれた6桁のコード<input id="phCode" inputmode="numeric" autocomplete="one-time-code" maxlength="10"></label><button type="button" class="btn primary" id="phOk">確認</button></div>
+    <div class="status" id="phStat"></div>`);
+  const st=(m,c)=>shMsg("phStat",m,c);
+  const tick=()=>{ const n=Math.ceil((cool-Date.now())/1000), btn=$("phSend"); if(!btn) return clearInterval(timer);
+    if(n>0){ btn.disabled=true; btn.textContent=`再送（${n}秒）`; } else { btn.disabled=false; btn.textContent=phone?"もう一度送る":"SMSを送る"; clearInterval(timer); } };
+  b.querySelector("#phSend").onclick=async e=>{
+    phone=toE164($("phNum").value); if(!phone) return st("日本の携帯電話番号（070・080・090で始まる11桁）を入れてください","err");
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.auth.updateUser({phone});
+    setBusy(e.target,false);
+    if(error) return st(phoneErr(error),"err");
+    $("phCodeRow").hidden=false; $("phCode").focus(); st("SMSを送りました。届いた6桁のコードを入れてください","ok");
+    cool=Date.now()+60000; clearInterval(timer); timer=setInterval(tick,1000); tick();
+  };
+  b.querySelector("#phOk").onclick=async e=>{
+    const token=$("phCode").value.replace(/\D/g,""); if(token.length<6) return st("6桁のコードを入れてください","err");
+    setBusy(e.target,true,"確認中…");
+    try{
+      const {error}=await SH.sb.auth.verifyOtp({phone,token,type:"phone_change"}); if(error) throw error;
+      const {data,error:e2}=await SH.sb.rpc("phone_verify"); if(e2) throw e2;
+      SH.profile.phone_verified_at=new Date().toISOString(); SH.profile.phone_tail=data?.tail||phone.slice(-4);
+      lsSet("choka-profile",JSON.stringify(SH.profile)); phoneUi();
+      openDlg("電話番号の認証",`<p>認証できました（末尾 ${esc(SH.profile.phone_tail)}）。おすそわけの出品・申し込みができます。</p><div class="actions"><button type="button" class="btn primary" onclick="document.getElementById('dlg').close()">閉じる</button></div>`);
+    }catch(err){ st(phoneErr(err),"err"); }
+    finally{ setBusy(e.target,false); }
+  };
+}
+$("btnPhone").onclick=()=>phoneDlg();
 
 /* ---------- PCとスマホの同期（会員）：釣果（写真は除く）と航跡。新しく変えた方を残す ----------
    ・cloud_items に kind/id ごとに1行。消したら deleted=true を送って、ほかの端末でも消す
@@ -2829,6 +2889,7 @@ function profileDlg(){
       <button type="button" class="btn sm" id="avClear">アイコンを外す</button></div></div>
     <label>表示名（20文字まで）<input id="avNick" maxlength="20" value="${esc(P.nickname)}"></label>
     <p class="hint">アイコンと表示名は、投稿・コメント・メッセージで誰でも見られます。正方形に切り抜いて小さくします。人の顔や他人の画像を使うときは許可を取ってください。</p>
+    <p class="hint">電話番号：${P.phone_verified_at?`認証済み（末尾 ${esc(P.phone_tail||"")}）`:"未認証"} <button type="button" class="btn sm" id="avPhone">${P.phone_verified_at?"番号を変える":"認証する"}</button></p>
     <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員（${(P.member_until||"").replace(/-/g,"/")}まで）`):"無料（コメント・いいね・メッセージができます）"}　ログアウトやお店の登録は「おすそわけ」タブから。</p>
     <div class="actions"><button type="button" class="btn" id="avShare">おすそわけタブへ</button><button type="button" class="btn primary" id="avSave">保存</button></div>
     <div class="status" id="avStat"></div>`);
@@ -2837,6 +2898,7 @@ function profileDlg(){
     catch{ shMsg("avStat","画像を読み込めませんでした（HEIC形式はJPEGに変換してください）","err"); } };
   b.querySelector("#avClear").onclick=()=>{ pick=null; clear=true; $("avPrev").innerHTML=avatar(null,$("avNick").value||P.nickname,72); };
   b.querySelector("#avShare").onclick=()=>{ $("dlg").close(); showTab("share"); };
+  b.querySelector("#avPhone").onclick=()=>phoneDlg();
   b.querySelector("#avSave").onclick=async e=>{
     const nick=$("avNick").value.trim(); if(!nick) return shMsg("avStat","表示名を入れてください","err");
     const patch={nickname:nick}, old=P.avatar;
@@ -3191,6 +3253,9 @@ async function shAdmin(){
       <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span><span class="st">${{pending:"返事待ち",accepted:"受け渡し待ち",done:"受け渡し済み",declined:"見送り",cancelled:"取り消し"}[d.status]||d.status}</span></div>
       <div class="facts"><span>出品 ${esc(d.owner_name)}</span><span>申込 ${esc(d.shop_name||d.requester_name)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.updated_at)}</span></div>
       <div class="ops"><button type="button" class="btn sm" data-a="athread">メッセージを見る（${d.msg_count}）</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">電話番号（SMS）の認証</div>
+    <label class="checks" style="margin:4px 0"><span><input type="checkbox" id="admReqPhone" ${SH.requirePhone?"checked":""}> おすそわけの出品・申し込みに、電話番号の認証を求める</span></label>
+    <p class="hint">Supabase でSMSの送信（Twilio など）を設定し、自分で認証できることを確かめてからオンにしてください。オフのあいだは、認証しなくても使えます（認証した人には「認証済み」の印が出ます）。</p>
     <div class="sec-h">利用者と会員（会員 ${SH.users.filter(u=>u.role==="admin"||(u.member_until&&u.member_until>=todayStr())).length}人／${SH.users.length}人）</div>
     <p class="hint">決済の仕組みを入れるまでは、ここで会員にします。会員は、釣果・航跡の記録、おすそわけ、投稿が使えます。</p>
     <input type="search" id="usrQ" placeholder="表示名・メールアドレスで絞り込み" style="margin-bottom:6px">
@@ -3283,6 +3348,13 @@ async function sharedCsv(who){
   download(`提供された釣果_${stamp()}.csv`,"\ufeff"+lines.join("\r\n"),"text/csv");
 }
 $("adminBox").addEventListener("change",e=>{ if(e.target.id==="scWho") $("scList").innerHTML=sharedRows(e.target.value); });
+$("adminBox").addEventListener("change",async e=>{
+  if(e.target.id!=="admReqPhone") return;
+  const on=e.target.checked;
+  const {error}=await SH.sb.from("app_settings").update({v:on?"on":"off",updated_at:new Date().toISOString()}).eq("k","require_phone");
+  if(error){ e.target.checked=!on; return shMsg("admStat",shErr(error),"err"); }
+  SH.requirePhone=on; phoneUi(); shMsg("admStat",on?"電話番号の認証を求めるようにしました":"電話番号の認証を求めないようにしました","ok");
+});
 $("adminBox").addEventListener("input",e=>{ if(e.target.id==="usrQ") $("usrList").innerHTML=usersHtml(e.target.value.trim()); });
 function usersHtml(q){
   const rows=(SH.users||[]).filter(u=>!q||(u.nickname+" "+(u.email||"")).includes(q));
@@ -3290,8 +3362,8 @@ function usersHtml(q){
     const mem=u.role==="admin"||(u.member_until&&u.member_until>=todayStr());
     return `<div class="card deal" data-uid="${u.id}"><div>
       <div class="t"><span class="sp">${esc(u.nickname)}</span><span class="st ${mem?"good":""}">${u.role==="admin"?"管理者":mem?`会員（${u.member_until.replace(/-/g,"/")}まで）`:u.member_until?"会員の期限切れ":"無料"}</span>${u.banned?'<span class="st hot">停止中</span>':""}</div>
-      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span></div>
-      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
+      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span><span>電話 ${u.phone_verified_at?`認証済み（末尾${esc(u.phone_tail||"")}）`:"未認証"}</span></div>
+      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.phone_verified_at?`<button type="button" class="btn sm" data-a="phreset">電話の認証を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
     + (rows.length>50?`<p class="hint">ほか${rows.length-50}人（絞り込んでください）</p>`:"") || `<div class="empty">該当する利用者はいません。</div>`;
 }
 $("adminBox").addEventListener("click",async e=>{
@@ -3315,6 +3387,12 @@ $("adminBox").addEventListener("click",async e=>{
   const usr=b.closest("[data-uid]");
   if(usr){
     const a=b.dataset.a, d=new Date(Date.now()+365*86400000);
+    if(a==="phreset"){
+      if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと外す"; return; }
+      const {error}=await SH.sb.rpc("admin_phone_reset",{p_user:usr.dataset.uid});
+      if(error) return shMsg("admStat",shErr(error),"err");
+      shAdmin(); return;
+    }
     const patch = a==="m1y" ? {member_until:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`}
                 : a==="m0" ? {member_until:null} : a==="ban" ? {banned:true} : a==="unban" ? {banned:false} : null;
     if(!patch) return;

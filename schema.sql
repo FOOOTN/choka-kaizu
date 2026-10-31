@@ -23,6 +23,25 @@ alter table public.profiles add column if not exists share_catches boolean not n
 alter table public.profiles add column if not exists member_until date;
 -- アイコン（avatars バケットの「利用者ID/ファイル名」）。誰でも見られる
 alter table public.profiles add column if not exists avatar text check (char_length(avatar) <= 200);
+-- 電話番号（SMS）の認証。番号そのものは Supabase の認証（auth.users）にだけあり、ここには元に戻せない形（ハッシュ）だけ残す
+alter table public.profiles add column if not exists phone_verified_at timestamptz;
+alter table public.profiles add column if not exists phone_hash text;
+alter table public.profiles add column if not exists phone_tail text check (char_length(phone_tail) <= 4);
+create unique index if not exists profiles_phone_hash_uq on public.profiles(phone_hash) where phone_hash is not null;
+-- 利用停止した人の電話番号（ハッシュ）。アカウントを作り直しても認証できない
+create table if not exists public.banned_phones (
+  phone_hash text primary key,
+  note       text,
+  created_at timestamptz not null default now()
+);
+-- アプリの設定（誰でも読める・管理者だけが変える）。require_phone：おすそわけに電話番号の認証を求めるか
+create table if not exists public.app_settings (k text primary key, v text not null, updated_at timestamptz not null default now());
+insert into public.app_settings values ('require_phone', 'off', now()) on conflict (k) do nothing;
+-- ハッシュ用の秘密の値（画面からは読めない）
+create table if not exists public.app_secrets (k text primary key, v text not null);
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
+insert into public.app_secrets values ('phone_salt', encode(extensions.gen_random_bytes(16), 'hex')) on conflict (k) do nothing;
 
 -- お店（魚介類販売業の許可を持つ店。管理者が許可証を確認して承認）
 create table if not exists public.shops (
@@ -330,6 +349,19 @@ language sql stable security definer set search_path = public as $$
   select exists(select 1 from profiles where id = auth.uid() and not banned)
 $$;
 
+-- 電話番号の認証が済んでいるか（管理者は不要）
+create or replace function public.phone_ok() returns boolean
+language sql stable security definer set search_path = public as $$
+  select is_admin()
+      or coalesce((select v from app_settings where k = 'require_phone'), 'off') <> 'on'   -- 認証を求めない設定のあいだは全員OK
+      or exists(select 1 from profiles where id = auth.uid() and phone_verified_at is not null and not banned)
+$$;
+create or replace function public.phone_hash_of(p text) returns text
+language sql stable security definer set search_path = public as $$
+  select encode(extensions.digest(regexp_replace(p, '\D', '', 'g') || (select v from app_secrets where k = 'phone_salt'), 'sha256'), 'hex')
+$$;
+revoke execute on function public.phone_hash_of(text) from public, anon, authenticated;
+
 -- 承認済みのお店を持っていればその店のID
 create or replace function public.my_shop() returns uuid
 language sql stable security definer set search_path = public as $$
@@ -408,13 +440,21 @@ $$;
 create or replace function public.profiles_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
+  if tg_op = 'UPDATE' and new.banned and not old.banned and new.phone_hash is not null then
+    -- 利用停止した人の電話番号は、作り直しても認証できないように残す
+    insert into banned_phones(phone_hash, note) values (new.phone_hash, '利用停止：' || new.nickname) on conflict do nothing;
+  end if;
   if auth.uid() is null or is_admin() then return new; end if;
   if tg_op = 'INSERT' then
     new.id := auth.uid(); new.role := 'user'; new.banned := false; new.member_until := null;
+    new.phone_verified_at := null; new.phone_hash := null; new.phone_tail := null;
     new.agreed_at := now(); new.created_at := now();
   else
     if new.role is distinct from old.role or new.banned is distinct from old.banned
-       or new.member_until is distinct from old.member_until or new.id <> old.id then
+       or new.member_until is distinct from old.member_until or new.id <> old.id
+       or ((new.phone_verified_at is distinct from old.phone_verified_at or new.phone_hash is distinct from old.phone_hash)
+           and coalesce(current_setting('app.phone_verify', true), '') <> '1')
+       or (new.phone_tail is distinct from old.phone_tail and coalesce(current_setting('app.phone_verify', true), '') <> '1') then
       raise exception '権限がありません';
     end if;
   end if;
@@ -464,6 +504,7 @@ begin
   if auth.uid() is null then return new; end if;            -- 管理画面からの投入は素通し
   new.owner := auth.uid();
   if not is_member() then raise exception 'おすそわけ・お店向けの出品は会員の機能です'; end if;
+  if not phone_ok() then raise exception '出品の前に、電話番号の認証をしてください'; end if;
   new.status := 'open'; new.created_at := now();
 
   v_reason := blocked_reason(new.species);
@@ -733,6 +774,7 @@ declare
 begin
   if auth.uid() is null then raise exception 'ログインが必要です'; end if;
   if not is_member() then raise exception 'おすそわけへの申し込みは会員の機能です'; end if;
+  if not phone_ok() then raise exception '申し込みの前に、電話番号の認証をしてください'; end if;
   select * into l from listings where id = p_listing for update;
   if not found or l.status <> 'open' or l.expires_at <= now() then raise exception 'この出品は受付を終了しています'; end if;
   if l.owner = auth.uid() then raise exception '自分の出品には申し込めません'; end if;
@@ -922,6 +964,7 @@ select
   l.expires_at, l.created_at,
   p.nickname as owner_name,
   rating_of(l.owner) as owner_rating,
+  (p.phone_verified_at is not null) as owner_verified,
   (my_shop() is not null and exists(select 1 from wants w where w.shop_id = my_shop() and w.status = 'open'
       and w.until >= (now() at time zone 'Asia/Tokyo')::date and want_matches(w, l))) as matches_my_want,
   l.cancel_reason,
@@ -961,6 +1004,7 @@ select
   (r.requester = auth.uid() and (r.status = 'cancelled' or (r.status = 'declined' and r.auto_declined))
      and l.status = 'open' and l.expires_at > now()) as can_reapply,
   rating_of(case when l.owner = auth.uid() then r.requester else l.owner end) as other_rating,
+  (case when l.owner = auth.uid() then rp.phone_verified_at else op.phone_verified_at end) is not null as other_verified,
   exists(select 1 from ratings g where g.request_id = r.id and g.rater = auth.uid()) as my_rated,
   (r.status = 'done' and r.updated_at > now() - interval '30 days') as can_rate
 from public.requests r
@@ -1069,6 +1113,7 @@ where is_admin();
 drop view if exists public.user_cards;
 create view public.user_cards with (security_barrier = true) as
 select p.id, p.nickname, p.role, p.banned, p.member_until, p.created_at, u.email, u.last_sign_in_at,
+       p.phone_verified_at, p.phone_tail,
        (select count(*) from posts x where x.owner = p.id) as posts,
        (select count(*) from listings x where x.owner = p.id) as listings
 from public.profiles p join auth.users u on u.id = p.id
@@ -1395,6 +1440,18 @@ create trigger cloud_items_guard before insert or update on public.cloud_items
   for each row execute function public.cloud_items_guard();
 
 alter table public.cloud_items enable row level security;
+alter table public.app_secrets   enable row level security;   -- ポリシーなし＝画面からは読めない
+alter table public.app_settings  enable row level security;
+drop policy if exists settings_read on public.app_settings;
+drop policy if exists settings_admin on public.app_settings;
+create policy settings_read on public.app_settings for select to anon, authenticated using (true);
+create policy settings_admin on public.app_settings for update to authenticated using (is_admin()) with check (is_admin());
+revoke insert, delete on public.app_settings from anon, authenticated;
+alter table public.banned_phones enable row level security;
+drop policy if exists banned_phones_admin on public.banned_phones;
+create policy banned_phones_admin on public.banned_phones for select to authenticated using (is_admin());
+revoke all on public.app_secrets from anon, authenticated;
+revoke all on public.banned_phones from anon;
 drop policy if exists cloud_select on public.cloud_items;
 drop policy if exists cloud_insert on public.cloud_items;
 drop policy if exists cloud_update on public.cloud_items;
@@ -1403,6 +1460,41 @@ create policy cloud_insert on public.cloud_items for insert to authenticated wit
 create policy cloud_update on public.cloud_items for update to authenticated using (owner = auth.uid()) with check (owner = auth.uid());
 revoke all on public.cloud_items from anon;
 revoke delete on public.cloud_items from authenticated;
+
+-- 電話番号の認証を確定する（SMSのコードで Supabase の認証が電話番号を確認したあとに呼ぶ）
+create or replace function public.phone_verify() returns json
+language plpgsql security definer set search_path = public, auth as $$
+declare v_phone text; v_conf timestamptz; v_hash text; v_other uuid;
+begin
+  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
+  if not exists(select 1 from profiles where id = auth.uid() and not banned) then raise exception '表示名の登録が必要です'; end if;
+  select phone, phone_confirmed_at into v_phone, v_conf from auth.users where id = auth.uid();
+  v_phone := regexp_replace(coalesce(v_phone, ''), '\D', '', 'g');
+  if v_phone = '' or v_conf is null then raise exception 'SMSのコードでの確認が済んでいません'; end if;
+  if v_phone !~ '^81[789]0[0-9]{8}$' then raise exception '日本の携帯電話番号（070・080・090）だけ認証できます'; end if;
+  v_hash := phone_hash_of(v_phone);
+  if exists(select 1 from banned_phones where phone_hash = v_hash) then raise exception 'この電話番号では認証できません'; end if;
+  select id into v_other from profiles where phone_hash = v_hash and id <> auth.uid();
+  if v_other is not null then raise exception 'この電話番号はほかのアカウントで使われています'; end if;
+  perform set_config('app.phone_verify', '1', true);       -- この操作の中だけ、認証の欄を書き換えてよい
+  update profiles set phone_verified_at = now(), phone_hash = v_hash, phone_tail = right(v_phone, 4) where id = auth.uid();
+  perform set_config('app.phone_verify', '', true);
+  return json_build_object('tail', right(v_phone, 4));
+end $$;
+-- 管理者：認証を外す（番号の使い回し・機種変更で困った人のため）。Supabase 側の電話番号も外す
+create or replace function public.admin_phone_reset(p_user uuid) returns void
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  if not is_admin() then raise exception '権限がありません'; end if;
+  update profiles set phone_verified_at = null, phone_hash = null, phone_tail = null where id = p_user;
+  begin
+    update auth.users set phone = null, phone_confirmed_at = null where id = p_user;
+  exception when others then null;      -- 外せない環境でも、アプリ側の認証は外す
+  end;
+end $$;
+-- 管理者：停止した番号の一覧の件数と、全部の解除（誤って停止したとき用。個別にはSQLで）
+revoke execute on function public.phone_verify(), public.admin_phone_reset(uuid) from public, anon;
+grant execute on function public.phone_verify(), public.admin_phone_reset(uuid) to authenticated;
 
 -- 同期の使用量（本人）
 create or replace function public.cloud_usage() returns json
