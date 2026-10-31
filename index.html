@@ -377,8 +377,8 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
           <div class="sec-h" style="margin-top:12px">PCとスマホで同期（会員）</div>
           <p class="hint" id="cloudInfo">会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。</p>
           <div class="toolbar" id="cloudOps" hidden>
-            <button type="button" class="btn sm" id="btnCloudSync">今すぐ同期</button>
-            <button type="button" class="btn sm" id="btnCloudPhotos">写真を同期（手動）</button>
+            <button type="button" class="btn sm" id="btnCloudSync">記録を今すぐ同期（写真以外）</button>
+            <button type="button" class="btn sm" id="btnCloudPhotos">写真の同期…</button>
           </div>
           <div class="status" id="cloudStat"></div>
         </div>
@@ -2657,7 +2657,7 @@ const cloudOn = () => !!(SH.sb && hasProfile() && isMember());
 function cloudUi(){
   const on=cloudOn();
   $("cloudOps").hidden=!on;
-  $("cloudInfo").textContent = on ? "ログイン中は、釣果（写真は除く）と航跡を自動で同期します。写真は「写真を同期（手動）」を押したときだけ送ります。"
+  $("cloudInfo").textContent = on ? "ログイン中は、釣果（写真は除く）と航跡を自動で同期します。写真は「写真の同期…」から、送る・取り込むを押したときだけ同期します。"
     : (hasProfile() ? "同期は会員の機能です。会員になると、釣果と航跡がPCとスマホで自動でそろいます。" : "会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。");
 }
 function cloudForget(kind,id){            // 消したことを覚えておき、次の同期で送る
@@ -2717,7 +2717,7 @@ async function cloudSync(force){
     if(got){ render(); drawTracks(); drawTrackList(); }
     lsSet(clKey("at"),new Date().toISOString());
     shMsg("cloudStat",`同期しました（${hm(Date.now())}${got?`・取り込み${got}件`:""}${sent?`・送信${sent}件`:""}）`,"ok");
-  }catch(e){ shMsg("cloudStat","同期できませんでした（電波のよいところで「今すぐ同期」を押してください）："+shErr(e),"err"); }
+  }catch(e){ shMsg("cloudStat","同期できませんでした（電波のよいところで「記録を今すぐ同期」を押してください）："+shErr(e),"err"); }
   finally{ CL.busy=false; }
 }
 let clT=null; function cloudSoon(){ clearTimeout(clT); clT=setTimeout(()=>cloudSync(true),1500); }
@@ -2737,7 +2737,7 @@ $("btnCloudPhotos").onclick=async e=>{
       <tr><td>取り込む写真</td><td>${down.reduce((s,r)=>s+r.cloudPhotos.length,0)}枚（${down.length}件の釣果）</td></tr>
       ${u?`<tr><td>保存済み</td><td>写真 約${MB(u.photo_bytes||0)}MB／記録 約${MB(u.bytes||0)}MB（釣果${u.catches}件・航跡${u.tracks}本）</td></tr>`:""}</table>
     <p class="hint">写真は通信量が多いので、Wi-Fiのときにおすすめします。送った写真は本人だけが見られます。</p>
-    <div class="actions"><button type="button" class="btn" id="cpNo">やめる</button><button type="button" class="btn primary" id="cpGo" ${up.length||down.length?"":"disabled"}>同期する</button></div>
+    <div class="actions"><button type="button" class="btn" id="cpNo">やめる</button><button type="button" class="btn primary" id="cpGo" ${up.length||down.length?"":"disabled"}>${up.length&&down.length?"写真を送る・取り込む":up.length?"写真を送る":down.length?"写真を取り込む":"同期する写真はありません"}</button></div>
     <div class="status" id="cpStat"></div>`);
   b.querySelector("#cpNo").onclick=()=>$("dlg").close();
   b.querySelector("#cpGo").onclick=async ev=>{
