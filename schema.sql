@@ -28,6 +28,8 @@ alter table public.profiles add column if not exists phone_verified_at timestamp
 alter table public.profiles add column if not exists phone_hash text;
 alter table public.profiles add column if not exists phone_tail text check (char_length(phone_tail) <= 4);
 create unique index if not exists profiles_phone_hash_uq on public.profiles(phone_hash) where phone_hash is not null;
+-- 住んでいる県（本人だけが見る。「みんな」の新着で、この県の釣果を先に並べる）
+alter table public.profiles add column if not exists home_pref text check (char_length(home_pref) <= 10);
 -- 利用停止した人の電話番号（ハッシュ）。アカウントを作り直しても認証できない
 create table if not exists public.banned_phones (
   phone_hash text primary key,
@@ -249,6 +251,16 @@ create table if not exists public.posts (
 );
 create index if not exists posts_time_idx on public.posts(status, created_at desc);
 create index if not exists posts_owner_idx on public.posts(owner);
+-- 釣果の新着（kind = 'catch'）：「釣果を登録」で保存した会員の釣果を自動で載せる。
+--   catch_id … 端末の釣果の番号（同じ釣果は1件にまとめる。直すと上書き、消すと消える）
+--   pref     … 釣った場所の県（誰でも見える。新着の並び順と絞り込みに使う）
+alter table public.posts drop constraint if exists posts_kind_check;
+alter table public.posts add constraint posts_kind_check check (kind in ('photo','blog','catch'));
+alter table public.posts add column if not exists pref text check (char_length(pref) <= 10);
+alter table public.posts add column if not exists catch_id text check (char_length(catch_id) <= 40);
+create unique index if not exists posts_catch_uq on public.posts(owner, catch_id) where catch_id is not null;
+create index if not exists posts_kind_time_idx on public.posts(kind, status, created_at desc);
+create index if not exists posts_pref_time_idx on public.posts(pref, created_at desc) where kind = 'catch';
 
 create table if not exists public.post_likes (
   post_id     uuid not null references public.posts(id) on delete cascade,
@@ -616,9 +628,20 @@ begin
   else
     if not is_member() then raise exception '投稿は会員の機能です'; end if;
     new.owner := auth.uid(); new.created_at := now(); new.updated_at := now(); new.status := 'public';
-    select count(*) into v_n from posts where owner = auth.uid() and created_at > now() - interval '24 hours';
-    if v_n >= 20 then raise exception '投稿は1日20件までです'; end if;
+    if new.kind = 'catch' then                              -- 釣果の新着は1日200件まで（数を釣る日もあるため別に数える）
+      if coalesce(new.catch_id, '') = '' then raise exception '釣果の番号がありません'; end if;
+      select count(*) into v_n from posts where owner = auth.uid() and kind = 'catch' and created_at > now() - interval '24 hours';
+      if v_n >= 200 then raise exception '釣果の新着への掲載は1日200件までです'; end if;
+    else
+      new.catch_id := null;
+      select count(*) into v_n from posts where owner = auth.uid() and kind <> 'catch' and created_at > now() - interval '24 hours';
+      if v_n >= 20 then raise exception '投稿は1日20件までです'; end if;
+    end if;
   end if;
+  if tg_op = 'UPDATE' and (new.kind is distinct from old.kind or new.catch_id is distinct from old.catch_id) then
+    raise exception '権限がありません';
+  end if;
+  if new.kind = 'catch' and coalesce(btrim(new.species), '') = '' then raise exception '魚種がありません'; end if;
   if coalesce(array_length(new.photos, 1), 0) > 6 then raise exception '写真は6枚までです'; end if;
   if exists(select 1 from unnest(new.photos) p where split_part(p, '/', 1) <> new.owner::text) then
     raise exception '写真の保存先が正しくありません';
@@ -1058,6 +1081,8 @@ join public.listings l on l.id = r.listing_id
 where is_admin();
 
 -- みんなの投稿（ログインしなくても見られる。釣った位置はログインした人だけ）
+drop function if exists public.catch_feed(text, int, int);              -- post_cards の形を返す関数（11.）を先に外す
+drop function if exists public.catch_search(text, text, int, int);
 drop view if exists public.post_cards;
 create view public.post_cards with (security_barrier = true) as
 select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p.method, p.shime, p.caught_at, p.place,
@@ -1066,6 +1091,8 @@ select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p
        (p.lat is not null) as has_pos,
        p.allow_comments, p.status, p.created_at, p.updated_at,
        u.nickname as owner_name, u.avatar as owner_avatar,
+       p.pref,                                                           -- 釣った場所の県（誰でも見える）
+       case when p.owner = auth.uid() then p.catch_id end as catch_id,   -- 自分の釣果の番号（本人だけ）
        (p.owner = auth.uid()) as mine,
        (select count(*) from post_likes k where k.post_id = p.id) as like_count,
        (select count(*) from post_comments c where c.post_id = p.id) as comment_count,
@@ -1343,7 +1370,7 @@ grant select on public.blocked_terms to anon, authenticated;
 revoke update on public.listings from authenticated;
 grant  update (status) on public.listings to authenticated;          -- 管理者の削除（removed）用。RLSで管理者に限定
 revoke update on public.profiles from authenticated;
-grant  update (nickname, banned, share_catches, member_until, avatar) on public.profiles to authenticated; -- banned・member_until はトリガーで管理者に限定
+grant  update (nickname, banned, share_catches, member_until, avatar, home_pref) on public.profiles to authenticated; -- banned・member_until はトリガーで管理者に限定
 revoke update on public.posts from authenticated;
 grant  update (title, body, place, allow_comments, status) on public.posts to authenticated;
 
@@ -1519,6 +1546,80 @@ create policy "cloud_read_own" on storage.objects for select to authenticated
   using (bucket_id = 'cloud' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "cloud_delete_own" on storage.objects for delete to authenticated
   using (bucket_id = 'cloud' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ---------------------------------------------------------------------
+-- 11. 釣果の新着（みんな）と魚の検索
+--     ・会員が「釣果を登録」で「みんなの新着に載せる」を選んだ釣果を、posts（kind = 'catch'）に1件ずつ載せる
+--     ・載せるのは写真・魚種・大きさ・匹数・釣法・締め方・釣った日時・県。メモ・ポイント名・仕掛けは載せない
+--     ・釣った位置は「位置も載せる」を選んだときだけ保存し、post_cards で会員と本人にだけ見せる（これまでの投稿と同じ）
+--     ・いいね・コメント・通報・削除は、これまでの投稿の仕組みをそのまま使う
+-- ---------------------------------------------------------------------
+create or replace function public.upsert_catch_post(p jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_id uuid; v_old text[]; v_new text[]; v_cid text; v_size numeric; v_cnt int;
+begin
+  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
+  if not is_member() then raise exception '釣果の新着への掲載は会員の機能です'; end if;
+  v_cid := left(coalesce(p->>'catch_id', ''), 40);
+  if v_cid = '' then raise exception '釣果の番号がありません'; end if;
+  if jsonb_typeof(p->'photos') = 'array' then
+    v_new := array(select jsonb_array_elements_text(p->'photos'));
+  end if;
+  v_size := nullif(p->>'size_cm', '')::numeric;
+  if v_size is not null and (v_size <= 0 or v_size >= 400) then v_size := null; end if;
+  v_cnt := round(nullif(p->>'count', '')::numeric)::int;
+  if v_cnt is not null and (v_cnt < 1 or v_cnt > 10000) then v_cnt := null; end if;
+  select id, photos into v_id, v_old from posts where owner = auth.uid() and catch_id = v_cid;
+  if v_id is null then
+    insert into posts(owner, kind, catch_id, photos, species, size_cm, count, method, shime, caught_at, pref, lat, lon, allow_comments)
+    values (auth.uid(), 'catch', v_cid, coalesce(v_new, '{}'),
+            left(nullif(btrim(p->>'species'), ''), 40), v_size, v_cnt,
+            left(nullif(p->>'method', ''), 40), left(nullif(p->>'shime', ''), 40),
+            nullif(p->>'caught_at', '')::timestamptz, left(nullif(p->>'pref', ''), 10),
+            nullif(p->>'lat', '')::float8, nullif(p->>'lon', '')::float8,
+            coalesce((p->>'allow_comments')::boolean, true))
+    returning id into v_id;
+    v_old := '{}';
+  else
+    update posts set
+      photos = coalesce(v_new, photos),
+      species = left(nullif(btrim(p->>'species'), ''), 40), size_cm = v_size, count = v_cnt,
+      method = left(nullif(p->>'method', ''), 40), shime = left(nullif(p->>'shime', ''), 40),
+      caught_at = nullif(p->>'caught_at', '')::timestamptz, pref = left(nullif(p->>'pref', ''), 10),
+      lat = nullif(p->>'lat', '')::float8, lon = nullif(p->>'lon', '')::float8
+    where id = v_id;
+  end if;
+  -- 差し替えで使わなくなった写真（画面の側で保存場所から消す）
+  return jsonb_build_object('id', v_id, 'old_photos',
+    case when v_new is null then '[]'::jsonb
+         else coalesce((select jsonb_agg(x) from unnest(v_old) x where not (x = any(v_new))), '[]'::jsonb) end);
+end $$;
+
+-- 新着の釣果：p_pref の県を先に、それぞれ新しい順（ログインしなくても見られる。位置は会員だけ）
+create or replace function public.catch_feed(p_pref text, p_offset int default 0, p_limit int default 20)
+returns setof public.post_cards language sql stable as $$
+  select * from public.post_cards c
+   where c.kind = 'catch' and c.status = 'public'
+   order by (nullif(p_pref, '') is not null and c.pref is not distinct from p_pref) desc, c.created_at desc
+   offset greatest(coalesce(p_offset, 0), 0) limit least(greatest(coalesce(p_limit, 20), 1), 50)
+$$;
+
+-- 魚の名前で探す（ひらがな・カタカナ・別名の一部でも当たる）。釣った位置は post_cards のとおり会員だけに出る
+create or replace function public.catch_search(p_q text, p_pref text default null, p_days int default null, p_limit int default 300)
+returns setof public.post_cards language sql stable as $$
+  select * from public.post_cards c
+   where c.status = 'public' and c.species is not null
+     and char_length(btrim(coalesce(p_q, ''))) between 1 and 40
+     and strpos(kana_norm(c.species), kana_norm(btrim(p_q))) > 0
+     and (nullif(p_pref, '') is null or c.pref = p_pref)
+     and (p_days is null or coalesce(c.caught_at, c.created_at) > now() - make_interval(days => p_days))
+   order by coalesce(c.caught_at, c.created_at) desc
+   limit least(greatest(coalesce(p_limit, 300), 1), 500)
+$$;
+
+revoke execute on function public.upsert_catch_post(jsonb) from public, anon;
+grant  execute on function public.upsert_catch_post(jsonb) to authenticated;
+grant  execute on function public.catch_feed(text, int, int), public.catch_search(text, text, int, int) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
