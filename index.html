@@ -456,6 +456,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
         <div class="toolbar">
           <button class="btn sm" id="btnCsv">CSV出力（Excel用）</button>
           <button class="btn sm" id="btnJson">バックアップ（JSON）</button>
+          <button type="button" class="btn sm" id="btnTrash">削除した釣果（30日以内）…</button>
           <label class="btn sm" style="flex-direction:row;color:var(--ink)">復元（JSON）<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
         </div>
         <p class="hint">釣果と航跡はこのブラウザ内（IndexedDB）に保存され、バックアップには両方が入ります。端末を替える前や定期的にバックアップしてください。</p>
@@ -895,10 +896,11 @@ function tideName(age){
 const DB = {
   db:null,
   open(){ return new Promise((res,rej)=>{
-    const r = indexedDB.open("choka-kaizu",2);
+    const r = indexedDB.open("choka-kaizu",3);
     r.onupgradeneeded = () => { const db=r.result;
       if(!db.objectStoreNames.contains("catches")) db.createObjectStore("catches",{keyPath:"id"});
-      if(!db.objectStoreNames.contains("tracks")) db.createObjectStore("tracks",{keyPath:"id"}); };
+      if(!db.objectStoreNames.contains("tracks")) db.createObjectStore("tracks",{keyPath:"id"});
+      if(!db.objectStoreNames.contains("trash")) db.createObjectStore("trash",{keyPath:"id"}); };   // 削除した釣果（30日とっておく）
     r.onsuccess = () => { this.db=r.result; res(); };
     r.onerror = () => rej(r.error);
   });},
@@ -911,6 +913,15 @@ let memStore = null, memTracks = new Map();   // IndexedDBが使えない環境�
 async function loadAll(){ return memStore ? [...memStore.values()] : DB.all("catches"); }
 async function saveRec(o){ if(memStore) memStore.set(o.id,o); else await DB.put(o,"catches"); }
 async function delRec(id,fromCloud){ if(memStore) memStore.delete(id); else await DB.del(id,"catches"); if(!fromCloud) cloudForget("catch",id); }
+/* 削除した釣果の一時保管（この端末・写真も含めて30日） */
+const memTrash=new Map(), TRASH_DAYS=30;
+async function trashPut(r){ if(!r || r.sample) return; const o={...r, deletedAt:new Date().toISOString()};
+  try{ if(memStore) memTrash.set(o.id,o); else await DB.put(o,"trash"); }catch{} }
+async function trashAll(){ let a=[]; try{ a=memStore?[...memTrash.values()]:await DB.all("trash"); }catch{}
+  const lim=new Date(Date.now()-TRASH_DAYS*86400000).toISOString(), keep=[];
+  for(const o of a){ if((o.deletedAt||"")<lim){ try{ memStore?memTrash.delete(o.id):await DB.del(o.id,"trash"); }catch{} } else keep.push(o); }
+  return keep; }
+async function trashDel(id){ try{ memStore?memTrash.delete(id):await DB.del(id,"trash"); }catch{} }
 async function loadTrks(){ return memStore ? [...memTracks.values()] : DB.all("tracks"); }
 async function saveTrk(o,fromCloud){ if(!fromCloud) o.updatedAt=new Date().toISOString(); if(memStore) memTracks.set(o.id,o); else await DB.put(o,"tracks"); }
 async function delTrk(id,fromCloud){ if(memStore) memTracks.delete(id); else await DB.del(id,"tracks"); if(!fromCloud) cloudForget("track",id); }
@@ -1325,7 +1336,8 @@ function photoState(r){
   const local=r.photos||[], f=MYP.get(String(r.id));
   if(r.photoSig===undefined){                                   // 前の版の記録（目印なし）
     // 新着に「最新の写真」として載っている写真（目印つき）がこの端末の写真と違えば、新着の写真を出す
-    if(local.length && f?.photos?.length && f.sig && !sigEq(f.sig,local)) return {kind:"feed",paths:f.photos};
+    const fs=knownFeedSig(f);
+    if(local.length && f?.photos?.length && fs && !sigEq(fs,local)) return {kind:"feed",paths:f.photos};
     if(local.length) return {kind:"local"};
     if(f?.photos?.length) return {kind:"feed",paths:f.photos};
     if((r.cloudPhotos||[]).length) return {kind:"cloud",paths:r.cloudPhotos};
@@ -1333,18 +1345,47 @@ function photoState(r){
   }
   if(r.photoSig==="") return {kind:"none"};                     // どこかの端末で写真を全部外した
   if(sigEq(r.photoSig,local)) return {kind:"local"};
-  if(f?.photos?.length && f.sig===r.photoSig) return {kind:"feed",paths:f.photos};
-  if((r.cloudPhotos||[]).length && r.cloudSig===r.photoSig) return {kind:"cloud",paths:r.cloudPhotos};
+  if(f?.photos?.length && knownFeedSig(f)===r.photoSig) return {kind:"feed",paths:f.photos};
+  if((r.cloudPhotos||[]).length && knownCloudSig(r)===r.photoSig) return {kind:"cloud",paths:r.cloudPhotos};
   return {kind:"missing"};
 }
 const localPh = r => photoState(r).kind==="local" ? (r.photos||[]) : [];
 /* ---------- 写真をそろえる：端末・新着・写真の同期で写真が食い違っているとき、正しい写真を選んでもらう ---------- */
+/* サーバーの写真の目印：前の版で載せた写真には目印がないので、一度だけ写真を読み込んで中身から作り、端末に覚えておく */
+const FS_KEY="choka-photosig"; let FSC=null;
+function fsc(){ if(!FSC){ try{ FSC=JSON.parse(lsGet(FS_KEY)||"{}"); }catch{ FSC={}; } } return FSC; }
+function pathsSig(paths){ const c=fsc(), a=(paths||[]).map(p=>c[p]); return a.length && a.every(x=>x!=null) ? a.join("|") : null; }
+const knownFeedSig = f => !f ? null : f.sig!=null ? f.sig : !f.photos.length ? "" : pathsSig(f.photos);
+const knownCloudSig = r => (r.cloudPhotos||[]).length ? (r.cloudSig ?? pathsSig(r.cloudPhotos)) : null;
+const resolving=new Set();
+async function resolveSigs(r){                       // 分からない目印を、写真を読み込んで調べる（記録を開いたときだけ。1回きり）
+  const id=String(r.id); if(resolving.has(id) || !(SH.sb && hasProfile())) return;
+  resolving.add(id);
+  try{
+    const f=MYP.get(id), jobs=[];
+    if(f?.photos?.length && knownFeedSig(f)==null) jobs.push(...f.photos.map(p=>[p,postUrl(p)]));
+    if((r.cloudPhotos||[]).length && knownCloudSig(r)==null){
+      const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600).catch(()=>({data:null}));
+      (data||[]).forEach((x,i)=>{ if(x.signedUrl) jobs.push([r.cloudPhotos[i],x.signedUrl]); });
+    }
+    const c=fsc(), todo=jobs.filter(([p])=>c[p]==null); if(!todo.length) return;
+    for(const [p,u] of todo){ const res=await fetch(u); if(!res.ok) return; c[p]=photoSig([await blobToDataUrl(await res.blob())]); }
+    const keys=Object.keys(c); if(keys.length>3000) for(const k of keys.slice(0,keys.length-3000)) delete c[k];
+    lsSet(FS_KEY,JSON.stringify(c));
+    // 開いている吹き出し・編集画面を出し直す
+    if(curPop?.id===r.id && map.hasLayer(curPop.pop)){ const cur=records.find(x=>x.id===r.id); if(cur) openRecPopup(cur); }
+    if(FM.id===r.id && !$("viewForm").hidden) photoNoteUi();
+    render();
+  }catch{} finally{ resolving.delete(id); }
+}
 function alignOptions(r){                         // 前の版の記録（目印なし）で、端末の写真と新着・写真の同期の写真が違うとき
   if(r.sample || r.photoSig!==undefined) return [];
   const local=r.photos||[], f=MYP.get(String(r.id)), o=[["local","この端末の写真を最新にする"]];
   if(!local.length) return [];
-  if(f?.photos?.length && !(f.sig && sigEq(f.sig,local))) o.push(["feed","新着に載っている写真にそろえる"]);
-  if((r.cloudPhotos||[]).length && r.cloudSig!==photoSig(local)) o.push(["cloud","写真の同期の写真（ほかの端末から送った写真）にそろえる"]);
+  const fs=knownFeedSig(f), cs=knownCloudSig(r);
+  if((f?.photos?.length && fs==null) || ((r.cloudPhotos||[]).length && cs==null)) resolveSigs(r);   // 分からないうちは「違う」と言わない
+  if(f?.photos?.length && fs!=null && !sigEq(fs,local)) o.push(["feed","新着に載っている写真にそろえる"]);
+  if((r.cloudPhotos||[]).length && cs!=null && !sigEq(cs,local)) o.push(["cloud","写真の同期の写真（ほかの端末から送った写真）にそろえる"]);
   return o.length>1 ? o : [];
 }
 async function alignFetch(r,src){                    // 選んだ写真を data URL で
@@ -1404,6 +1445,7 @@ function popupHtml(r){
     ${r.feed?`<div class="feed-on">${r.feedDirty?"「みんな」の新着への反映待ち（電波のよいところで自動で送ります）":`「みんな」の新着に載せています${r.pref?`（${esc(r.pref)}）`:""}`}</div>`:""}</div>`;
 }
 /* マークを触ったとき：登録フォーム中はその位置を指定、それ以外は記録を開く */
+let curPop=null;                                     // 開いている記録の吹き出し
 function openRecPopup(r){
   const tmp=document.createElement("div"); tmp.innerHTML=popupHtml(r);
   const el=tmp.firstElementChild;
@@ -1423,6 +1465,7 @@ function openRecPopup(r){
     if(a==="edit") openForm(r); else moveStart(r);
   });
   const pop=L.popup({maxWidth:280,autoPanPaddingTopLeft:[10,isPhone()?84:60]}).setLatLng([r.lat,r.lon]).setContent(el).openOn(map);
+  curPop={id:r.id,pop};
   const fit=()=>{ if(map.hasLayer(pop)) pop.update(); };              // 写真が読み込まれたら吹き出しの大きさを合わせ直す
   el.querySelectorAll("img").forEach(i=>i.complete?0:i.addEventListener("load",fit,{once:true}));
   const pst=photoState(r);
@@ -1568,7 +1611,7 @@ function render(){
       const a = e.target.dataset?.a;
       if(a==="edit"){ openForm(r); return; }
       if(a==="del"){
-        if(e.target.dataset.armed){ if(MV.r?.id===r.id) moveEnd(); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id); if(!r.sample) feedRemove(r); }   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
+        if(e.target.dataset.armed){ if(MV.r?.id===r.id) moveEnd(); await trashPut(r); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id); if(!r.sample) feedRemove(r); }   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
         else { e.target.dataset.armed="1"; e.target.textContent="もう一度押すと削除"; setTimeout(()=>{e.target.textContent="削除";delete e.target.dataset.armed;},3000); }
         return;
       }
@@ -2344,14 +2387,50 @@ $("btnJson").onclick=()=>download(`釣果バックアップ_${stamp()}.json`,JSO
 $("fileImport").addEventListener("change",async e=>{
   const f=e.target.files[0]; if(!f) return;
   try{ const d=JSON.parse(await f.text()); const list=Array.isArray(d)?d:d.records;
-    for(const r of list){ if(r&&r.id&&r.lat!=null&&r.lon!=null){ await saveRec(r); records=records.filter(x=>x.id!==r.id).concat(r);} }
+    const now=new Date().toISOString(); let nNew=0, nSkip=0;
+    for(const r0 of list){ if(!(r0&&r0.id&&r0.lat!=null&&r0.lon!=null) || r0.sample) continue;
+      const loc=records.find(x=>x.id===r0.id);
+      if(loc && (loc.updatedAt||"")>=(r0.updatedAt||"")){ nSkip++; continue; }        // この端末の方が新しい記録はそのまま
+      const r={...r0}; if(!loc){ r.updatedAt=now; nNew++; }                             // 消えていた記録は、新しい変更として戻す（ほかの端末・新着にも戻る）
+      delete r.feedPost; delete r.feedDirty;
+      await saveRec(r); records=records.filter(x=>x.id!==r.id).concat(r); await trashDel(r.id);
+      if(r.feed) feedPush(r); }
     let nt=0; for(const t of (d.tracks||[])){ if(t&&t.id&&Array.isArray(t.points)){ await saveTrk(t); tracks=tracks.filter(x=>x.id!==t.id).concat(t); nt++; } }
-    render(); drawTracks(); drawTrackList(); alertStatus(`${list.length}件の釣果${nt?`と${nt}本の航跡`:""}を復元しました。`);
+    render(); drawTracks(); drawTrackList(); shMsg("cloudStat",`釣果を復元しました（消えていた釣果${nNew}件を戻しました${nSkip?`。この端末の方が新しい${nSkip}件はそのままです`:""}）`,"ok"); alertStatus(`釣果を復元しました（消えていた釣果${nNew}件を戻しました${nSkip?`。この端末の方が新しい${nSkip}件はそのままです`:""}）${nt?`。航跡${nt}本`:""}`);
     shSyncAll(); if(SH.user) lsSet(clKey("push"),null); cloudSoon();
   }catch{ alertStatus("ファイルを読み込めませんでした。このアプリで出力したJSONを選んでください。"); }
   e.target.value="";
 });
 function alertStatus(msg){ $("summary").textContent=msg; }
+/* 削除した釣果（30日以内）：この端末にとってある分（写真つき）と、サーバーの同期にとってある分（会員）から元に戻す */
+$("btnTrash").onclick=async()=>{
+  const b=openDlg("削除した釣果（30日以内）",`<div id="trList"><div class="empty">読み込み中…</div></div><div class="status" id="trStat"></div>`);
+  const items=new Map();
+  for(const o of await trashAll()) if(!records.some(r=>r.id===o.id)) items.set(o.id,{rec:o,at:o.deletedAt,where:"この端末にとってある分"});
+  if(cloudOn()){
+    const lim=new Date(Date.now()-TRASH_DAYS*86400000).toISOString();
+    const {data}=await SH.sb.from("cloud_items").select("id,trash,deleted_at").eq("kind","catch").eq("deleted",true).gt("deleted_at",lim).order("deleted_at",{ascending:false}).limit(300);
+    for(const x of data||[]) if(x.trash && !items.has(x.id) && !records.some(r=>r.id===x.id))
+      items.set(x.id,{rec:{...x.trash,id:x.id,photos:[]},at:x.deleted_at,where:"サーバー（写真は、写真の同期で送った分だけ戻ります）"});
+  }
+  const list=[...items.values()].sort((a,b)=>(b.at||"").localeCompare(a.at||""));
+  const box=$("trList"); if(!box) return;
+  box.innerHTML = list.length ? list.map((x,i)=>`<div class="card" style="grid-template-columns:1fr auto;cursor:default"><div>
+      <div class="t"><span class="sp">${esc(x.rec.species||"")}</span><span>${x.rec.count||1}匹${x.rec.length?` ・${x.rec.length}cm`:""}</span><span class="when">${esc(fmtDT(x.rec.datetime||""))}</span></div>
+      <div class="facts"><span>${fmtJ(x.at)}に削除</span><span>${esc(x.where)}</span>${(x.rec.photos||[]).length?`<span>写真${x.rec.photos.length}枚</span>`:""}</div></div>
+      <button type="button" class="btn sm primary" data-i="${i}">元に戻す</button></div>`).join("")
+    : `<div class="empty">30日以内に削除した釣果はありません。${cloudOn()?"":"<br>（会員がログインすると、ほかの端末で削除した釣果も表示されます）"}</div>`;
+  box.querySelectorAll("button[data-i]").forEach(btn=>btn.onclick=async()=>{
+    const x=list[+btn.dataset.i]; setBusy(btn,true,"戻しています…");
+    try{
+      const r={...x.rec, updatedAt:new Date().toISOString()};
+      delete r.deletedAt; delete r.feedPost; delete r.feedDirty; delete r.feedLog;
+      await saveRec(r); records=records.filter(q=>q.id!==r.id).concat(r); await trashDel(r.id);
+      render(); shSyncRec(r); cloudSoon(); if(r.feed) feedPush(r);
+      btn.textContent="戻しました"; shMsg("trStat",`${r.species}を戻しました。${r.feed?"新着にも載せ直します。":""}`,"ok");
+    }catch(err){ setBusy(btn,false); shMsg("trStat",shErr(err),"err"); }
+  });
+};
 
 $("btnDelSamples").onclick=async()=>{ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); try{localStorage.setItem("choka-seeded","1")}catch{} render(); };
 $("filter").addEventListener("input",render);
@@ -2462,7 +2541,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.10";
+const APP_VER="2026.11.02.12";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -3267,7 +3346,7 @@ async function cloudSync(force){
         const iso=new Date(x.updated_at).toISOString();
         if(x.kind==="catch"){
           const loc=records.find(r=>r.id===x.id);
-          if(x.deleted){ if(loc && !((loc.updatedAt||"")>iso)){ await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
+          if(x.deleted){ if(loc && !((loc.updatedAt||"")>iso)){ await trashPut(loc); await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
           if(loc && (loc.updatedAt||"")>=iso){                       // 記録はこの端末の方が新しい：写真の目印だけ、新しければ取り込む
             if(phNewer(x.data,loc)){ for(const k of PHK) if(x.data[k]!==undefined) loc[k]=x.data[k]; await saveRec(loc); got++; }
             continue;
@@ -3398,8 +3477,9 @@ async function feedPush(r,backfill){
     const known=r.photoSig!==undefined, current=photosCurrent(r);
     const wantSig=known ? r.photoSig : sig;
     // 新着と同じ写真か：サーバーの新着の状態（MYP）が分かればそれで決める。分からないときだけ、この端末が前に送った目印で決める
-    const same = f && (f.sig!=null || !f.photos.length)
-      ? (f.photos.length ? f.sig===wantSig : !(r.photos||[]).length)
+    const fks=knownFeedSig(f);
+    const same = f && fks!=null
+      ? (f.photos.length ? (fks===wantSig || sigEq(fks,r.photos)) : !(r.photos||[]).length)
       : (had!==undefined && sigEq(had,r.photos));
     let photos=null;                                              // null＝サーバーの写真をそのまま使う
     // 前の版の記録（目印なし）は、新着にまだ写真がないときだけ写真を送る（どの端末の写真が新しいか分からないため）
