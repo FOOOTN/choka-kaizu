@@ -1473,7 +1473,8 @@ create index if not exists cloud_items_pull_idx on public.cloud_items(owner, syn
 create or replace function public.cloud_items_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  if not is_member() then raise exception '同期は会員の機能です'; end if;
+  -- 会員でなくなっても、「消した」印だけは送れる（消した釣果を、ほかの端末と新着からも消すため）
+  if not is_member() and not (new.deleted and is_active_user()) then raise exception '同期は会員の機能です'; end if;
   new.owner := auth.uid();
   if new.deleted then new.data := null; end if;
   if new.data is not null and pg_column_size(new.data) > 3000000 then

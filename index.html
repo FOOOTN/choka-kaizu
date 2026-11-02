@@ -2325,6 +2325,7 @@ async function shRefreshMe(){
   feedPollStart();
   SH.foreign=false;
   cloudUi(); if(isMember() && ownerCheck()){ cloudSync(); shSyncAll(); feedSweep().then(feedBackfill); loadMyPhotos(); }
+  else if(!isMember()){ feedSweep(); cloudPushDeletes(); }      // 会員でなくても、消した釣果は新着とほかの端末から消す
   newPoll();
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
@@ -3036,7 +3037,16 @@ function cloudForget(kind,id){            // 消したことを覚えておき�
   if(!SH.user) return;
   let q=[]; try{ q=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
   q.push({kind,id:String(id),at:new Date().toISOString()}); lsSet(clKey("del"),JSON.stringify(q.slice(-2000)));
-  if(cloudOn()) cloudSoon();
+  if(cloudOn()) cloudSoon(); else cloudPushDeletes();
+}
+/* 会員でなくなっても「消した」印だけは送る。ほかの端末の同じ記録も消え、サーバーが新着からも消す */
+async function cloudPushDeletes(){
+  if(!(SH.sb && hasProfile() && !SH.foreign) || cloudOn()) return;
+  let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+  if(!dels.length) return;
+  const rows=dels.map(d=>({kind:d.kind,id:d.id,data:null,deleted:true,updated_at:d.at}));
+  for(let i=0;i<rows.length;i+=50){ const {error}=await SH.sb.from("cloud_items").upsert(rows.slice(i,i+50),{onConflict:"owner,kind,id"}); if(error) return; }
+  lsSet(clKey("del"),null);
 }
 const catchData = r => { const {photos,sample,feedPost,feedDirty,...d}=r; return d; };
 async function cloudSync(force){
@@ -3197,22 +3207,27 @@ async function feedDelete(id){
   const {data,error}=await SH.sb.from("posts").delete().eq("owner",SH.user.id).eq("catch_id",String(id)).select("photos");
   if(error) throw error;
   const ph=(data||[]).flatMap(x=>x.photos||[]); if(ph.length) SH.sb.storage.from("posts").remove(withThumbs(ph));
+  return (data||[]).length;
 }
 /* 新着から外した釣果を、開いている一覧と地図からもすぐ消す */
 function feedForget(id){
   const n=NW.list.length; NW.list=NW.list.filter(p=>!(p.mine && p.catch_id===String(id)));
   if(NW.list.length!==n){ document.querySelectorAll("#nwList .card[data-pid]").forEach(c=>{ if(!NW.list.some(p=>p.id===c.dataset.pid)) c.remove(); }); drawPostMarkers(NW.list, NW.mode!=="feed"); }
 }
+/* 自分の釣果を新着から外すのは、会員でなくなっても本人ならできる（ログインしていれば） */
+const feedOwnerOn = () => !!(SH.sb && hasProfile() && !SH.foreign);
+function feedDelQueue(){ let q=[]; try{ q=JSON.parse(lsGet(FEED_DEL)||"[]"); }catch{}
+  return q.map(x=>typeof x==="string"?{id:x,owner:null,at:Date.now()}:x); }   // 前の版は番号だけ
 async function feedRemove(r){                                     // 記録を消した・載せるのをやめたとき
   const alive=records.some(x=>x.id===r.id);
   try{
-    if(!feedOnline()) throw 0;
+    if(!feedOwnerOn()) throw 0;
     await feedDelete(r.id); MYP.delete(String(r.id));
     r.feedPost=null; delete r.feedDirty;
     feedForget(r.id);
   }catch{
     if(alive) r.feedDirty=true;
-    else { let q=[]; try{ q=JSON.parse(lsGet(FEED_DEL)||"[]"); }catch{} if(!q.includes(String(r.id))) q.push(String(r.id)); lsSet(FEED_DEL,JSON.stringify(q.slice(-500))); }
+    else { const q=feedDelQueue(); if(!q.some(x=>x.id===String(r.id))) q.push({id:String(r.id), owner:SH.user?.id||null, at:Date.now()}); lsSet(FEED_DEL,JSON.stringify(q.slice(-500))); }
   }
   if(alive) await saveRec(r);
 }
@@ -3243,10 +3258,16 @@ async function feedBackfill(){
   }finally{ backfilling=false; }
 }
 async function feedSweep(){                                       // 送れていない分を送り直す（1回に20件まで）
-  if(!feedOnline()) return;
-  let q=[]; try{ q=JSON.parse(lsGet(FEED_DEL)||"[]"); }catch{}
-  const left=[]; for(const id of q){ try{ await feedDelete(id); }catch{ left.push(id); } }
+  if(!feedOwnerOn()) return;
+  // 消した釣果で、まだ新着から外せていないもの（会員でなくても本人なら外せる）。ほかのアカウントの分は残しておく
+  const left=[];
+  for(const x of feedDelQueue()){
+    if(x.owner && x.owner!==SH.user.id){ left.push(x); continue; }
+    try{ const n=await feedDelete(x.id); feedForget(x.id); if(!x.owner && !n && Date.now()-x.at<30*86400000) left.push(x); }
+    catch{ left.push(x); }
+  }
   lsSet(FEED_DEL,left.length?JSON.stringify(left):null);
+  if(!feedOnline()) return;                                       // ここから先（載せる・直す）は会員だけ
   const todo=records.filter(r=>!r.sample && ((r.feed && (!r.feedPost || r.feedDirty)) || (!r.feed && (r.feedPost || r.feedDirty)))).slice(0,20);
   for(const r of todo) await feedPush(r);
 }
