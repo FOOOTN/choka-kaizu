@@ -1708,6 +1708,28 @@ revoke execute on function public.my_favorites(int, int) from public, anon;
 grant  execute on function public.my_favorites(int, int) to authenticated;
 
 -- ---------------------------------------------------------------------
+-- 12. サーバーの使用量（管理者）：データベースの大きさ・大きい表・保存場所（バケット）ごとのファイル数と容量
+--     通信量（Egress）はSQLでは分からないので、Supabase の画面の Usage で見る
+-- ---------------------------------------------------------------------
+create or replace function public.admin_usage() returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception '権限がありません'; end if;
+  return jsonb_build_object(
+    'db_bytes', pg_database_size(current_database()),
+    'tables', (select coalesce(jsonb_agg(t), '[]'::jsonb) from (
+        select c.relname as name, pg_total_relation_size(c.oid) as bytes
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and c.relkind = 'r'
+         order by 2 desc limit 8) t),
+    'buckets', (select coalesce(jsonb_agg(b), '[]'::jsonb) from (
+        select o.bucket_id as name, count(*) as files, coalesce(sum((o.metadata->>'size')::bigint), 0) as bytes
+          from storage.objects o group by o.bucket_id order by 3 desc) b));
+end $$;
+revoke execute on function public.admin_usage() from public, anon;
+grant  execute on function public.admin_usage() to authenticated;   -- 中で管理者かどうかを確かめる
+
+-- ---------------------------------------------------------------------
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
 -- ---------------------------------------------------------------------
 notify pgrst, 'reload schema';
