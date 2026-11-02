@@ -40,6 +40,7 @@ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
   border-bottom:2px solid var(--ink)}
 header h1{margin:0;font-size:18px;font-weight:700;letter-spacing:.06em}
 header .sub{color:var(--ink-2);font-size:12px}
+@media (max-width:520px){ header{gap:6px} header h1{font-size:16px;letter-spacing:.02em} header .sub{display:none} header .btn{padding:5px 8px} #btnAccount{max-width:7.5em;overflow:hidden;text-overflow:ellipsis} }
 header .sp{flex:1}
 .btn{font:inherit;font-size:13px;border:1px solid var(--ink);background:transparent;color:var(--ink);
   padding:6px 12px;border-radius:3px;cursor:pointer;white-space:nowrap}
@@ -404,6 +405,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
   <h1>釣果海図ログ</h1>
   <span class="sub">位置／魚種／棚／気象／潮汐／波浪・等深線</span>
   <span class="sp"></span>
+  <button class="btn" id="btnRefresh" title="同期してから、最新の版で開き直します">↻ 更新</button>
   <button class="btn" id="btnAccount" title="ログイン・アカウント">ログイン</button>
   <button class="btn" id="btnTheme" title="表示テーマ切替">昼／夜</button>
 </header>
@@ -1843,6 +1845,13 @@ function drawPhotos(){
 function photoNoteUi(){
   const el=$("photoNote"), r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
   const st=r ? photoState(r) : null;
+  if(r && !photosTouched && st.kind==="local" && (r.photos||[]).length && r.photoSig===undefined){
+    // 前の版の記録：どの端末の写真が最新か分からない。正しい写真の端末で、この写真を最新に決めてもらう
+    el.hidden=false;
+    el.innerHTML=`ほかの端末と写真が違うときは、正しい写真が出ている端末で押してください。 <button type="button" class="btn sm" id="btnMakeLatest">この端末の写真を最新にする</button>`;
+    $("btnMakeLatest").onclick=()=>{ photosTouched=true; el.hidden=false; el.textContent="この端末の写真を最新にします。「変更を保存」で確定すると、ほかの端末と新着もこの写真になります。"; };
+    return;
+  }
   if(!r || photosTouched || st.kind==="local" || st.kind==="none"){ el.hidden=true; return; }
   el.hidden=false;
   const rm=`<button type="button" class="btn sm danger" id="btnDropPh">写真を外す（どの端末でも写真なしにする）</button>`;
@@ -2358,13 +2367,20 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.3";
+const APP_VER="2026.11.02.4";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 async function checkVer(){
   try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k","min_app_ver").maybeSingle();
     $("verBanner").hidden = !(data?.v && verOlder(APP_VER,data.v)); }catch{}
 }
 $("btnReload").onclick=()=>location.reload();
+/* 更新ボタン：メールアプリの中のブラウザなど、再読み込みのボタンがない画面のため。送れていない分を送ってから開き直す */
+$("btnRefresh").onclick=async e=>{
+  setBusy(e.target,true,"更新中…");
+  const work=(async()=>{ try{ if(cloudOn()) await cloudSync(true); await feedSweep(); await cloudPushDeletes(); }catch{} })();
+  await Promise.race([work,new Promise(r=>setTimeout(r,5000))]);
+  location.reload();
+};
 async function shStart(){
   if(SH.started) return; SH.started=true;
   if(!SB_URL||!SB_KEY){ shShow("shNoConf"); return; }
