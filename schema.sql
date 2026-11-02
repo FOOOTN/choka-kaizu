@@ -39,6 +39,8 @@ create table if not exists public.banned_phones (
 -- アプリの設定（誰でも読める・管理者だけが変える）。require_phone：おすそわけに電話番号の認証を求めるか
 create table if not exists public.app_settings (k text primary key, v text not null, updated_at timestamptz not null default now());
 insert into public.app_settings values ('require_phone', 'off', now()) on conflict (k) do nothing;
+-- アプリの最低限の版。これより古い版の画面には「読み込み直してください」と出す（写真などを古い版で上書きしないため）
+insert into public.app_settings values ('min_app_ver', '2026.11.02.3', now()) on conflict (k) do update set v = excluded.v, updated_at = now();
 -- ハッシュ用の秘密の値（画面からは読めない）
 create table if not exists public.app_secrets (k text primary key, v text not null);
 create schema if not exists extensions;
@@ -263,6 +265,9 @@ create index if not exists posts_kind_time_idx on public.posts(kind, status, cre
 create index if not exists posts_pref_time_idx on public.posts(pref, created_at desc) where kind = 'catch';
 create index if not exists posts_caught_idx on public.posts(caught_at desc) where kind = 'catch';
 -- 釣果のくわしい記録（棚・水深・仕掛け・ポイント名・気象・潮・メモなど）。post_cards で会員と本人にだけ見せる
+-- 写真を最後に変えた日時と写真の目印（新着の写真を、古い写真で上書きさせないため）
+alter table public.posts add column if not exists photo_at timestamptz;
+alter table public.posts add column if not exists photo_sig text check (char_length(photo_sig) <= 600);
 alter table public.posts add column if not exists detail jsonb check (detail is null or (jsonb_typeof(detail) = 'object' and pg_column_size(detail) < 8000));
 
 -- お気に入り（会員）：ほかの人の釣果・投稿を保存しておく。本人だけが見られる
@@ -1119,6 +1124,7 @@ select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p
        case when is_member() or p.owner = auth.uid() then p.detail end as detail,   -- くわしい記録は会員だけ
        exists(select 1 from post_favorites f where f.post_id = p.id and f.user_id = auth.uid()) as faved,
        case when p.owner = auth.uid() then p.catch_id end as catch_id,   -- 自分の釣果の番号（本人だけ）
+       case when p.owner = auth.uid() then p.photo_sig end as photo_sig, -- 載っている写真の目印（本人だけ）
        (p.owner = auth.uid()) as mine,
        (select count(*) from post_likes k where k.post_id = p.id) as like_count,
        (select count(*) from post_comments c where c.post_id = p.id) as comment_count,
@@ -1584,6 +1590,7 @@ create policy "cloud_delete_own" on storage.objects for delete to authenticated
 create or replace function public.upsert_catch_post(p jsonb)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare v_id uuid; v_old text[]; v_new text[]; v_cid text; v_size numeric; v_cnt int; v_detail jsonb;
+        v_pat timestamptz; v_old_at timestamptz; v_stale boolean := false;
 begin
   if auth.uid() is null then raise exception 'ログインが必要です'; end if;
   if not is_member() then raise exception '釣果の新着への掲載は会員の機能です'; end if;
@@ -1599,10 +1606,16 @@ begin
   v_detail := case when jsonb_typeof(p->'detail') = 'object' and pg_column_size(p->'detail') < 8000 then p->'detail' end;
   -- これまでの記録をまとめて載せるとき（並び順を釣った日時にする。posts_guard で使う）
   perform set_config('app.catch_backfill', case when coalesce((p->>'backfill')::boolean, false) then '1' else '' end, true);
-  select id, photos into v_id, v_old from posts where owner = auth.uid() and catch_id = v_cid;
+  v_pat := nullif(p->>'photo_at', '')::timestamptz;
+  select id, photos, photo_at into v_id, v_old, v_old_at from posts where owner = auth.uid() and catch_id = v_cid;
+  -- 写真を変えるのは、載っている写真より新しく変えた写真のときだけ（古い写真しかない端末・古い版のアプリからの上書きを断る）
+  if v_new is not null and v_old_at is not null and (v_pat is null or v_pat < v_old_at) then
+    v_new := null; v_stale := true;
+  end if;
   if v_id is null then
-    insert into posts(owner, kind, catch_id, photos, species, size_cm, count, method, shime, caught_at, pref, lat, lon, detail, allow_comments)
+    insert into posts(owner, kind, catch_id, photos, photo_at, photo_sig, species, size_cm, count, method, shime, caught_at, pref, lat, lon, detail, allow_comments)
     values (auth.uid(), 'catch', v_cid, coalesce(v_new, '{}'),
+            case when v_new is not null then v_pat end, case when v_new is not null then left(p->>'photo_sig', 600) end,
             left(nullif(btrim(p->>'species'), ''), 40), v_size, v_cnt,
             left(nullif(p->>'method', ''), 40), left(nullif(p->>'shime', ''), 40),
             nullif(p->>'caught_at', '')::timestamptz, left(nullif(p->>'pref', ''), 10),
@@ -1613,6 +1626,8 @@ begin
   else
     update posts set
       photos = coalesce(v_new, photos),
+      photo_at = case when v_new is not null then v_pat else photo_at end,
+      photo_sig = case when v_new is not null then left(p->>'photo_sig', 600) else photo_sig end,
       species = left(nullif(btrim(p->>'species'), ''), 40), size_cm = v_size, count = v_cnt,
       method = left(nullif(p->>'method', ''), 40), shime = left(nullif(p->>'shime', ''), 40),
       caught_at = nullif(p->>'caught_at', '')::timestamptz, pref = left(nullif(p->>'pref', ''), 10),
@@ -1621,7 +1636,7 @@ begin
   end if;
   perform set_config('app.catch_backfill', '', true);
   -- 差し替えで使わなくなった写真（画面の側で保存場所から消す）
-  return jsonb_build_object('id', v_id, 'old_photos',
+  return jsonb_build_object('id', v_id, 'stale', v_stale, 'old_photos',
     case when v_new is null then '[]'::jsonb
          else coalesce((select jsonb_agg(x) from unnest(v_old) x where not (x = any(v_new))), '[]'::jsonb) end);
 end $$;
