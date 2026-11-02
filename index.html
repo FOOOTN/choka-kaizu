@@ -135,8 +135,8 @@ textarea{resize:vertical;min-height:60px}
 .empty{color:var(--ink-2);text-align:center;padding:30px 10px;font-size:13px}
 
 /* 素早い入力 */
-.quickbar{display:flex;gap:8px;margin-bottom:6px}
-.quickbar .btn{flex:1;min-height:44px;font-size:14px;display:flex;align-items:center;justify-content:center}
+.quickbar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+.quickbar .btn{flex:1 1 9em;min-width:0;min-height:44px;font-size:14px;display:flex;align-items:center;justify-content:center;white-space:normal;text-align:center;line-height:1.3}
 .photo-btn{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 .row-dt{margin:8px 0 4px}
 .q{border-top:1px solid var(--rule);padding:10px 0 12px;display:flex;flex-direction:column;gap:8px}
@@ -1909,12 +1909,14 @@ function drawPhotos(){
 /* 別の端末の写真を取り込む：この記録について、新着に載っている写真と写真の同期の写真から、まだ入っていない写真を足す */
 function otherPhUi(){
   const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
-  $("btnOtherPh").hidden = !(r && SH.sb && hasProfile() && ((MYP.get(String(r.id))?.photos||[]).length || (r.cloudPhotos||[]).length));
+  $("btnOtherPh").hidden = !r || r.sample;                      // 記録の編集ではいつも出す（写真がない釣果でも）
 }
 $("btnOtherPh").onclick=async e=>{
   const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null; if(!r) return;
+  if(!(SH.sb && hasProfile())){ autoStatus("別の端末の写真を取り込むには、ログインしてください（ほかの端末で新着に載せた写真か、「写真の同期」で送った写真を取り込めます）"); return; }
   setBusy(e.target,true,"取り込み中…");
   try{
+    await loadMyPhotos();                                          // 新着の写真の一覧を最新にしてから探す
     const urls=(MYP.get(String(r.id))?.photos||[]).map(x=>postUrl(x));
     if((r.cloudPhotos||[]).length){ const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); urls.push(...(data||[]).map(x=>x.signedUrl).filter(Boolean)); }
     const have=new Set(photos.map(p=>photoSig([p]))); let n=0;
@@ -1925,7 +1927,8 @@ $("btnOtherPh").onclick=async e=>{
       if(have.has(k)) continue; have.add(k); photos.push(d); photoDates.push(null); n++;
     }
     if(n){ photosTouched=true; drawPhotos(); autoStatus(`ほかの端末の写真を${n}枚取り込みました。「変更を保存」で確定します`,"ok"); }
-    else autoStatus("足せる写真はありませんでした（ほかの端末で新着に載せた写真か、「写真の同期」で送った写真を取り込めます。同じ写真はすでに入っています）");
+    else autoStatus(urls.length ? "足せる写真はありませんでした（同じ写真はすでに入っています）"
+      : "この釣果の写真は、まだサーバーにありません。写真がある端末でこの釣果を開いて新着に載せるか、「釣果一覧」の「写真の同期…」で送ってから、もう一度押してください");
   }catch(err){ autoStatus("写真を取り込めませんでした："+shErr(err),"err"); }
   finally{ setBusy(e.target,false); }
 };
@@ -2459,7 +2462,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.8";
+const APP_VER="2026.11.02.10";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
