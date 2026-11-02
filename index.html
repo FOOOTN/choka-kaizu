@@ -2367,7 +2367,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.4";
+const APP_VER="2026.11.02.5";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 async function checkVer(){
   try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k","min_app_ver").maybeSingle();
@@ -3114,7 +3114,12 @@ const cloudOn = () => !!(SH.sb && hasProfile() && isMember() && !SH.foreign);
 function cloudUi(){
   const on=cloudOn();
   $("cloudOps").hidden=!on;
-  $("cloudInfo").textContent = on ? "ログイン中は、釣果（写真は除く）と航跡を自動で同期します。写真は「写真の同期…」から、送る・取り込むを押したときだけ同期します。"
+  if(SH.foreign){
+    $("cloudInfo").innerHTML=`<b style="color:var(--magenta)">この端末には別のアカウントの記録が入っているため、同期と新着への掲載を止めています。</b> <button type="button" class="btn sm" id="btnForeign">どうするか選ぶ</button>`;
+    $("btnForeign").onclick=()=>foreignDlg();
+    return;
+  }
+  $("cloudInfo").textContent = on ? `ログイン中は、釣果（写真は除く）と航跡を自動で同期します。${lsGet(clKey("at"))?`最後に同期：${fmtJ(lsGet(clKey("at")))}`:""}`
     : (hasProfile() ? "同期は会員の機能です。会員になると、釣果と航跡がPCとスマホで自動でそろいます。" : "会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。");
 }
 function cloudForget(kind,id){            // 消したことを覚えておき、次の同期で送る
@@ -3133,6 +3138,9 @@ async function cloudPushDeletes(){
   lsSet(clKey("del"),null);
 }
 const catchData = r => { const {photos,sample,feedPost,feedDirty,...d}=r; return d; };
+/* 写真の目印は、記録全体とは別に「写真を変えた日時」が新しい方を残す */
+const PHK=["photoSig","photoAt","cloudPhotos","cloudSig"];
+const phNewer=(a,b)=>(a?.photoAt||"") > (b?.photoAt||"");
 async function cloudSync(force){
   if(!cloudOn()||CL.busy) return;
   if(!force && Date.now()-CL.last<20000) return;
@@ -3148,11 +3156,14 @@ async function cloudSync(force){
         const iso=new Date(x.updated_at).toISOString();
         if(x.kind==="catch"){
           const loc=records.find(r=>r.id===x.id);
-          if(loc && (loc.updatedAt||"")>iso) continue;
-          if(x.deleted){ if(loc){ await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
-          if(loc && (loc.updatedAt||"")===iso) continue;
+          if(x.deleted){ if(loc && !((loc.updatedAt||"")>iso)){ await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
+          if(loc && (loc.updatedAt||"")>=iso){                       // 記録はこの端末の方が新しい：写真の目印だけ、新しければ取り込む
+            if(phNewer(x.data,loc)){ for(const k of PHK) if(x.data[k]!==undefined) loc[k]=x.data[k]; await saveRec(loc); got++; }
+            continue;
+          }
           const r={...x.data, id:x.id, photos:loc?.photos||[], updatedAt:iso};
           if(loc?.feedPost) r.feedPost=loc.feedPost;                  // この端末が新着に送った写真の目印は残す
+          if(loc && phNewer(loc,x.data)) for(const k of PHK) r[k]=loc[k];   // 写真の目印は、この端末の方が新しければそのまま
           await saveRec(r); records=records.filter(q=>q.id!==x.id).concat(r); got++;
         }else{
           if(rec && rec.track.id===x.id) continue;                 // 記録中の航跡はこの端末を優先
@@ -3170,9 +3181,10 @@ async function cloudSync(force){
     }
     // 2) この端末で変えた分を送る
     const pushedAt=lsGet(clKey("push"))||"", started=new Date().toISOString();
+    const rePh=!lsGet(clKey("phfix1"));                            // 一度だけ：写真の目印を送り直す（前の版で捨てられた分を直す）
     let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
     const rows=[
-      ...records.filter(r=>!r.sample && (r.updatedAt||"1970")>pushedAt && pulled.get("catch:"+r.id)!==r.updatedAt).map(r=>({kind:"catch",id:String(r.id),data:catchData(r),deleted:false,updated_at:r.updatedAt||"2000-01-01T00:00:00Z"})),
+      ...records.filter(r=>!r.sample && (((r.updatedAt||"1970")>pushedAt && pulled.get("catch:"+r.id)!==r.updatedAt) || (rePh && r.photoAt))).map(r=>({kind:"catch",id:String(r.id),data:catchData(r),deleted:false,updated_at:r.updatedAt||"2000-01-01T00:00:00Z"})),
       ...tracks.filter(t=>(t.updatedAt||"1970")>pushedAt && pulled.get("track:"+t.id)!==t.updatedAt).map(t=>{ const {visible,...d}=t; return {kind:"track",id:String(t.id),data:d,deleted:false,updated_at:t.updatedAt||"2000-01-01T00:00:00Z"}; }),
       ...dels.map(d=>({kind:d.kind,id:d.id,data:null,deleted:true,updated_at:d.at}))];
     for(let i=0;i<rows.length;i+=50){
@@ -3180,9 +3192,9 @@ async function cloudSync(force){
       if(error) throw error;
       sent+=Math.min(50,rows.length-i);
     }
-    lsSet(clKey("push"),started); lsSet(clKey("del"),null);
+    lsSet(clKey("push"),started); lsSet(clKey("del"),null); lsSet(clKey("phfix1"),"1");
     if(got){ render(); drawTracks(); drawTrackList(); }
-    lsSet(clKey("at"),new Date().toISOString());
+    lsSet(clKey("at"),new Date().toISOString()); cloudUi();
     shMsg("cloudStat",`同期しました（${hm(Date.now())}${got?`・取り込み${got}件`:""}${sent?`・送信${sent}件`:""}）`,"ok");
   }catch(e){ shMsg("cloudStat","同期できませんでした（電波のよいところで「記録を今すぐ同期」を押してください）："+shErr(e),"err"); }
   finally{ CL.busy=false; }

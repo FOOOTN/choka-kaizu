@@ -40,7 +40,7 @@ create table if not exists public.banned_phones (
 create table if not exists public.app_settings (k text primary key, v text not null, updated_at timestamptz not null default now());
 insert into public.app_settings values ('require_phone', 'off', now()) on conflict (k) do nothing;
 -- アプリの最低限の版。これより古い版の画面には「読み込み直してください」と出す（写真などを古い版で上書きしないため）
-insert into public.app_settings values ('min_app_ver', '2026.11.02.3', now()) on conflict (k) do update set v = excluded.v, updated_at = now();
+insert into public.app_settings values ('min_app_ver', '2026.11.02.5', now()) on conflict (k) do update set v = excluded.v, updated_at = now();
 -- ハッシュ用の秘密の値（画面からは読めない）
 create table if not exists public.app_secrets (k text primary key, v text not null);
 create schema if not exists extensions;
@@ -1487,7 +1487,22 @@ begin
     raise exception '1件のデータが大きすぎます'; end if;
   if new.updated_at > now() + interval '1 day' then new.updated_at := now(); end if;
   if tg_op = 'UPDATE' then
-    if new.updated_at < old.updated_at then return null; end if;   -- 古い変更は無視
+    -- 写真の目印（photoSig・photoAt・cloudPhotos・cloudSig）は、記録全体とは別に「写真を変えた日時」が新しい方を残す
+    if new.kind = 'catch' and not new.deleted and not old.deleted and new.data is not null and old.data is not null then
+      if new.updated_at < old.updated_at then
+        if coalesce(new.data->>'photoAt', '') > coalesce(old.data->>'photoAt', '') then
+          new.data := old.data || jsonb_strip_nulls(jsonb_build_object('photoSig', new.data->'photoSig', 'photoAt', new.data->'photoAt',
+                                                                       'cloudPhotos', new.data->'cloudPhotos', 'cloudSig', new.data->'cloudSig'));
+          new.updated_at := old.updated_at;                        -- 記録のほかの項目は、新しい方（old）のまま
+        else
+          return null;                                             -- 古い変更は無視
+        end if;
+      elsif coalesce(old.data->>'photoAt', '') > coalesce(new.data->>'photoAt', '') then
+        new.data := new.data || jsonb_strip_nulls(jsonb_build_object('photoSig', old.data->'photoSig', 'photoAt', old.data->'photoAt',
+                                                                     'cloudPhotos', old.data->'cloudPhotos', 'cloudSig', old.data->'cloudSig'));
+      end if;
+    elsif new.updated_at < old.updated_at then return null;         -- 古い変更は無視
+    end if;
     if new.owner <> old.owner then raise exception '権限がありません'; end if;
   elsif (select count(*) from cloud_items where owner = auth.uid()) >= 20000 then
     raise exception '同期できる件数の上限です';
