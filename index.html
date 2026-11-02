@@ -1468,7 +1468,7 @@ function render(){
       const a = e.target.dataset?.a;
       if(a==="edit"){ openForm(r); return; }
       if(a==="del"){
-        if(e.target.dataset.armed){ if(MV.r?.id===r.id) moveEnd(); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id); if(r.feed||r.feedPost) feedRemove(r); }
+        if(e.target.dataset.armed){ if(MV.r?.id===r.id) moveEnd(); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id); if(!r.sample) feedRemove(r); }   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
         else { e.target.dataset.armed="1"; e.target.textContent="もう一度押すと削除"; setTimeout(()=>{e.target.textContent="削除";delete e.target.dataset.armed;},3000); }
         return;
       }
@@ -3198,12 +3198,18 @@ async function feedDelete(id){
   if(error) throw error;
   const ph=(data||[]).flatMap(x=>x.photos||[]); if(ph.length) SH.sb.storage.from("posts").remove(withThumbs(ph));
 }
+/* 新着から外した釣果を、開いている一覧と地図からもすぐ消す */
+function feedForget(id){
+  const n=NW.list.length; NW.list=NW.list.filter(p=>!(p.mine && p.catch_id===String(id)));
+  if(NW.list.length!==n){ document.querySelectorAll("#nwList .card[data-pid]").forEach(c=>{ if(!NW.list.some(p=>p.id===c.dataset.pid)) c.remove(); }); drawPostMarkers(NW.list, NW.mode!=="feed"); }
+}
 async function feedRemove(r){                                     // 記録を消した・載せるのをやめたとき
   const alive=records.some(x=>x.id===r.id);
   try{
     if(!feedOnline()) throw 0;
     await feedDelete(r.id); MYP.delete(String(r.id));
     r.feedPost=null; delete r.feedDirty;
+    feedForget(r.id);
   }catch{
     if(alive) r.feedDirty=true;
     else { let q=[]; try{ q=JSON.parse(lsGet(FEED_DEL)||"[]"); }catch{} if(!q.includes(String(r.id))) q.push(String(r.id)); lsSet(FEED_DEL,JSON.stringify(q.slice(-500))); }
@@ -4293,7 +4299,9 @@ const SAMPLES = [
   records = await loadAll();
   await initTracks();
   let seeded=false; try{ seeded=localStorage.getItem("choka-seeded")==="1"; }catch{}
-  if(!records.length && !seeded){ for(const s of SAMPLES) await saveRec(s); records=await loadAll(); try{localStorage.setItem("choka-seeded","1")}catch{} }
+  // サンプル（例）の釣果は入れない。前の版で入れたサンプルも消す
+  if(records.some(r=>r.sample)){ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); }
+  try{localStorage.setItem("choka-seeded","1")}catch{}
   render();
   if(records.length) map.fitBounds(L.latLngBounds(records.map(r=>[r.lat,r.lon])).pad(0.4),{maxZoom:12});
   hereStart();

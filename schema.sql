@@ -1708,6 +1708,28 @@ revoke execute on function public.my_favorites(int, int) from public, anon;
 grant  execute on function public.my_favorites(int, int) to authenticated;
 
 -- ---------------------------------------------------------------------
+-- 13. 消した釣果は、新着からも必ず消す
+--     端末で釣果を消すと、同期（cloud_items）に「消した」印が届く。そのとき同じ本人・同じ番号の新着（posts）も消す。
+--     画面からも消すが、電波が切れたときや、ほかの端末で載せた分の取り残しをここで防ぐ
+--     （写真のファイルは画面の側で消す。取り残された写真は Storage の posts から手で消せる）
+-- ---------------------------------------------------------------------
+create or replace function public.cloud_items_forget_post() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.kind = 'catch' and new.deleted then
+    delete from posts where owner = new.owner and kind = 'catch' and catch_id = left(new.id, 40);
+  end if;
+  return null;
+end $$;
+drop trigger if exists cloud_items_forget_post on public.cloud_items;
+create trigger cloud_items_forget_post after insert or update of deleted on public.cloud_items
+  for each row execute function public.cloud_items_forget_post();
+revoke execute on function public.cloud_items_forget_post() from public, anon, authenticated;
+-- すでに消した釣果で、新着に残っているものを片付ける（何度実行しても同じ）
+delete from public.posts p using public.cloud_items c
+ where p.kind = 'catch' and c.kind = 'catch' and c.deleted and c.owner = p.owner and left(c.id, 40) = p.catch_id;
+
+-- ---------------------------------------------------------------------
 -- 12. サーバーの使用量（管理者）：データベースの大きさ・大きい表・保存場所（バケット）ごとのファイル数と容量
 --     通信量（Egress）はSQLでは分からないので、Supabase の画面の Usage で見る
 -- ---------------------------------------------------------------------
