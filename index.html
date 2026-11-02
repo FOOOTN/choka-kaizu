@@ -365,6 +365,11 @@ body.form-open .mode-ctl,body.moving .mode-ctl,body.moving .map-size{display:non
 .near-i .dot{width:12px;height:12px;border-radius:50%;flex:none}
 .near-i span:last-child{color:#666;font-size:12px;margin-left:auto;white-space:nowrap}
 .pop .rec-ops .btn{min-height:32px}
+.leaflet-popup .btn{color:#16263a;border-color:#16263a;background:#fff}
+.leaflet-popup .btn.primary{color:#fff;background:#a3195b;border-color:#a3195b}
+.leaflet-popup .btn.danger{color:#a3195b;border-color:#a3195b}
+.pop .align{margin:8px 0;padding:8px;border:1.5px solid #a3195b;border-radius:4px;background:#fff7fa;display:flex;flex-direction:column;gap:6px;font-size:12px;color:#16263a}
+.pop .align .btn{text-align:left;white-space:normal;min-height:34px}
 .pop .feed-on{font-size:11px;color:#2f6b4a;margin-top:4px}
 .pop .gal-s{display:flex;gap:4px;margin-top:6px;overflow-x:auto}
 .pop .gal-s img{width:84px;height:84px;object-fit:cover;margin:0;flex:none}
@@ -496,6 +501,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
         <div class="quickbar">
           <label class="btn photo-btn">写真を撮る・選ぶ<input type="file" id="f_photo" accept="image/*" multiple hidden></label>
           <button type="button" class="btn" id="btnGps">現在地</button>
+          <button type="button" class="btn" id="btnOtherPh" hidden title="ほかの端末で新着に載せた写真・写真の同期で送った写真を、この記録に足します">別の端末の写真を取り込む</button>
         </div>
         <div class="photos" id="photoPrev"></div>
         <div class="hint" id="photoNote" hidden></div>
@@ -1332,6 +1338,33 @@ function photoState(r){
   return {kind:"missing"};
 }
 const localPh = r => photoState(r).kind==="local" ? (r.photos||[]) : [];
+/* ---------- 写真をそろえる：端末・新着・写真の同期で写真が食い違っているとき、正しい写真を選んでもらう ---------- */
+function alignOptions(r){                         // 前の版の記録（目印なし）で、端末の写真と新着・写真の同期の写真が違うとき
+  if(r.sample || r.photoSig!==undefined) return [];
+  const local=r.photos||[], f=MYP.get(String(r.id)), o=[["local","この端末の写真を最新にする"]];
+  if(!local.length) return [];
+  if(f?.photos?.length && !(f.sig && sigEq(f.sig,local))) o.push(["feed","新着に載っている写真にそろえる"]);
+  if((r.cloudPhotos||[]).length && r.cloudSig!==photoSig(local)) o.push(["cloud","写真の同期の写真（ほかの端末から送った写真）にそろえる"]);
+  return o.length>1 ? o : [];
+}
+async function alignFetch(r,src){                    // 選んだ写真を data URL で
+  if(src==="local") return [...(r.photos||[])];
+  let urls=[];
+  if(src==="feed") urls=(MYP.get(String(r.id))?.photos||[]).map(x=>postUrl(x));
+  else { const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); urls=(data||[]).map(x=>x.signedUrl).filter(Boolean); }
+  const ph=[]; for(const u of urls){ const res=await fetch(u); if(!res.ok) throw new Error("写真を取り込めませんでした"); ph.push(await blobToDataUrl(await res.blob())); }
+  if(!ph.length) throw new Error("写真が見つかりませんでした");
+  return ph;
+}
+async function alignPhotos(r,src){                   // その写真を「最新の写真」にして保存（ほかの端末と新着もこの写真になる）
+  if(!memberGate("釣果の記録")) return false;
+  const ph=await alignFetch(r,src), now=new Date().toISOString();
+  r.photos=ph; r.photoDates=ph.map((_,i)=>src==="local"?(r.photoDates?.[i]??null):null);
+  r.photoSig=photoSig(ph); r.photoAt=now; r.updatedAt=now;
+  if(src==="cloud") r.cloudSig=r.photoSig;
+  await saveRec(r); shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost) await feedPush(r);
+  render(); return true;
+}
 /* 写真の状態（うまく表示されないときに、画面を送ってもらうための表） */
 function photoDiagHtml(r){
   const st=photoState(r), f=MYP.get(String(r.id)), short=x=>x==null?"—":x===""?"（写真なし）":String(x).slice(0,10);
@@ -1342,8 +1375,10 @@ function photoDiagHtml(r){
     ["新着の写真",!mypLoaded?"まだ読み込んでいません":f?`${f.photos.length}枚 ${short(f.sig)}`:"新着に載っていません"],
     ["写真の同期",(r.cloudPhotos||[]).length?`${r.cloudPhotos.length}枚 ${short(r.cloudSig)}`:"なし"],
     ["同期",SH.foreign?"止まっています（別のアカウントの記録）":cloudOn()?`オン（最後 ${lsGet(clKey("at"))?fmtJ(lsGet(clKey("at"))):"—"}）`:hasProfile()?"オフ（会員でない）":"オフ（ログインしていない）"],
-    ["記録を直した日時",r.updatedAt?fmtJ(r.updatedAt):"—"]];
-  return `<table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>`;
+    ["記録を直した日時",r.updatedAt?fmtJ(r.updatedAt):"—"],
+    ["新着への最後の送信",r.feed?(r.feedLog||"この端末からはまだ送っていません")+(r.feedDirty?"（送り直し待ち）":""):"新着に載せない記録"]];
+  return `<table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
+    ${r.feed && feedOnline()?`<button type="button" class="btn sm" data-a="resend" style="margin-top:4px">新着に送り直す</button>`:""}`;
 }
 function popupHtml(r){
   const rows = [
@@ -1361,6 +1396,7 @@ function popupHtml(r){
   return `<div class="pop recpop"><h4>${esc(r.species)} ${r.sample?'<span class="tag">例</span>':""}</h4>
     <div class="coord mono">${fmtPos(r.lat,r.lon)}${r.spot?` ・ ${esc(r.spot)}`:""}</div>
     ${r.sample?"":`<div class="rec-ops"><button type="button" class="btn sm" data-a="edit">記録を直す</button><button type="button" class="btn sm primary" data-a="move">位置を直す</button></div>`}
+    ${alignOptions(r).length?`<div class="align"><div>端末によって写真が違います。正しい写真を選ぶと、すべての端末と新着がその写真になります。</div>${alignOptions(r).map(([k,t])=>`<button type="button" class="btn sm" data-align="${k}">${t}</button>`).join("")}</div>`:""}
     ${r.sample?"":`<details class="phdiag"><summary>写真の状態を調べる</summary>${photoDiagHtml(r)}</details>`}
     <table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
     ${ph.length>1?`<div class="gal-s">${ph.map((p,i)=>`<img src="${p}" alt="${esc(r.species)}の写真${i+1}">`).join("")}</div>`
@@ -1372,8 +1408,17 @@ function openRecPopup(r){
   const tmp=document.createElement("div"); tmp.innerHTML=popupHtml(r);
   const el=tmp.firstElementChild;
   el.style.maxHeight=Math.max(160,map.getSize().y-(isPhone()?130:110))+"px";        // 小さい地図でも吹き出しの中でスクロールできる
-  el.addEventListener("click",e=>{
+  el.addEventListener("click",async e=>{
+    const al=e.target.closest("button[data-align]");
+    if(al){ setBusy(al,true,"そろえています…");
+      try{ if(await alignPhotos(r,al.dataset.align)){ map.closePopup(); openRecPopup(r); } else setBusy(al,false); }
+      catch(err){ setBusy(al,false); al.insertAdjacentHTML("afterend",`<div class="srv" style="color:#a3195b">${esc(shErr(err))}</div>`); }
+      return; }
     const a=e.target.closest("button[data-a]")?.dataset.a; if(!a) return;
+    if(a==="resend"){ const b=e.target.closest("button"); setBusy(b,true,"送っています…");
+      await loadMyPhotos(); await feedPush(records.find(x=>x.id===r.id)||r);
+      const cur=records.find(x=>x.id===r.id)||r; map.closePopup(); openRecPopup(cur);
+      const d=document.querySelector(".leaflet-popup .phdiag"); if(d) d.open=true; return; }
     map.closePopup();
     if(a==="edit") openForm(r); else moveStart(r);
   });
@@ -1861,27 +1906,42 @@ function drawPhotos(){
   photoNoteUi();
 }
 /* 編集する記録の写真が、この端末にないか古いとき：サーバーの写真を取り込めるようにする */
+/* 別の端末の写真を取り込む：この記録について、新着に載っている写真と写真の同期の写真から、まだ入っていない写真を足す */
+function otherPhUi(){
+  const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
+  $("btnOtherPh").hidden = !(r && SH.sb && hasProfile() && ((MYP.get(String(r.id))?.photos||[]).length || (r.cloudPhotos||[]).length));
+}
+$("btnOtherPh").onclick=async e=>{
+  const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null; if(!r) return;
+  setBusy(e.target,true,"取り込み中…");
+  try{
+    const urls=(MYP.get(String(r.id))?.photos||[]).map(x=>postUrl(x));
+    if((r.cloudPhotos||[]).length){ const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); urls.push(...(data||[]).map(x=>x.signedUrl).filter(Boolean)); }
+    const have=new Set(photos.map(p=>photoSig([p]))); let n=0;
+    for(const u of urls){
+      if(photos.length>=6) break;
+      const res=await fetch(u); if(!res.ok) continue;
+      const d=await blobToDataUrl(await res.blob()); const k=photoSig([d]);
+      if(have.has(k)) continue; have.add(k); photos.push(d); photoDates.push(null); n++;
+    }
+    if(n){ photosTouched=true; drawPhotos(); autoStatus(`ほかの端末の写真を${n}枚取り込みました。「変更を保存」で確定します`,"ok"); }
+    else autoStatus("足せる写真はありませんでした（ほかの端末で新着に載せた写真か、「写真の同期」で送った写真を取り込めます。同じ写真はすでに入っています）");
+  }catch(err){ autoStatus("写真を取り込めませんでした："+shErr(err),"err"); }
+  finally{ setBusy(e.target,false); }
+};
 function photoNoteUi(){
+  otherPhUi();
   const el=$("photoNote"), r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
   const st=r ? photoState(r) : null;
-  if(r && !photosTouched && st.kind==="local" && (r.photos||[]).length && r.photoSig===undefined){
-    // 前の版の記録：どの端末の写真が最新か分からない。正しい写真の端末で、この写真を最新に決めてもらう
+  const opts=r && !photosTouched ? alignOptions(r) : [];
+  if(opts.length){
     el.hidden=false;
-    const f=MYP.get(String(r.id)), hasFeed=!!f?.photos?.length, hasCloud=(r.cloudPhotos||[]).length>0 && r.cloudSig!==photoSig(r.photos);
-    el.innerHTML=`この記録は前の版のもので、どの端末の写真が最新か分かりません。ほかの端末と写真が違うときは、正しい写真を選んで「変更を保存」してください。
-      <span style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
-        <button type="button" class="btn sm" id="btnMakeLatest">この端末の写真を最新にする</button>
-        ${hasFeed?`<button type="button" class="btn sm" id="btnUseFeed">新着に載っている写真にそろえる</button>`:""}
-        ${hasCloud?`<button type="button" class="btn sm" id="btnUseCloud">写真の同期の写真（ほかの端末から送った写真）にそろえる</button>`:""}</span>`;
-    const done=t=>{ photosTouched=true; drawPhotos(); el.hidden=false; el.textContent=t+"「変更を保存」で確定すると、ほかの端末と新着もこの写真になります。"; };
-    const useUrls=async(btn,urls)=>{ setBusy(btn,true,"取り込み中…");
-      try{ const ph=[]; for(const u of urls){ const res=await fetch(u); if(!res.ok) throw new Error("写真を取り込めませんでした"); ph.push(await blobToDataUrl(await res.blob())); }
-        if(!ph.length) throw new Error("写真が見つかりませんでした");
-        photos=ph; photoDates=ph.map(()=>null); done("写真を差し替えました。"); }
-      catch(err){ setBusy(btn,false); autoStatus(shErr(err),"err"); } };
-    $("btnMakeLatest").onclick=()=>done("この端末の写真を最新にします。");
-    $("btnUseFeed")?.addEventListener("click",e=>useUrls(e.target,f.photos.map(x=>postUrl(x))));
-    $("btnUseCloud")?.addEventListener("click",async e=>{ const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); useUrls(e.target,(data||[]).map(x=>x.signedUrl).filter(Boolean)); });
+    el.innerHTML=`端末によって写真が違います。正しい写真を選んで「変更を保存」してください。<span style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${opts.map(([k,t])=>`<button type="button" class="btn sm" data-alignf="${k}">${t}</button>`).join("")}</span>`;
+    el.querySelectorAll("button[data-alignf]").forEach(btn=>btn.onclick=async()=>{
+      setBusy(btn,true,"取り込み中…");
+      try{ const ph=await alignFetch(r,btn.dataset.alignf); photos=ph; photoDates=ph.map(()=>null); photosTouched=true; drawPhotos();
+        el.hidden=false; el.textContent="写真を選びました。「変更を保存」で確定すると、すべての端末と新着がこの写真になります。"; }
+      catch(err){ setBusy(btn,false); autoStatus(shErr(err),"err"); } });
     return;
   }
   if(!r || photosTouched || st.kind==="local" || st.kind==="none"){ el.hidden=true; return; }
@@ -2399,19 +2459,35 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.7";
+const APP_VER="2026.11.02.8";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
-async function checkVer(){
-  try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k","min_app_ver").maybeSingle();
-    $("verBanner").hidden = !(data?.v && verOlder(APP_VER,data.v)); }catch{}
+/* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
+async function publishedVer(){
+  try{ const t=await (await fetch(location.pathname+"?vercheck="+Date.now(),{cache:"no-store"})).text();
+    return (/const APP_VER="([^"]+)"/.exec(t)||[])[1]||null; }catch{ return null; }
 }
-$("btnReload").onclick=()=>location.reload();
+async function checkVer(){
+  let need=null;
+  try{ const {data}=SH.sb ? await SH.sb.from("app_settings").select("v").eq("k","min_app_ver").maybeSingle() : {data:null};
+    if(data?.v && verOlder(APP_VER,data.v)) need=data.v; }catch{}
+  const pub=await publishedVer(); if(pub && verOlder(APP_VER,pub)) need=pub;
+  $("verBanner").hidden=!need;
+  if(need) $("verBanner").firstChild.textContent=`新しい版（${need}）があります。いま開いているのは ${APP_VER} です。読み込み直してください。 `;
+}
+/* 読み込み直す：ブラウザが覚えている古いページを捨ててから開き直す */
+async function hardReload(){
+  try{ await fetch(location.pathname,{cache:"reload"}); }catch{}
+  location.reload();
+}
+$("btnReload").onclick=()=>hardReload();
+setTimeout(()=>{ if(!SH.started) checkVer(); },3000);
+setInterval(()=>{ if(document.visibilityState==="visible") checkVer(); },600000);   // 開いたままでも10分ごとに確かめる   // サーバーの設定がない画面でも、公開されている版を調べる
 /* 更新ボタン：メールアプリの中のブラウザなど、再読み込みのボタンがない画面のため。送れていない分を送ってから開き直す */
 $("btnRefresh").onclick=async e=>{
   setBusy(e.target,true,"更新中…");
   const work=(async()=>{ try{ if(cloudOn()) await cloudSync(true); await feedSweep(); await cloudPushDeletes(); }catch{} })();
   await Promise.race([work,new Promise(r=>setTimeout(r,5000))]);
-  location.reload();
+  hardReload();
 };
 async function shStart(){
   if(SH.started) return; SH.started=true;
@@ -3053,7 +3129,7 @@ function deviceId(){
 }
 const sharingOn = () => !!(SH.sb && hasProfile() && isMember() && !SH.foreign);   // 確認事項に同意して表示名を登録した会員の釣果を送る
 function catchRow(r){
-  const {id,lat,lon,datetime,species,count,photos,photoDates,sample,feedPost,feedDirty,...rest}=r;
+  const {id,lat,lon,datetime,species,count,photos,photoDates,sample,feedPost,feedDirty,feedLog,...rest}=r;
   if(rest.memo) rest.memo=String(rest.memo).slice(0,1000);
   return {local_id:String(id).slice(0,40), caught_at:new Date(datetime+":00+09:00").toISOString(),
     species:String(species||"不明").slice(0,40), count:count??null, lat, lon, data:rest};
@@ -3169,7 +3245,7 @@ async function cloudPushDeletes(){
   for(let i=0;i<rows.length;i+=50){ const {error}=await SH.sb.from("cloud_items").upsert(rows.slice(i,i+50),{onConflict:"owner,kind,id"}); if(error) return; }
   lsSet(clKey("del"),null);
 }
-const catchData = r => { const {photos,sample,feedPost,feedDirty,...d}=r; return d; };
+const catchData = r => { const {photos,sample,feedPost,feedDirty,feedLog,...d}=r; return d; };
 /* 写真の目印は、記録全体とは別に「写真を変えた日時」が新しい方を残す */
 const PHK=["photoSig","photoAt","cloudPhotos","cloudSig"];
 const phNewer=(a,b)=>(a?.photoAt||"") > (b?.photoAt||"");
@@ -3318,7 +3394,10 @@ async function feedPush(r,backfill){
     // 写真を送るのは、この端末の写真が最新のときだけ（古い写真で上書きしない。サーバーでも写真を変えた日時で確かめる）
     const known=r.photoSig!==undefined, current=photosCurrent(r);
     const wantSig=known ? r.photoSig : sig;
-    const same=(had!==undefined && sigEq(had,r.photos)) || (!!f && f.sig!=null && f.sig===wantSig) || (!!f && !(r.photos||[]).length && !f.photos.length);
+    // 新着と同じ写真か：サーバーの新着の状態（MYP）が分かればそれで決める。分からないときだけ、この端末が前に送った目印で決める
+    const same = f && (f.sig!=null || !f.photos.length)
+      ? (f.photos.length ? f.sig===wantSig : !(r.photos||[]).length)
+      : (had!==undefined && sigEq(had,r.photos));
     let photos=null;                                              // null＝サーバーの写真をそのまま使う
     // 前の版の記録（目印なし）は、新着にまだ写真がないときだけ写真を送る（どの端末の写真が新しいか分からないため）
     const legacyBlock = !known && (!mypLoaded || (f?.photos?.length > 0));
@@ -3338,18 +3417,25 @@ async function feedPush(r,backfill){
       pref:r.pref||null, lat:r.lat, lon:r.lon, detail:feedDetail(r), photos, backfill:!!backfill,
       photo_sig:wantSig, photo_at: photos ? (r.photoAt || (known ? new Date().toISOString() : null)) : null}});
     if(error) throw error;
+    const sentN=photos?photos.length:null;
     if(data?.stale){                                              // サーバーにもっと新しい写真がある：送った写真は捨てる
       if(uploaded.length) SH.sb.storage.from("posts").remove(uploaded);
       uploaded=[]; photos=null; loadMyPhotos();
     }
+    const log=`${fmtJ(new Date().toISOString())} ${data?.stale?"送信しました（写真は、サーバーにもっと新しく変えた写真があるため送りませんでした）":sentN==null?"送信しました（写真はそのまま）":`送信しました（写真${sentN}枚）`}`;
     if(data?.old_photos?.length) SH.sb.storage.from("posts").remove(withThumbs(data.old_photos));
-    r.feedPost={id:data.id, sig: photos ? sig : had}; if(r.feedPost.sig===undefined) delete r.feedPost.sig; delete r.feedDirty;
     if(photos) MYP.set(String(r.id),{photos,sig:wantSig});
-    await saveRec(r);
+    // 送っている間に記録が直されていることがあるので、結果は今の記録に書き込む（古い記録で上書きしない）
+    const cur=records.find(x=>x.id===r.id);
+    for(const o of new Set([r,cur].filter(Boolean))){ o.feedPost={id:data.id, sig: photos ? sig : had}; if(o.feedPost.sig===undefined) delete o.feedPost.sig; delete o.feedDirty; o.feedLog=log; }
+    if(cur) await saveRec(cur);
     if(!$("viewFeed").hidden && FD.fsub==="new" && NW.mode==="feed") nwLoad(true);
   }catch(e){
     if(uploaded.length) SH.sb.storage.from("posts").remove(uploaded);
-    r.feedDirty=true; await saveRec(r);
+    const cur=records.find(x=>x.id===r.id);
+    const log=`${fmtJ(new Date().toISOString())} 送れませんでした：${shErr(e)}`;
+    for(const o of new Set([r,cur].filter(Boolean))){ o.feedDirty=true; o.feedLog=log; }
+    if(cur) await saveRec(cur);
     shMsg("cloudStat","新着への反映ができませんでした。電波のよいところで、自動で送り直します","err");
   }finally{
     feedBusy.delete(r.id);
@@ -3386,7 +3472,9 @@ async function feedRemove(r){                                     // 記録を�
     if(alive) r.feedDirty=true;
     else { const q=feedDelQueue(); if(!q.some(x=>x.id===String(r.id))) q.push({id:String(r.id), owner:SH.user?.id||null, at:Date.now()}); lsSet(FEED_DEL,JSON.stringify(q.slice(-500))); }
   }
-  if(alive) await saveRec(r);
+  const cur=records.find(x=>x.id===r.id);
+  if(cur && cur!==r){ cur.feedPost=r.feedPost; if(r.feedDirty) cur.feedDirty=true; else delete cur.feedDirty; }
+  if(cur) await saveRec(cur);
 }
 /* これまでに登録した釣果を、一度だけまとめて新着に載せる（会員・端末ごとに1回）。
    1日以上前の釣果は、新着の先頭に並ばないよう釣った日時の順で載せる。すでに載せている分も、位置とくわしい記録を付けて送り直す */
