@@ -298,6 +298,9 @@ details.box summary{cursor:pointer;font-weight:500;min-height:30px;display:flex;
 .thumbs button{position:absolute;top:2px;right:2px;border:0;background:rgba(0,0,0,.6);color:#fff;border-radius:2px;font-size:11px;cursor:pointer;padding:0 5px}
 .phone-note{background:#fff7e0;border:1px solid #e6c46a;border-radius:4px;padding:8px 10px;font-size:13px;margin:6px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .vbadge{display:inline-block;font-size:11px;color:#1d6b3a;border:1px solid #6fb98a;border-radius:3px;padding:0 4px;margin-left:4px;white-space:nowrap}
+.av-w{position:relative;display:inline-flex;flex:none;vertical-align:middle}
+.av-w .tsu{position:absolute;right:-3px;bottom:-3px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:#e0a91b;color:#16263a;font-weight:900;line-height:1;border:1.5px solid var(--bg,#fff)}
+.tsu-i{display:inline-flex;align-items:center;justify-content:center;width:1.3em;height:1.3em;border-radius:50%;background:#e0a91b;color:#16263a;font-weight:900;font-size:.85em;vertical-align:middle}
 .av{display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:50%;overflow:hidden;background:var(--c,#6b7c8f);color:#fff;font-weight:700;vertical-align:middle}
 .av img{width:100%;height:100%;object-fit:cover;display:block}
 .who-line{display:inline-flex;align-items:center;gap:6px}
@@ -456,7 +459,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
         <div class="toolbar">
           <button class="btn sm" id="btnCsv">CSV出力（Excel用）</button>
           <button class="btn sm" id="btnJson">バックアップ（JSON）</button>
-          <button type="button" class="btn sm" id="btnTrash">削除した釣果（30日以内）…</button>
+          <button type="button" class="btn sm" id="btnTrash">削除した釣果を戻す…</button>
           <label class="btn sm" style="flex-direction:row;color:var(--ink)">復元（JSON）<input type="file" id="fileImport" accept=".json,application/json" hidden></label>
         </div>
         <p class="hint">釣果と航跡はこのブラウザ内（IndexedDB）に保存され、バックアップには両方が入ります。端末を替える前や定期的にバックアップしてください。</p>
@@ -466,6 +469,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
           <div class="toolbar" id="cloudOps" hidden>
             <button type="button" class="btn sm" id="btnCloudSync">記録を今すぐ同期（写真以外）</button>
             <button type="button" class="btn sm" id="btnCloudPhotos">写真の同期…</button>
+            <button type="button" class="btn sm" id="btnCloudFull" title="サーバーにあるのに、この端末にない釣果を取り込みます">サーバーから全部取り込み直す</button>
           </div>
           <div class="status" id="cloudStat"></div>
         </div>
@@ -636,6 +640,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
         </section>
 
         <div class="actions">
+          <button type="button" class="btn" id="btnUndo" hidden>変更を戻す…</button>
           <button type="button" class="btn" id="btnCancel">やめる</button>
           <button type="button" class="btn" id="btnSaveNext">保存して次の1匹</button>
           <button type="submit" class="btn primary" id="btnSave">保存</button>
@@ -732,7 +737,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
 
       <div id="shNotMember" hidden>
         <div class="rules"><b>おすそわけ・お店向けの取引は、会員の機能です。</b><br>会員になると、釣果・航跡の記録、おすそわけ、写真やブログの投稿が使えます。<br>会員でなくても、「みんな」タブでの閲覧・いいね・コメント・メッセージは使えます。</div>
-        <p class="hint" id="nmInfo">会員の申し込み方法は準備中です。くわしくは管理者にお問い合わせください。</p>
+        <p class="hint" id="nmInfo">会員は月150円です。はじめて申し込むときは、最初の2か月が無料です。 <button type="button" class="btn sm primary" id="nmJoin">会員になる・くわしく</button></p>
         <div class="shfoot"><span id="nmWho"></span><button type="button" class="btn sm" data-logout>ログアウト</button></div>
       </div>
 
@@ -896,11 +901,12 @@ function tideName(age){
 const DB = {
   db:null,
   open(){ return new Promise((res,rej)=>{
-    const r = indexedDB.open("choka-kaizu",3);
+    const r = indexedDB.open("choka-kaizu",4);
     r.onupgradeneeded = () => { const db=r.result;
       if(!db.objectStoreNames.contains("catches")) db.createObjectStore("catches",{keyPath:"id"});
       if(!db.objectStoreNames.contains("tracks")) db.createObjectStore("tracks",{keyPath:"id"});
-      if(!db.objectStoreNames.contains("trash")) db.createObjectStore("trash",{keyPath:"id"}); };   // 削除した釣果（30日とっておく）
+      if(!db.objectStoreNames.contains("trash")) db.createObjectStore("trash",{keyPath:"id"});      // 削除した釣果（30日とっておく）
+      if(!db.objectStoreNames.contains("hist")) db.createObjectStore("hist",{keyPath:"id"}); };     // 変更の履歴（変更を戻す）
     r.onsuccess = () => { this.db=r.result; res(); };
     r.onerror = () => rej(r.error);
   });},
@@ -908,10 +914,15 @@ const DB = {
   all(s){ return new Promise((res,rej)=>{ const r=this.tx("readonly",s).getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
   put(o,s){ return new Promise((res,rej)=>{ const r=this.tx("readwrite",s).put(o); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); }); },
   del(id,s){ return new Promise((res,rej)=>{ const r=this.tx("readwrite",s).delete(id); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); }); },
+  get(id,s){ return new Promise((res,rej)=>{ const r=this.tx("readonly",s).get(id); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
 };
 let memStore = null, memTracks = new Map();   // IndexedDBが使えない環境用（保存されない）
 async function loadAll(){ return memStore ? [...memStore.values()] : DB.all("catches"); }
-async function saveRec(o){ if(memStore) memStore.set(o.id,o); else await DB.put(o,"catches"); }
+async function saveRec(o){
+  // 中身が変わるときは、変える前の記録を履歴にとっておく（「変更を戻す」用。どの画面・同期で変わっても）
+  try{ const old=memStore ? memStore.get(o.id) : await DB.get(o.id,"catches");
+    if(old && old!==o && !o.sample && histKey(old)!==histKey(o)) await histPut(old,o); }catch{}
+  if(memStore) memStore.set(o.id,o); else await DB.put(o,"catches"); }
 async function delRec(id,fromCloud){ if(memStore) memStore.delete(id); else await DB.del(id,"catches"); if(!fromCloud) cloudForget("catch",id); }
 /* 削除した釣果の一時保管（この端末・写真も含めて30日） */
 const memTrash=new Map(), TRASH_DAYS=30;
@@ -922,6 +933,24 @@ async function trashAll(){ let a=[]; try{ a=memStore?[...memTrash.values()]:awai
   for(const o of a){ if((o.deletedAt||"")<lim){ try{ memStore?memTrash.delete(o.id):await DB.del(o.id,"trash"); }catch{} } else keep.push(o); }
   return keep; }
 async function trashDel(id){ try{ memStore?memTrash.delete(id):await DB.del(id,"trash"); }catch{} }
+/* 変更の履歴（この端末・写真も含めて、1件につき直近10回分を90日） */
+const memHist=new Map(), HIST_N=10, HIST_DAYS=90;
+const HIST_SKIP=new Set(["id","updatedAt","feedPost","feedDirty","feedLog","photos","photoDates","photoAt","cloudPhotos","cloudSig","sample"]);
+function histFields(r){ const o={}; for(const k of Object.keys(r||{}).sort()) if(!HIST_SKIP.has(k) && r[k]!=null && r[k]!=="") o[k]=r[k]; return o; }
+const histKey = r => JSON.stringify(histFields(r)) + "#" + photoSig(localPh(r));
+async function histGet(id){ try{ const h=memStore?memHist.get(id):await DB.get(id,"hist"); return h?.list||[]; }catch{ return []; } }
+async function histPut(old,next){
+  const e={at:old.updatedAt||new Date().toISOString(), saved:new Date().toISOString(), rec:{...old}};
+  for(const k of ["feedPost","feedDirty","feedLog"]) delete e.rec[k];
+  if(photoSig(localPh(old))===photoSig(localPh(next))){ delete e.rec.photos; delete e.rec.photoDates; e.samePh=true; }   // 写真が同じなら写真はとらない（容量を節約）
+  const lim=new Date(Date.now()-HIST_DAYS*86400000).toISOString();
+  const list=[e,...(await histGet(old.id))].filter(x=>(x.saved||"")>lim).slice(0,HIST_N);
+  const o={id:old.id,list};
+  if(memStore) memHist.set(old.id,o); else await DB.put(o,"hist");
+}
+/* 履歴の版の写真：写真をとっていない版は、ひとつ新しい版と同じ写真（なければ今の記録の写真） */
+function histPhotos(list,i,cur){ for(let j=i;j>=0;j--) if(!list[j].samePh && list[j].rec) return {photos:list[j].rec.photos||[],photoDates:list[j].rec.photoDates||[]};
+  return {photos:localPh(cur),photoDates:cur.photoDates||[]}; }
 async function loadTrks(){ return memStore ? [...memTracks.values()] : DB.all("tracks"); }
 async function saveTrk(o,fromCloud){ if(!fromCloud) o.updatedAt=new Date().toISOString(); if(memStore) memTracks.set(o.id,o); else await DB.put(o,"tracks"); }
 async function delTrk(id,fromCloud){ if(memStore) memTracks.delete(id); else await DB.del(id,"tracks"); if(!fromCloud) cloudForget("track",id); }
@@ -1436,7 +1465,7 @@ function popupHtml(r){
   const ph=localPh(r);
   return `<div class="pop recpop"><h4>${esc(r.species)} ${r.sample?'<span class="tag">例</span>':""}</h4>
     <div class="coord mono">${fmtPos(r.lat,r.lon)}${r.spot?` ・ ${esc(r.spot)}`:""}</div>
-    ${r.sample?"":`<div class="rec-ops"><button type="button" class="btn sm" data-a="edit">記録を直す</button><button type="button" class="btn sm primary" data-a="move">位置を直す</button></div>`}
+    ${r.sample?"":`<div class="rec-ops"><button type="button" class="btn sm" data-a="edit">記録を直す</button><button type="button" class="btn sm primary" data-a="move">位置を直す</button><button type="button" class="btn sm" data-a="undo">変更を戻す</button></div>`}
     ${alignOptions(r).length?`<div class="align"><div>端末によって写真が違います。正しい写真を選ぶと、すべての端末と新着がその写真になります。</div>${alignOptions(r).map(([k,t])=>`<button type="button" class="btn sm" data-align="${k}">${t}</button>`).join("")}</div>`:""}
     ${r.sample?"":`<details class="phdiag"><summary>写真の状態を調べる</summary>${photoDiagHtml(r)}</details>`}
     <table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
@@ -1462,7 +1491,7 @@ function openRecPopup(r){
       const cur=records.find(x=>x.id===r.id)||r; map.closePopup(); openRecPopup(cur);
       const d=document.querySelector(".leaflet-popup .phdiag"); if(d) d.open=true; return; }
     map.closePopup();
-    if(a==="edit") openForm(r); else moveStart(r);
+    if(a==="edit") openForm(r); else if(a==="undo") histDlg(r.id); else moveStart(r);
   });
   const pop=L.popup({maxWidth:280,autoPanPaddingTopLeft:[10,isPhone()?84:60]}).setLatLng([r.lat,r.lon]).setContent(el).openOn(map);
   curPop={id:r.id,pop};
@@ -1610,11 +1639,7 @@ function render(){
     el.addEventListener("click",async e=>{
       const a = e.target.dataset?.a;
       if(a==="edit"){ openForm(r); return; }
-      if(a==="del"){
-        if(e.target.dataset.armed){ if(MV.r?.id===r.id) moveEnd(); await trashPut(r); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id); if(!r.sample) feedRemove(r); }   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
-        else { e.target.dataset.armed="1"; e.target.textContent="もう一度押すと削除"; setTimeout(()=>{e.target.textContent="削除";delete e.target.dataset.armed;},3000); }
-        return;
-      }
+      if(a==="del"){ delConfirm(r); return; }   // 2回続けて触っても消えないよう、確認の画面を出す
       map.flyTo([r.lat,r.lon],Math.max(map.getZoom(),13),{duration:.6});
       setTimeout(()=>openRecPopup(r),700);
       if(isPhone()) $("mapwrap").scrollIntoView({block:"start",behavior:"smooth"});
@@ -1825,6 +1850,7 @@ function openForm(r, pos, carry){
   drawPhotos(); syncChips(); checkTimes(); showTab("form"); formMarkStyle(true);
   $("btnSave").textContent = r ? "変更を保存" : "保存";
   $("btnSaveNext").hidden = !!r;
+  $("btnUndo").hidden = !r || !!r.sample;
   if(!r) scheduleWx(false);
 }
 
@@ -2402,24 +2428,46 @@ $("fileImport").addEventListener("change",async e=>{
   e.target.value="";
 });
 function alertStatus(msg){ $("summary").textContent=msg; }
-/* 削除した釣果（30日以内）：この端末にとってある分（写真つき）と、サーバーの同期にとってある分（会員）から元に戻す */
+/* 釣果を消す前の確認（ほかの端末と新着からも消える。30日以内なら戻せる） */
+function delConfirm(r){
+  const b=openDlg("釣果を削除",`<p><b>${esc(r.species)}</b>（${esc(fmtDT(r.datetime))}${r.count?`・${r.count}匹`:""}${r.length?`・${r.length}cm`:""}）を削除しますか？</p>
+    <p class="hint">ほかの端末と「みんな」の新着からも消えます。消したあとも「釣果一覧」の下の「削除した釣果を戻す」から戻せます（この端末には写真つきで30日、会員はサーバーからいつでも）。</p>
+    <div class="actions"><button type="button" class="btn" id="dcNo">やめる</button><button type="button" class="btn danger" id="dcYes">削除する</button></div>`);
+  b.querySelector("#dcNo").onclick=()=>$("dlg").close();
+  const yes=b.querySelector("#dcYes"); yes.disabled=true; setTimeout(()=>{ yes.disabled=false; },600);   // 開いた直後の触り間違いを防ぐ
+  yes.onclick=async()=>{
+    $("dlg").close();
+    if(MV.r?.id===r.id) moveEnd();
+    await trashPut(r); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id);
+    if(!r.sample) feedRemove(r);                                   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
+    alertStatus(`${r.species}を削除しました（「削除した釣果を戻す」から戻せます）`);
+  };
+}
+/* 削除した釣果を戻す：この端末にとってある分（写真つき・30日）と、サーバーにとってある分（会員の同期・期限なし）。
+   削除をとっておく前の版で消えた釣果も、「提供された釣果」に残っていればそこから戻す */
 $("btnTrash").onclick=async()=>{
-  const b=openDlg("削除した釣果（30日以内）",`<div id="trList"><div class="empty">読み込み中…</div></div><div class="status" id="trStat"></div>`);
+  const b=openDlg("削除した釣果を戻す",`<div id="trList"><div class="empty">読み込み中…</div></div><div class="status" id="trStat"></div>`);
   const items=new Map();
   for(const o of await trashAll()) if(!records.some(r=>r.id===o.id)) items.set(o.id,{rec:o,at:o.deletedAt,where:"この端末にとってある分"});
-  if(cloudOn()){
-    const lim=new Date(Date.now()-TRASH_DAYS*86400000).toISOString();
-    const {data}=await SH.sb.from("cloud_items").select("id,trash,deleted_at").eq("kind","catch").eq("deleted",true).gt("deleted_at",lim).order("deleted_at",{ascending:false}).limit(300);
-    for(const x of data||[]) if(x.trash && !items.has(x.id) && !records.some(r=>r.id===x.id))
-      items.set(x.id,{rec:{...x.trash,id:x.id,photos:[]},at:x.deleted_at,where:"サーバー（写真は、写真の同期で送った分だけ戻ります）"});
+  if(SH.sb && hasProfile() && !SH.foreign){
+    try{
+      const {data}=await SH.sb.from("cloud_items").select("id,trash,deleted_at").eq("kind","catch").eq("deleted",true).not("trash","is",null).order("deleted_at",{ascending:false}).limit(300);
+      for(const x of data||[]) if(!items.has(x.id) && !records.some(r=>r.id===x.id))
+        items.set(x.id,{rec:{...x.trash,id:x.id,photos:[]},at:x.deleted_at,where:"サーバー（写真は「別の端末の写真を取り込む」で戻せることがあります）"});
+    }catch{}
+    try{
+      const {data}=await SH.sb.rpc("my_lost_catches");
+      for(const x of data||[]) if(!items.has(x.id) && !records.some(r=>r.id===x.id))
+        items.set(x.id,{rec:{...x.data,id:x.id,photos:[]},at:x.deleted_at,where:"サーバーの提供された釣果から（写真は「別の端末の写真を取り込む」で戻せることがあります）"});
+    }catch{}
   }
   const list=[...items.values()].sort((a,b)=>(b.at||"").localeCompare(a.at||""));
   const box=$("trList"); if(!box) return;
   box.innerHTML = list.length ? list.map((x,i)=>`<div class="card" style="grid-template-columns:1fr auto;cursor:default"><div>
       <div class="t"><span class="sp">${esc(x.rec.species||"")}</span><span>${x.rec.count||1}匹${x.rec.length?` ・${x.rec.length}cm`:""}</span><span class="when">${esc(fmtDT(x.rec.datetime||""))}</span></div>
       <div class="facts"><span>${fmtJ(x.at)}に削除</span><span>${esc(x.where)}</span>${(x.rec.photos||[]).length?`<span>写真${x.rec.photos.length}枚</span>`:""}</div></div>
-      <button type="button" class="btn sm primary" data-i="${i}">元に戻す</button></div>`).join("")
-    : `<div class="empty">30日以内に削除した釣果はありません。${cloudOn()?"":"<br>（会員がログインすると、ほかの端末で削除した釣果も表示されます）"}</div>`;
+      <button type="button" class="btn sm primary" data-i="${i}" style="align-self:center">元に戻す</button></div>`).join("")
+    : `<div class="empty">戻せる釣果はありません。${cloudOn()?"":"<br>（会員がログインすると、ほかの端末で削除した釣果も表示されます）"}</div>`;
   box.querySelectorAll("button[data-i]").forEach(btn=>btn.onclick=async()=>{
     const x=list[+btn.dataset.i]; setBusy(btn,true,"戻しています…");
     try{
@@ -2431,6 +2479,70 @@ $("btnTrash").onclick=async()=>{
     }catch(err){ setBusy(btn,false); shMsg("trStat",shErr(err),"err"); }
   });
 };
+
+/* 変更を戻す：この端末の履歴（写真つき・10回分）と、サーバーの履歴（会員の同期・ほかの端末での変更も）から前の状態に戻す */
+const HL={species:"魚種",count:"匹数",length:"大きさ",weight:"重さ",method:"釣法",bait:"エサ・仕掛け",tana:"棚",tanaRef:"棚",depth:"水深",bottom:"底質",
+  echo:"反応",drift:"船の流れ",shime:"締め方",treat:"締め方",cooling:"締め方",shimeAt:"締めた日時",weather:"気象",temp:"気象",press:"気象",windDir:"気象",
+  wind:"気象",gust:"気象",sst:"水温",wave:"波",wavePer:"波",waveDir:"波",color:"潮色",tideName:"潮",moon:"潮",tideMove:"潮の動き",tideLv:"潮",high:"潮",low:"潮",
+  spot:"ポイント名",memo:"メモ",datetime:"釣った日時",lat:"位置",lon:"位置",feed:"新着に載せる",pref:"県",prefManual:"県"};
+const PH4=["photoSig","photoAt","cloudPhotos","cloudSig"];
+const histFk = r => { const o=histFields(r); delete o.photoSig; return JSON.stringify(o); };
+function histDiff(a,cur,withPh){
+  const A=histFields(a), C=histFields(cur), d=new Set();
+  for(const k of new Set([...Object.keys(A),...Object.keys(C)])) if(k!=="photoSig" && JSON.stringify(A[k])!==JSON.stringify(C[k])) d.add(HL[k]||k);
+  if(withPh && photoSig(a.photos||[])!==photoSig(localPh(cur))) d.add("写真");
+  return [...d];
+}
+async function histDlg(id){
+  const cur=records.find(x=>x.id===id); if(!cur) return;
+  openDlg("変更を戻す",`<p class="hint">戻したい時の状態を選んで「この状態に戻す」を押します。戻したあとも、ここからもう一度戻せます（戻す前の状態も履歴に残ります）。</p>
+    <div id="hiList"><div class="empty">読み込み中…</div></div><div class="status" id="hiStat"></div>`);
+  const loc=await histGet(id);
+  const vers=loc.map((e,i)=>({at:e.at, rec:{...e.rec,...histPhotos(loc,i,cur)}, where:"この端末", ph:true}));
+  if(cloudOn()){
+    try{ const {data}=await SH.sb.from("cloud_items").select("history").eq("kind","catch").eq("id",String(id)).maybeSingle();
+      for(const h of data?.history||[]) if(h?.data) vers.push({at:h.at, rec:{...h.data,id}, where:"サーバー（ほかの端末での変更も含む・写真は今のまま）", ph:false}); }catch{}
+  }
+  // 今と同じ中身は出さない。同じ中身が両方にあれば、この端末の分（写真つき）を出す
+  const seen=new Set(), list=[];
+  for(const v of vers.sort((a,b)=>(a.ph===b.ph?0:a.ph?-1:1))){
+    const k=histFk(v.rec)+(v.ph?"#"+photoSig(v.rec.photos||[]):"");
+    if(!histDiff(v.rec,cur,v.ph).length || seen.has(k) || (!v.ph && seen.has("f:"+histFk(v.rec)))) continue;
+    seen.add(k); seen.add("f:"+histFk(v.rec)); list.push(v);
+  }
+  list.sort((a,b)=>String(b.at||"").localeCompare(String(a.at||"")));
+  const box=$("hiList"); if(!box) return;
+  box.innerHTML = list.length ? list.map((v,i)=>{ const x=v.rec, ph=v.ph?(x.photos||[]):[];
+    return `<div class="card" style="grid-template-columns:1fr auto;cursor:default"><div>
+      <div class="t"><span class="sp">${esc(x.species||"")}</span><span>${x.count||1}匹${x.length?` ・${x.length}cm`:""}</span><span class="when">${esc(fmtDT(x.datetime||""))}</span></div>
+      <div class="facts"><span>${fmtJ(v.at)}の状態</span><span>${esc(v.where)}</span></div>
+      <div class="facts"><span>今と違うところ：${esc(histDiff(x,cur,v.ph).join("・"))}</span></div>
+      ${ph.length?`<div style="display:flex;gap:4px;margin-top:4px">${ph.slice(0,4).map(p=>`<img src="${p}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px">`).join("")}</div>`:""}</div>
+      <button type="button" class="btn sm primary" data-i="${i}" style="align-self:center">この状態に戻す</button></div>`; }).join("")
+    : `<div class="empty">戻せる前の状態はありません（この機能を入れる前の変更は残っていません）。</div>`;
+  box.querySelectorAll("button[data-i]").forEach(btn=>btn.onclick=async()=>{
+    const v=list[+btn.dataset.i], now=new Date().toISOString(), c=records.find(x=>x.id===id)||cur;
+    setBusy(btn,true,"戻しています…");
+    try{
+      const r={...v.rec, id:c.id, updatedAt:now};
+      for(const k of ["feedPost","feedLog","feedDirty"]){ if(c[k]!==undefined) r[k]=c[k]; else delete r[k]; }
+      const phChange = v.ph && photoSig(r.photos||[])!==photoSig(localPh(c));
+      if(phChange){                                               // 写真も前の写真に戻す（ほかの端末と新着にも）
+        r.photoSig=photoSig(r.photos||[]); r.photoAt=now; delete r.cloudPhotos; delete r.cloudSig;
+        if(c.cloudPhotos?.length && cloudOn()) SH.sb.storage.from("cloud").remove(c.cloudPhotos).then(()=>{},()=>{});
+      } else {                                                    // 写真は今のまま
+        r.photos=c.photos; r.photoDates=c.photoDates;
+        for(const k of PH4){ if(c[k]!==undefined) r[k]=c[k]; else delete r[k]; }
+      }
+      await saveRec(r); records=records.filter(q=>q.id!==r.id).concat(r);
+      render(); shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost||c.feed) feedPush(r);
+      $("dlg").close();
+      if(!$("viewForm").hidden && FM.id===r.id) openForm(r); else { showTab("list"); openRecPopup(r); }
+      alertStatus(`${r.species}を${fmtJ(v.at)}の状態に戻しました（「変更を戻す」でもう一度戻せます）`);
+    }catch(err){ setBusy(btn,false); shMsg("hiStat",shErr(err),"err"); }
+  });
+}
+$("btnUndo").onclick=()=>{ if(FM.id!=null) histDlg(FM.id); };
 
 $("btnDelSamples").onclick=async()=>{ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); try{localStorage.setItem("choka-seeded","1")}catch{} render(); };
 $("filter").addEventListener("input",render);
@@ -2504,6 +2616,7 @@ function updateAccountBtn(){
   b.textContent = hasProfile() ? `${SH.profile.nickname}${isMember()?"":"（無料）"}` : "ログイン";
   applyLocks();
 }
+$("nmJoin").onclick=()=>billingDlg();
 $("btnAccount").onclick=()=>{ if(hasProfile()) profileDlg(); else showTab("share"); };
 /* 会員の機能を使おうとしたとき */
 const MEMBER_FEATURES=[
@@ -2522,9 +2635,11 @@ function memberGate(what){
   const b=openDlg(`${what}は会員の機能です`,`<p>会員になると、次の機能が使えます。</p>
     <ul class="mfeat">${MEMBER_FEATURES.map(([t,d])=>`<li${what&&(t.includes(what)||what.includes(t.slice(0,4)))?' class="hit"':""}><b>${t}</b><span>${d}</span></li>`).join("")}</ul>
     <p class="hint">${logged?"会員でなくても、新着の釣果と投稿を見る・いいね・コメント・メッセージは使えます。":"ログイン（無料）すると、いいね・コメント・メッセージが使えます。"}</p>
-    <p class="hint">${logged?"会員の申し込み方法は準備中です。くわしくは管理者にお問い合わせください。":"会員の方は、ログインしてください。"}</p>
-    <p class="hint">これまでにこの端末で記録した釣果は、会員でなくても「釣果一覧」で見られ、バックアップもできます。</p>
-    <div class="actions">${logged?"":`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
+    <p class="hint">${logged?`会員は月${esc(BILL.price)}円です。はじめて申し込むときは、最初の2か月が無料です（カードの登録が必要）。`:"会員になるには、ログイン（無料）してから申し込みます。会員の方は、ログインしてください。"}</p>
+    <p class="hint">これまでの釣果と航跡は、会員でなくても（支払いが止まっても）「釣果一覧」「航跡」で見られ、バックアップもできます。<a href="#" id="gtTk">特定商取引法に基づく表記</a></p>
+    <div class="actions">${logged?`<button type="button" class="btn primary" id="gtJoin">会員になる・くわしく</button>`:`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
+  b.querySelector("#gtJoin")?.addEventListener("click",()=>billingDlg());
+  b.querySelector("#gtTk").onclick=e=>{ e.preventDefault(); tokushoDlg(); };
   b.querySelector("#gtClose").onclick=()=>$("dlg").close();
   b.querySelector("#gtLogin")?.addEventListener("click",()=>{ $("dlg").close(); showTab("share"); });
   return false;
@@ -2541,7 +2656,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.02.12";
+const APP_VER="2026.11.03.1";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -2596,10 +2711,11 @@ async function shRefreshMe(){
   SH.profile=p;
   if(!p){ shShow("shProfile"); return; }
   if(p.banned){ shShow("shBanned"); shPollStop(); return; }
+  if(!BILL.started){ BILL.started=true; setTimeout(()=>refAuto().then(billReturn),0); }   // 紹介のリンク・支払いの画面から戻ったとき
   feedPollStart();
   SH.foreign=false;
   cloudUi(); if(isMember() && ownerCheck()){ cloudSync(); shSyncAll(); feedSweep().then(feedBackfill); loadMyPhotos(); }
-  else if(!isMember()){ feedSweep(); cloudPushDeletes(); }      // 会員でなくても、消した釣果は新着とほかの端末から消す
+  else if(!isMember()){ feedSweep(); cloudPushDeletes(); if(p.member_until && ownerCheck()) cloudSync(true); }   // 会員でなくても、消した釣果は新着とほかの端末から消す。前に会員だった人は、記録の取り込み（見るだけ）を続ける
   newPoll();
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
@@ -3310,6 +3426,7 @@ function cloudUi(){
     return;
   }
   $("cloudInfo").textContent = on ? `ログイン中は、釣果（写真は除く）と航跡を自動で同期します。${lsGet(clKey("at"))?`最後に同期：${fmtJ(lsGet(clKey("at")))}`:""}`
+    : cloudReadOn() ? "会員の期限が切れているため、サーバーの記録を取り込んで見ることだけできます（記録の追加・変更と送信は止めています）。「会員・お支払い・紹介」から再開できます。"
     : (hasProfile() ? "同期は会員の機能です。会員になると、釣果と航跡がPCとスマホで自動でそろいます。" : "会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。");
 }
 function cloudForget(kind,id){            // 消したことを覚えておき、次の同期で送る
@@ -3331,8 +3448,11 @@ const catchData = r => { const {photos,sample,feedPost,feedDirty,feedLog,...d}=r
 /* 写真の目印は、記録全体とは別に「写真を変えた日時」が新しい方を残す */
 const PHK=["photoSig","photoAt","cloudPhotos","cloudSig"];
 const phNewer=(a,b)=>(a?.photoAt||"") > (b?.photoAt||"");
+/* 会員の期限が切れた人（支払いが止まった・解約した）：サーバーの記録を取り込んで見ることだけできる */
+const cloudReadOn = () => !!(SH.sb && hasProfile() && !SH.foreign && SH.profile?.member_until && !isMember());
 async function cloudSync(force){
-  if(!cloudOn()||CL.busy) return;
+  if(!(cloudOn()||cloudReadOn())||CL.busy) return;
+  const readOnly=!cloudOn();
   if(!force && Date.now()-CL.last<20000) return;
   CL.busy=true; CL.last=Date.now();
   let got=0, sent=0; const pulled=new Map();   // 取り込んだばかりのものは送り返さない
@@ -3369,7 +3489,13 @@ async function cloudSync(force){
       lsSet(clKey("pull"),since);
       if(data.length<500) break;
     }
-    // 2) この端末で変えた分を送る
+    // 2) この端末で変えた分を送る（会員だけ）
+    if(readOnly){
+      if(got){ render(); drawTracks(); drawTrackList(); }
+      lsSet(clKey("at"),new Date().toISOString()); cloudUi();
+      shMsg("cloudStat",`記録を取り込みました（${hm(Date.now())}${got?`・${got}件`:""}。会員の期限が切れているため、見るだけです）`,"ok");
+      return;
+    }
     const pushedAt=lsGet(clKey("push"))||"", started=new Date().toISOString();
     const rePh=!lsGet(clKey("phfix1"));                            // 一度だけ：写真の目印を送り直す（前の版で捨てられた分を直す）
     let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
@@ -3390,8 +3516,14 @@ async function cloudSync(force){
   finally{ CL.busy=false; }
 }
 let clT=null; function cloudSoon(){ clearTimeout(clT); clT=setTimeout(()=>cloudSync(true),1500); }
+$("btnCloudFull").onclick=async e=>{                          // 取り込みの位置を最初に戻して、サーバーの記録をすべて読み直す
+  setBusy(e.target,true,"取り込み中…"); const n=records.length;
+  lsSet(clKey("pull"),null); await cloudSync(true);
+  setBusy(e.target,false);
+  shMsg("cloudStat",`サーバーから取り込み直しました（釣果 ${n}件 → ${records.length}件）`,"ok");
+};
 $("btnCloudSync").onclick=async e=>{ setBusy(e.target,true,"同期中…"); await cloudSync(true); setBusy(e.target,false); };
-document.addEventListener("visibilitychange",()=>{ if(cloudOn()) cloudSync(); });   // 開いたとき・裏に回るとき
+document.addEventListener("visibilitychange",()=>{ if(cloudOn()||cloudReadOn()) cloudSync(); });   // 開いたとき・裏に回るとき
 
 /* 写真の同期（手動）：この端末の写真を送り、ほかの端末で送った写真を取り込む */
 $("btnCloudPhotos").onclick=async e=>{
@@ -3804,12 +3936,17 @@ const POST_REASONS=["釣り場や個人の情報が書かれている","不適�
 const postUrl = p => p ? SH.sb.storage.from("posts").getPublicUrl(p).data.publicUrl : "";
 const avUrl = p => p ? SH.sb.storage.from("avatars").getPublicUrl(p).data.publicUrl : "";
 /* アイコン：画像がなければ表示名の1文字目を色つきの丸で */
-function avatar(path,name,px=22){
+const TSU_T="つ抜け会員（紹介した会員のうち、支払い中の人が10人以上）";
+const tsuMark = () => `<span class="tsu-i" title="${TSU_T}" aria-label="${TSU_T}">つ</span>`;
+function avatar(path,name,px=22,tsu=false){
   const st=`width:${px}px;height:${px}px;font-size:${Math.round(px*.5)}px;--c:${spColor(name||"?")}`;
-  return path ? `<span class="av" style="${st}"><img src="${esc(avUrl(path))}" alt="" loading="lazy"></span>`
+  const a = path ? `<span class="av" style="${st}"><img src="${esc(avUrl(path))}" alt="" loading="lazy"></span>`
               : `<span class="av" style="${st}" aria-hidden="true">${esc([...(name||"?")][0])}</span>`;
+  if(!tsu) return a;
+  const k=Math.max(11,Math.round(px*.45));                        // つ抜け会員の印（アイコンの右下）
+  return `<span class="av-w" title="${TSU_T}">${a}<span class="tsu" style="width:${k}px;height:${k}px;font-size:${Math.round(k*.7)}px" aria-label="${TSU_T}">つ</span></span>`;
 }
-const whoLine = (path,name,px) => `<span class="who-line">${avatar(path,name,px)}<span>${esc(name||"")}</span></span>`;
+const whoLine = (path,name,px,tsu) => `<span class="who-line">${avatar(path,name,px,tsu)}<span>${esc(name||"")}</span></span>`;
 /* 正方形に切り抜いて縮小 */
 function squareShrink(file,px){ return new Promise((res,rej)=>{
   const img=new Image(), url=URL.createObjectURL(file);
@@ -3817,16 +3954,157 @@ function squareShrink(file,px){ return new Promise((res,rej)=>{
     c.getContext("2d").drawImage(img,(img.width-m)/2,(img.height-m)/2,m,m,0,0,px,px); URL.revokeObjectURL(url); res(c.toDataURL("image/jpeg",0.85)); };
   img.onerror=rej; img.src=url; }); }
 /* プロフィール（アイコン・表示名） */
+/* =====================================================================
+   会員の申し込み・お支払い（Stripe）と紹介
+   ・月額。はじめての申し込みは最初の2か月が無料（カードの登録が必要）
+   ・紹介した人が無料期間のあと初めて支払うと、紹介者が1か月無料。支払い中の紹介が10人以上の間は無料（つ抜け会員）
+   ・支払いや解約の手続きは Stripe の画面。結果はサーバー（Edge Functions）が受け取って会員の期限を変える
+   ===================================================================== */
+const REF_KEY="choka-ref", BILL={me:null, started:false, price:"150"};
+try{ const r=new URLSearchParams(location.search).get("ref"); if(r) localStorage.setItem(REF_KEY, r.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,12)); }catch{}
+async function billFn(action){
+  const {data,error}=await SH.sb.functions.invoke("billing",{body:{action}});
+  if(error){ let m=error.message; try{ const j=await error.context?.json(); if(j?.error) m=j.error; }catch{}
+    if(/Failed to send|FunctionsFetchError|not found|404/i.test(m)) m="お支払いの準備ができていません（管理者が Stripe の設定を終えると使えます）"; throw new Error(m); }
+  if(data?.error) throw new Error(data.error);
+  return data;
+}
+async function billMe(){ const {data,error}=await SH.sb.rpc("billing_me"); if(error) throw error; BILL.me=data; if(data?.price_month) BILL.price=data.price_month; return data; }
+/* 紹介のリンクから来た人：申し込みの前なら、紹介コードを自動で登録する（1回だけ） */
+async function refAuto(){
+  const code=lsGet(REF_KEY); if(!code || !hasProfile()) return;
+  try{
+    const me=await billMe();
+    if(me.can_set_referrer && me.ref_code!==code){
+      const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:code});
+      if(!error) alertStatus(`${data}さんの紹介で登録しました（会員に申し込むと、最初の2か月は無料です）`);
+    }
+    lsSet(REF_KEY,null);
+  }catch{}
+}
+/* Stripe の画面から戻ってきたとき：状態を読み直して知らせる */
+async function billReturn(){
+  const q=new URLSearchParams(location.search), b=q.get("billing"); if(!b) return;
+  q.delete("billing"); history.replaceState(null,"",location.pathname+(q.toString()?"?"+q:"")+location.hash);
+  if(!hasProfile()) return;
+  if(b==="cancel"){ alertStatus("会員の申し込みをやめました"); return; }
+  for(let i=0;i<4;i++){
+    try{ await billFn("sync"); }catch{}
+    await shRefreshMe(); if(b!=="ok" || isMember()) break;
+    await new Promise(r=>setTimeout(r,2500));
+  }
+  billingDlg(b==="ok" ? (isMember() ? "申し込みを受け付けました。会員の機能が使えます" : "申し込みを確認しています。少したってから「状態を読み直す」を押してください") : "");
+}
+const BILL_ST={trialing:"無料期間中",active:"会員",past_due:"お支払いが確認できません",unpaid:"お支払いが確認できません",canceled:"解約済み",
+  incomplete:"申し込みの手続き中",incomplete_expired:"申し込みが完了しませんでした",paused:"一時停止中"};
+async function billingDlg(note){
+  if(!hasProfile()){ memberGate(""); return; }
+  openDlg("会員・お支払い・紹介",`<div id="blBox"><div class="empty">読み込み中…</div></div><div class="status" id="blStat"></div>`);
+  let me; try{ me=await billMe(); }
+  catch(e){ if($("blBox")) $("blBox").innerHTML=`<p class="status err">${esc(shErr(e))}（管理者：schema.sql を最新にして実行してください）</p>`; return; }
+  const box=$("blBox"); if(!box) return;
+  const P=SH.profile, adm=P.role==="admin", st=me.status, price=me.price_month||"150";
+  const day=d=>d?new Date(d).toLocaleDateString("ja-JP"):"";
+  const subOn=["trialing","active","past_due","unpaid","incomplete","paused"].includes(st);
+  const head = adm ? "管理者（料金はかかりません）"
+    : st==="trialing" ? `無料期間中です（${day(me.period_end)}まで）。そのあとは月${price}円です${me.cancel_at_end?"。期間の終わりで解約します":""}`
+    : st==="active" ? (me.tsunuke ? `つ抜け会員：料金は無料です（支払い中の紹介が${me.tsunuke_n}人以上の間）。次の更新日 ${day(me.period_end)}`
+                                  : `会員です（月${price}円）。${me.cancel_at_end?`${day(me.period_end)}に解約します`:`次のお支払い日 ${day(me.period_end)}`}`)
+    : (st==="past_due"||st==="unpaid") ? "お支払いが確認できないため、会員の機能を止めています。「支払い方法の変更・解約」でカードを直すと、すぐ戻ります。これまでの記録は見られます"
+    : isMember() ? `会員です（${(P.member_until||"").replace(/-/g,"/")}まで）`
+    : st==="canceled" ? "解約済みです。これまでの記録は見られます。もう一度申し込めます"
+    : "会員ではありません（無料）";
+  const need=Math.max(0,me.tsunuke_n-me.refs_paying);
+  const link=`${location.origin}${location.pathname}?ref=${me.ref_code}`;
+  box.innerHTML=`
+    <div class="sec-h">いまの状態</div>
+    <p>${me.tsunuke?tsuMark()+" ":""}${esc(head)}</p>
+    <div class="actions" style="justify-content:flex-start;flex-wrap:wrap">
+      ${!adm&&!subOn?`<button type="button" class="btn primary" id="blJoin">${me.trial_used?`会員になる（月${esc(price)}円）`:`会員になる（最初の2か月無料・そのあと月${esc(price)}円）`}</button>`:""}
+      ${me.has_customer?`<button type="button" class="btn" id="blPortal">支払い方法の変更・解約</button>`:""}
+      <button type="button" class="btn" id="blSync">状態を読み直す</button></div>
+    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
+    <div class="sec-h">紹介</div>
+    <p>あなたの紹介コード：<b class="mono" style="font-size:1.25em;letter-spacing:.08em">${esc(me.ref_code)}</b></p>
+    <div class="actions" style="justify-content:flex-start;flex-wrap:wrap"><button type="button" class="btn" id="blCopy">紹介のリンクをコピー</button>${navigator.share?`<button type="button" class="btn" id="blShare">紹介のリンクを送る</button>`:""}</div>
+    <ul class="hint" style="margin:6px 0;padding-left:1.2em">
+      <li>紹介した人が、無料期間のあと初めて支払うと、あなたの料金が1か月無料になります（1人につき1回）</li>
+      <li>紹介した人のうち、支払い中の会員が${me.tsunuke_n}人以上いる間は、あなたの料金は無料です（つ抜け会員 ${tsuMark()}・アイコンに印が付きます）。${me.tsunuke_n-1}人以下になると有料に戻ります</li>
+      <li>数えるのは、あなたが直接紹介した人だけです。特典はこのアプリの料金の割引だけで、お金の支払いはありません</li></ul>
+    <p>紹介した人 ${me.refs_total}人（うち支払い中 ${me.refs_paying}人）${me.tsunuke?"":`・つ抜けまで あと${need}人`}・紹介でもらった無料 ${me.credit_total}か月${me.credit_pending?`（${me.credit_pending}か月分は、申し込むと使われます）`:""}</p>
+    ${me.referred_by_name?`<p class="hint">あなたを紹介した人：${esc(me.referred_by_name)}</p>`:""}
+    ${me.can_set_referrer?`<label>紹介コードを入れる（申し込みの前だけ・1回だけ）<span style="display:flex;gap:6px"><input id="blCode" maxlength="12" autocapitalize="characters" autocomplete="off" style="flex:1"><button type="button" class="btn" id="blSet">登録</button></span></label>`:""}
+    <p class="hint" style="margin-top:10px"><a href="#" id="blTk">特定商取引法に基づく表記</a></p>`;
+  if(note) shMsg("blStat",note,"ok");
+  const go=async(btn,action)=>{ setBusy(btn,true,"開いています…"); try{ const d=await billFn(action); if(d.url) location.href=d.url; }catch(e){ setBusy(btn,false); shMsg("blStat",e.message,"err"); } };
+  box.querySelector("#blJoin")?.addEventListener("click",e=>go(e.target,"checkout"));
+  box.querySelector("#blPortal")?.addEventListener("click",e=>go(e.target,"portal"));
+  box.querySelector("#blSync").onclick=async e=>{ setBusy(e.target,true,"読み直しています…");
+    try{ await billFn("sync"); }catch(err){ if(!/準備ができていません/.test(err.message)) shMsg("blStat",err.message,"err"); }
+    await shRefreshMe(); billingDlg("読み直しました"); };
+  box.querySelector("#blCopy").onclick=async()=>{ try{ await navigator.clipboard.writeText(link); shMsg("blStat","紹介のリンクをコピーしました："+link,"ok"); }catch{ shMsg("blStat",link,"ok"); } };
+  box.querySelector("#blShare")?.addEventListener("click",()=>navigator.share({title:"釣果海図ログ",text:"釣った場所を海図に残せるアプリです。このリンクから会員になると、最初の2か月は無料です。",url:link}).catch(()=>{}));
+  box.querySelector("#blSet")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"登録中…");
+    const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:$("blCode").value});
+    if(error){ setBusy(e.target,false); shMsg("blStat",shErr(error),"err"); return; }
+    billingDlg(`${data}さんを紹介した人として登録しました`);
+  });
+  box.querySelector("#blTk").onclick=ev=>{ ev.preventDefault(); tokushoDlg(); };
+}
+/* 特定商取引法に基づく表記（管理者が画面で書く。だれでも見られる） */
+const TOKUSHO_TPL=`販売事業者：［氏名または屋号］
+運営責任者：［氏名］
+所在地：請求があれば遅滞なく開示します
+電話番号：請求があれば遅滞なく開示します
+メールアドレス：［メールアドレス］
+販売価格：月額150円（税込）
+商品代金以外の必要料金：インターネットの通信料はお客様のご負担です
+支払方法：クレジットカード（Stripe）
+支払時期：申し込みのときにカードを登録します。はじめての申し込みは2か月の無料期間のあと初回のお支払い、以後1か月ごとに自動で更新します
+提供時期：お申し込みの手続きが終わると、すぐに使えます
+解約：アプリの「会員・お支払い・紹介」→「支払い方法の変更・解約」から、いつでも解約できます。次の更新日からは請求しません
+返金：デジタルサービスの性質上、お支払い済みの料金は返金しません（無料期間中に解約すれば料金はかかりません）
+紹介の特典：紹介した方の料金の割引（1か月無料・つ抜け会員の無料）だけで、金銭の支払いはありません
+動作環境：最新のブラウザ（Chrome・Safari・Edge）`;
+async function tokushoDlg(){
+  openDlg("特定商取引法に基づく表記",`<div id="tkBox"><div class="empty">読み込み中…</div></div>`);
+  if(!SH.started) await shStart();
+  let t=""; try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k","tokusho").maybeSingle(); t=data?.v||""; }catch{}
+  const adm=SH.profile?.role==="admin", box=$("tkBox"); if(!box) return;
+  box.innerHTML=(t?`<div style="white-space:pre-wrap;line-height:1.8">${esc(t)}</div>`:`<p class="hint">準備中です。</p>`)
+    + (adm?`<label style="margin-top:12px">管理者：表記を書く・直す（［ ］の中を書き換えてください）<textarea id="tkEdit" rows="16">${esc(t||TOKUSHO_TPL)}</textarea></label>
+      <div class="actions"><button type="button" class="btn primary" id="tkSave">保存</button></div><div class="status" id="tkStat"></div>`:"");
+  box.querySelector("#tkSave")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"保存中…");
+    const {error}=await SH.sb.from("app_settings").update({v:$("tkEdit").value.trim(),updated_at:new Date().toISOString()}).eq("k","tokusho");
+    setBusy(e.target,false); if(error) shMsg("tkStat",shErr(error),"err"); else tokushoDlg();
+  });
+}
+/* 管理者：会員の支払いと紹介の一覧 */
+async function billAdminLoad(){
+  const box=$("billBox"); if(!box) return;
+  const {data,error}=await SH.sb.rpc("admin_billing");
+  const ST=s=>BILL_ST[s]||s||"―";
+  box.innerHTML=`<div class="sec-h">会員の支払いと紹介</div>
+    <div class="actions" style="justify-content:flex-start"><button type="button" class="btn sm" id="admTk">特定商取引法に基づく表記を書く</button></div>
+    ${error?`<p class="status err">${esc(shErr(error))}（schema.sql を最新のものにして実行し直してください）</p>`
+    : (data||[]).length?`<div style="overflow-x:auto"><table class="mini"><tr><th>表示名</th><th>状態</th><th>次の日付</th><th>会員の期限</th><th>紹介者</th><th>紹介</th><th>支払い中</th><th>特典</th></tr>
+      ${data.map(r=>`<tr><td>${r.tsunuke?tsuMark()+" ":""}${esc(r.nickname)}</td><td>${esc(ST(r.status))}</td><td>${r.period_end?fmtJ(r.period_end):""}</td><td>${esc(r.member_until||"")}</td><td>${esc(r.referred_by||"")}</td><td class="n">${r.refs_total}</td><td class="n">${r.refs_paying}</td><td class="n">${r.credit_total}か月</td></tr>`).join("")}</table></div>`
+    : `<div class="empty">まだ申し込み・紹介はありません。</div>`}`;
+  box.querySelector("#admTk").onclick=()=>tokushoDlg();
+}
 function profileDlg(){
   const P=SH.profile; let pick=null, clear=false;
-  const b=openDlg("プロフィール",`<div class="av-edit"><span id="avPrev">${avatar(P.avatar,P.nickname,72)}</span>
+  const b=openDlg("プロフィール",`<div class="av-edit"><span id="avPrev">${avatar(P.avatar,P.nickname,72,P.tsunuke)}</span>
       <div class="toolbar" style="margin:0"><label class="btn sm" style="flex-direction:row;color:var(--ink)">画像を選ぶ<input type="file" id="avFile" accept="image/*" hidden></label>
       <button type="button" class="btn sm" id="avClear">アイコンを外す</button></div></div>
     <label>表示名（20文字まで）<input id="avNick" maxlength="20" value="${esc(P.nickname)}"></label>
     <label style="margin-top:8px">住んでいる県（「みんな」の新着で、この県の釣果を先に並べます。ほかの人には見えません）<select id="avPref">${prefOptions("選ばない")}</select></label>
     <p class="hint">アイコンと表示名は、投稿・コメント・メッセージで誰でも見られます。正方形に切り抜いて小さくします。人の顔や他人の画像を使うときは許可を取ってください。</p>
     <p class="hint">電話番号：${P.phone_verified_at?`認証済み（末尾 ${esc(P.phone_tail||"")}）`:"未認証"} <button type="button" class="btn sm" id="avPhone">${P.phone_verified_at?"番号を変える":"認証する"}</button></p>
-    <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員（${(P.member_until||"").replace(/-/g,"/")}まで）`):"無料（コメント・いいね・メッセージができます）"}　ログアウトやお店の登録は「おすそわけ」タブから。　アプリの版：${APP_VER}</p>
+    <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員${P.tsunuke?"（つ抜け会員 "+tsuMark()+"）":""}`):"無料（コメント・いいね・メッセージができます）"} <button type="button" class="btn sm" id="avBill">会員・お支払い・紹介…</button></p>
+    <p class="hint">ログアウトやお店の登録は「おすそわけ」タブから。　アプリの版：${APP_VER}</p>
     <div class="actions"><button type="button" class="btn" id="avShare">おすそわけタブへ</button><button type="button" class="btn primary" id="avSave">保存</button></div>
     <div class="status" id="avStat"></div>`);
   $("avPref").value=P.home_pref||"";
@@ -3836,6 +4114,7 @@ function profileDlg(){
   b.querySelector("#avClear").onclick=()=>{ pick=null; clear=true; $("avPrev").innerHTML=avatar(null,$("avNick").value||P.nickname,72); };
   b.querySelector("#avShare").onclick=()=>{ $("dlg").close(); showTab("share"); };
   b.querySelector("#avPhone").onclick=()=>phoneDlg();
+  b.querySelector("#avBill").onclick=()=>billingDlg();
   b.querySelector("#avSave").onclick=async e=>{
     const nick=$("avNick").value.trim(); if(!nick) return shMsg("avStat","表示名を入れてください","err");
     const patch={nickname:nick,home_pref:$("avPref").value||null}, old=P.avatar;
@@ -3950,7 +4229,7 @@ function catchCard(p){
   return `<div class="card post catchcard" data-pid="${p.id}" tabindex="0" role="button">
     ${u?`<img src="${esc(u)}" data-full="${esc(full)}" onerror="if(this.dataset.full&&this.src!==this.dataset.full)this.src=this.dataset.full" alt="${esc(p.species||"")}の写真" loading="lazy">`:`<div class="noimg" style="background:${spColor(p.species)}">${esc(p.species||"")}</div>`}
     <div><div class="t"><span class="ttl">${esc(title)}</span>${isNew?'<span class="tag">新着</span>':""}${p.faved?'<span class="tag ok">★</span>':""}${p.kind!=="catch"?`<span class="kind ${(KIND_POST[p.kind]||KIND_POST.photo)[0]}">${(KIND_POST[p.kind]||KIND_POST.photo)[1]}</span>`:""}${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
-    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,22)}${p.pref?`<span>${esc(p.pref)}</span>`:""}<span>${p.caught_at?`${fmtJ(p.caught_at)} 釣果`:fmtJ(p.created_at)}</span></div>
+    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,22,p.owner_tsunuke)}${p.pref?`<span>${esc(p.pref)}</span>`:""}<span>${p.caught_at?`${fmtJ(p.caught_at)} 釣果`:fmtJ(p.created_at)}</span></div>
     <div class="meta">${[p.method,p.shime].filter(Boolean).map(x=>`<span>${esc(x)}</span>`).join("")}${p.lat!=null?"<span>📍位置あり</span>":""}</div>
     <div class="meta"><button type="button" class="qlike" data-like="${p.id}" aria-pressed="${p.liked}">♥ ${p.like_count}</button>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}</div></div></div>`;
 }
@@ -4097,7 +4376,7 @@ function postCard(p){
   return `<div class="card post" data-pid="${p.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
     <div><div class="t"><span class="kind ${kc}">${kn}</span><span class="ttl">${esc(title)}</span>${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
     ${p.body?`<div class="ex">${esc(p.body)}</div>`:""}
-    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,20)}${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
+    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,20,p.owner_tsunuke)}${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
 }
 function drawPostMarkers(list,search){
   postLayer.clearLayers();
@@ -4138,11 +4417,11 @@ async function postDetail(id){
   const facts=[["魚種",p.species],["大きさ",p.size_cm?`${p.size_cm}cm`:""],["匹数",p.count?`${p.count}匹`:""],["釣法",p.method],["締め方",p.shime],
     ["釣った日",p.caught_at?fmtJ(p.caught_at):""],["県",p.pref],["場所",p.place],
     ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?(hasProfile()?"会員になると見られます":"会員がログインすると見られます"):"")]].filter(x=>x[1]);
-  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${whoLine(c.user_avatar,c.user_name,20)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
+  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${whoLine(c.user_avatar,c.user_name,20,c.user_tsunuke)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
      <span class="ops">${c.mine||c.on_my_post||isAdmin?`<button type="button" class="btn sm" data-a="cdel">消す</button>`:""}${logged&&!c.mine?`<button type="button" class="btn sm" data-a="crep">通報</button>`:""}</span></div>`).join("");
   const b=openDlg(p.kind==="blog"?p.title:(p.species||"写真"),
     `${(p.photos||[]).length?`<div class="gal">${p.photos.map(x=>`<img src="${esc(postUrl(x))}" alt="">`).join("")}</div>`:""}
-     <div class="hint" style="display:flex;align-items:center;gap:6px">${whoLine(p.owner_avatar,p.owner_name,28)}<span>・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</span></div>
+     <div class="hint" style="display:flex;align-items:center;gap:6px">${whoLine(p.owner_avatar,p.owner_name,28,p.owner_tsunuke)}<span>・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</span></div>
      ${p.body?`<div class="pbody">${esc(p.body)}</div>`:""}
      ${facts.length?`<table class="kv">${facts.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>`:""}
      ${isCatch&&p.detail&&detailRows(p.detail).length?`<div class="sec-h">くわしい記録（会員）</div><table class="kv">${detailRows(p.detail).map(([k,v])=>`<tr><td>${k}</td><td style="white-space:pre-wrap">${esc(v)}</td></tr>`).join("")}</table>`:""}
@@ -4336,7 +4615,7 @@ async function dmList(){
   if(error){ $("dmList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
   const seen=dmSeen();
   $("dmList").innerHTML = data.length ? data.map(t=>`<div class="card dmrow" data-tid="${t.id}" data-name="${esc(t.other_name)}" tabindex="0" role="button"><div>
-      <div class="t"><span class="sp">${whoLine(t.other_avatar,t.other_name,26)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
+      <div class="t"><span class="sp">${whoLine(t.other_avatar,t.other_name,26,t.other_tsunuke)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
       <div class="facts"><span>${esc(t.last_body||"（まだメッセージはありません）")}</span></div></div></div>`).join("")
     : `<div class="empty">まだメッセージはありません。<br>投稿を開いて「メッセージを送る」から始められます。</div>`;
   feedBadge(data);
@@ -4417,9 +4696,10 @@ async function shAdmin(){
        ${s.status==="pending"?`<button type="button" class="btn sm" data-a="reject">差し戻し</button>`:""}
        ${s.status==="approved"?`<button type="button" class="btn sm danger" data-a="suspend">停止</button>`:""}</div></div></div>`;
   const pend=shops.filter(s=>s.status==="pending"), rest=shops.filter(s=>s.status!=="pending");
-  setTimeout(usageLoad,0);                                 // 下の画面を作ったあとで、使用量を読み込む
+  setTimeout(()=>{ usageLoad(); billAdminLoad(); },0);         // 下の画面を作ったあとで、使用量と支払いを読み込む
   box.innerHTML=`
     ${statsHtml(stq.data, stq.error)}
+    <div id="billBox"><div class="sec-h">会員の支払いと紹介</div><p class="hint">読み込み中…</p></div>
     <div class="sec-h">通報（未対応 ${reports.length}件）</div>
     ${reports.length?reports.map(r=>`<div class="card deal" data-rep="${r.id}" data-lid="${r.listing_id}"><div>
       <div class="t"><span class="kind ${r.kind}">${KIND_JA[r.kind]}</span><span class="sp">${esc(r.species)}</span><span class="st hot">${esc(r.reason)}</span>${r.owner_banned?'<span class="st">出品者は停止中</span>':""}</div>

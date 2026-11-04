@@ -30,6 +30,8 @@ alter table public.profiles add column if not exists phone_tail text check (char
 create unique index if not exists profiles_phone_hash_uq on public.profiles(phone_hash) where phone_hash is not null;
 -- 住んでいる県（本人だけが見る。「みんな」の新着で、この県の釣果を先に並べる）
 alter table public.profiles add column if not exists home_pref text check (char_length(home_pref) <= 10);
+-- つ抜け会員（紹介した人のうち、支払い中の会員が10人以上）。アイコンに印を付ける。サーバー（決済の受け取り）だけが書き換える
+alter table public.profiles add column if not exists tsunuke boolean not null default false;
 -- 利用停止した人の電話番号（ハッシュ）。アカウントを作り直しても認証できない
 create table if not exists public.banned_phones (
   phone_hash text primary key,
@@ -475,12 +477,12 @@ begin
   end if;
   if auth.uid() is null or is_admin() then return new; end if;
   if tg_op = 'INSERT' then
-    new.id := auth.uid(); new.role := 'user'; new.banned := false; new.member_until := null;
+    new.id := auth.uid(); new.role := 'user'; new.banned := false; new.member_until := null; new.tsunuke := false;
     new.phone_verified_at := null; new.phone_hash := null; new.phone_tail := null;
     new.agreed_at := now(); new.created_at := now();
   else
     if new.role is distinct from old.role or new.banned is distinct from old.banned
-       or new.member_until is distinct from old.member_until or new.id <> old.id
+       or new.member_until is distinct from old.member_until or new.id <> old.id or new.tsunuke is distinct from old.tsunuke
        or ((new.phone_verified_at is distinct from old.phone_verified_at or new.phone_hash is distinct from old.phone_hash)
            and coalesce(current_setting('app.phone_verify', true), '') <> '1')
        or (new.phone_tail is distinct from old.phone_tail and coalesce(current_setting('app.phone_verify', true), '') <> '1') then
@@ -1128,7 +1130,8 @@ select p.id, p.kind, p.title, p.body, p.photos, p.species, p.size_cm, p.count, p
        (p.owner = auth.uid()) as mine,
        (select count(*) from post_likes k where k.post_id = p.id) as like_count,
        (select count(*) from post_comments c where c.post_id = p.id) as comment_count,
-       exists(select 1 from post_likes k where k.post_id = p.id and k.user_id = auth.uid()) as liked
+       exists(select 1 from post_likes k where k.post_id = p.id and k.user_id = auth.uid()) as liked,
+       u.tsunuke as owner_tsunuke                                        -- つ抜け会員の印
 from public.posts p join public.profiles u on u.id = p.owner
 where (p.status = 'public' and not u.banned) or p.owner = auth.uid() or is_admin();
 
@@ -1136,7 +1139,8 @@ drop view if exists public.comment_cards;
 create view public.comment_cards with (security_barrier = true) as
 select c.id, c.post_id, c.body, c.created_at, u.nickname as user_name, u.avatar as user_avatar,
        (c.user_id = auth.uid()) as mine,
-       exists(select 1 from posts p where p.id = c.post_id and p.owner = auth.uid()) as on_my_post
+       exists(select 1 from posts p where p.id = c.post_id and p.owner = auth.uid()) as on_my_post,
+       u.tsunuke as user_tsunuke
 from public.post_comments c
 join public.profiles u on u.id = c.user_id
 join public.posts p on p.id = c.post_id
@@ -1149,7 +1153,8 @@ select t.id, t.last_at, o.nickname as other_name, o.avatar as other_avatar,
        exists(select 1 from blocks k where k.blocker = auth.uid() and k.blocked = o.id) as i_blocked,
        is_blocked(t.a, t.b) as blocked,
        (select m.body from dm_messages m where m.thread_id = t.id order by m.id desc limit 1) as last_body,
-       (select max(m.created_at) from dm_messages m where m.thread_id = t.id and m.sender <> auth.uid()) as last_in_at
+       (select max(m.created_at) from dm_messages m where m.thread_id = t.id and m.sender <> auth.uid()) as last_in_at,
+       o.tsunuke as other_tsunuke
 from public.dm_threads t
 join public.profiles o on o.id = case when t.a = auth.uid() then t.b else t.a end
 where auth.uid() in (t.a, t.b);
@@ -1478,6 +1483,8 @@ create index if not exists cloud_items_pull_idx on public.cloud_items(owner, syn
 -- 削除した記録の一時保管（30日）：消したときの中身と日時。元に戻すと消える
 alter table public.cloud_items add column if not exists trash jsonb;
 alter table public.cloud_items add column if not exists deleted_at timestamptz;
+-- 変更の履歴（「変更を戻す」用）：直す前の中身を新しい順に10回分。端末からは書き換えられない
+alter table public.cloud_items add column if not exists history jsonb;
 
 create or replace function public.cloud_items_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
@@ -1517,8 +1524,19 @@ begin
     elsif new.updated_at < old.updated_at then return null;         -- 古い変更は無視
     end if;
     if new.owner <> old.owner then raise exception '権限がありません'; end if;
-  elsif (select count(*) from cloud_items where owner = auth.uid()) >= 20000 then
-    raise exception '同期できる件数の上限です';
+    -- 中身が変わったら、変える前の中身を履歴に足す（新着の送信記録などだけの変化は数えない）
+    new.history := old.history;
+    if new.kind = 'catch' and not new.deleted and not old.deleted and new.data is not null and old.data is not null
+       and (old.data - array['updatedAt','feedPost','feedLog','feedDirty']) is distinct from (new.data - array['updatedAt','feedPost','feedLog','feedDirty']) then
+      new.history := (select coalesce(jsonb_agg(e order by n), '[]'::jsonb) from jsonb_array_elements(
+          jsonb_build_array(jsonb_build_object('at', old.updated_at, 'data', old.data)) || coalesce(old.history, '[]'::jsonb)
+        ) with ordinality t(e, n) where n <= 10);
+    end if;
+  else
+    new.history := null;
+    if (select count(*) from cloud_items where owner = auth.uid()) >= 20000 then
+      raise exception '同期できる件数の上限です';
+    end if;
   end if;
   new.synced_at := clock_timestamp();
   return new;
@@ -1548,6 +1566,20 @@ create policy cloud_insert on public.cloud_items for insert to authenticated wit
 create policy cloud_update on public.cloud_items for update to authenticated using (owner = auth.uid()) with check (owner = auth.uid());
 revoke all on public.cloud_items from anon;
 revoke delete on public.cloud_items from authenticated;
+
+-- 削除をとっておく前の版で消えた自分の釣果：「提供された釣果」に残っていれば、その中身を返す（「削除した釣果を戻す」用）
+create or replace function public.my_lost_catches() returns table(id text, deleted_at timestamptz, data jsonb)
+language sql stable security definer set search_path = public as $$
+  select c.id, coalesce(c.deleted_at, c.synced_at),
+         coalesce(s.data, '{}'::jsonb) || jsonb_build_object('lat', s.lat, 'lon', s.lon, 'species', s.species, 'count', s.count,
+           'datetime', to_char(s.caught_at at time zone 'Asia/Tokyo', 'YYYY-MM-DD"T"HH24:MI'))
+    from cloud_items c
+    join lateral (select * from shared_catches x where x.owner = c.owner and x.local_id = c.id order by x.updated_at desc limit 1) s on true
+   where c.owner = auth.uid() and c.kind = 'catch' and c.deleted and c.trash is null
+   order by 2 desc limit 300
+$$;
+revoke execute on function public.my_lost_catches() from public, anon;
+grant execute on function public.my_lost_catches() to authenticated;
 
 -- 電話番号の認証を確定する（SMSのコードで Supabase の認証が電話番号を確認したあとに呼ぶ）
 create or replace function public.phone_verify() returns json
@@ -1794,6 +1826,221 @@ begin
 end $$;
 revoke execute on function public.admin_usage() from public, anon;
 grant  execute on function public.admin_usage() to authenticated;   -- 中で管理者かどうかを確かめる
+
+
+-- ---------------------------------------------------------------------
+-- 13. 会員の支払い（Stripe）と紹介
+--     ・月額。最初の2か月（1＋1か月）は無料。申し込みにはカードの登録が必要
+--     ・紹介：紹介した人が無料期間のあと初めて支払ったら、紹介者に1か月無料（Stripe の残高に1か月分を足す）
+--     ・つ抜け：紹介した人のうち、支払い中の会員が10人以上いる間は、本人の料金が無料（9人以下で有料に戻る）
+--     ・支払いができなかったら、すぐ会員から外れる（ログインのまま。記録を見ることはできる）
+--     決済の受け取りは Edge Functions（billing・stripe-webhook）が行い、ここの関数を使う
+-- ---------------------------------------------------------------------
+create table if not exists public.billing (
+  user_id        uuid primary key references public.profiles(id) on delete cascade,
+  ref_code       text not null unique,                        -- 自分の紹介コード
+  referred_by    uuid references public.profiles(id) on delete set null,   -- 紹介してくれた人（1人だけ・あとから変えられない）
+  stripe_customer text unique,
+  sub_id         text,
+  sub_status     text,                                        -- trialing / active / past_due / canceled など（Stripe のまま）
+  period_end     timestamptz,                                 -- 無料期間の終わり、または次の支払い日
+  cancel_at_end  boolean not null default false,              -- 期間の終わりで解約する予定
+  trial_used     boolean not null default false,              -- 無料期間は1人1回
+  first_paid_at  timestamptz,                                 -- 初めて支払った日時（紹介の特典・つ抜けの数え方に使う）
+  ref_rewarded   boolean not null default false,              -- この人を紹介した人に、特典を渡したか
+  credit_pending int not null default 0 check (credit_pending >= 0),   -- 紹介でもらった無料の月のうち、まだ Stripe に渡していない数
+  credit_total   int not null default 0,                      -- 紹介でもらった無料の月の合計
+  updated_at     timestamptz not null default now(),
+  created_at     timestamptz not null default now()
+);
+create index if not exists billing_referred_by_idx on public.billing(referred_by);
+alter table public.billing enable row level security;
+drop policy if exists billing_select on public.billing;
+create policy billing_select on public.billing for select to authenticated using (user_id = auth.uid() or is_admin());
+revoke all on public.billing from anon;
+revoke insert, update, delete on public.billing from authenticated;
+grant select on public.billing to authenticated;
+
+insert into public.app_settings values ('price_month', '150', now()) on conflict (k) do nothing;   -- 表示用（実際の金額は Stripe の価格）
+insert into public.app_settings values ('tsunuke_n', '10', now()) on conflict (k) do nothing;
+insert into public.app_settings values ('tokusho', '', now()) on conflict (k) do nothing;          -- 特定商取引法に基づく表記（管理者が画面で入れる）
+
+-- 紹介コード（読み間違えやすい 0/O・1/I/L を使わない6文字）
+create or replace function public.billing_new_code() returns text
+language plpgsql volatile set search_path = public as $$
+declare a text := 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; c text;
+begin
+  loop
+    c := '';
+    for i in 1..6 loop c := c || substr(a, 1 + floor(random() * length(a))::int, 1); end loop;
+    exit when not exists(select 1 from billing where ref_code = c);
+  end loop;
+  return c;
+end $$;
+
+create or replace function public.billing_ensure(p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  insert into billing(user_id, ref_code) values (p_user, billing_new_code()) on conflict (user_id) do nothing;
+end $$;
+
+-- 支払い中の会員として数える：初めての支払いが済んでいて、今も続いている（つ抜けで無料の人も含む）
+create or replace function public.billing_paying_refs(p_user uuid) returns int
+language sql stable security definer set search_path = public as $$
+  select count(*)::int from billing b join profiles p on p.id = b.user_id
+   where b.referred_by = p_user and b.sub_status = 'active' and b.first_paid_at is not null and not p.banned
+$$;
+
+-- 本人の支払いと紹介の状態
+create or replace function public.billing_me() returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare b billing; n int;
+begin
+  if auth.uid() is null or not is_active_user() then raise exception 'ログインして表示名を登録してください'; end if;
+  perform billing_ensure(auth.uid());
+  select * into b from billing where user_id = auth.uid();
+  n := coalesce((select v::int from app_settings where k = 'tsunuke_n'), 10);
+  return jsonb_build_object(
+    'ref_code', b.ref_code,
+    'referred_by_name', (select nickname from profiles where id = b.referred_by),
+    'can_set_referrer', b.referred_by is null and not b.trial_used and b.sub_id is null,
+    'status', b.sub_status, 'period_end', b.period_end, 'cancel_at_end', b.cancel_at_end,
+    'trial_used', b.trial_used, 'has_customer', b.stripe_customer is not null,
+    'credit_pending', b.credit_pending, 'credit_total', b.credit_total,
+    'refs_total', (select count(*) from billing x where x.referred_by = auth.uid()),
+    'refs_paying', billing_paying_refs(auth.uid()),
+    'tsunuke_n', n,
+    'tsunuke', (select tsunuke from profiles where id = auth.uid()),
+    'member_until', (select member_until from profiles where id = auth.uid()),
+    'price_month', (select v from app_settings where k = 'price_month'));
+end $$;
+
+-- 紹介コードを登録（申し込みの前だけ・1回だけ）
+create or replace function public.billing_set_referrer(p_code text) returns text
+language plpgsql security definer set search_path = public as $$
+declare b billing; r uuid;
+begin
+  if auth.uid() is null or not is_active_user() then raise exception 'ログインして表示名を登録してください'; end if;
+  perform billing_ensure(auth.uid());
+  select * into b from billing where user_id = auth.uid() for update;
+  if b.referred_by is not null then raise exception '紹介コードはすでに登録済みです'; end if;
+  if b.trial_used or b.sub_id is not null then raise exception '会員の申し込みのあとは、紹介コードを登録できません'; end if;
+  select user_id into r from billing where ref_code = upper(regexp_replace(coalesce(p_code, ''), '\s', '', 'g'));
+  if r is null then raise exception 'その紹介コードは見つかりません'; end if;
+  if r = auth.uid() then raise exception '自分の紹介コードは使えません'; end if;
+  update billing set referred_by = r, updated_at = now() where user_id = auth.uid();
+  return (select nickname from profiles where id = r);
+end $$;
+
+-- ここから下は、決済の受け取り（Edge Functions、service_role）だけが使う
+-- Stripe の顧客と利用者を結びつける
+create or replace function public.billing_link_customer(p_user uuid, p_customer text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform billing_ensure(p_user);
+  update billing set stripe_customer = p_customer, updated_at = now() where user_id = p_user;
+end $$;
+
+-- 紹介でもらった無料の月を取り出す（Stripe に渡す前）。渡せなかったら billing_add_credit で戻す
+create or replace function public.billing_take_credit(p_user uuid) returns int
+language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  select credit_pending into n from billing where user_id = p_user and stripe_customer is not null for update;
+  if coalesce(n, 0) = 0 then return 0; end if;
+  update billing set credit_pending = 0, updated_at = now() where user_id = p_user;
+  return n;
+end $$;
+create or replace function public.billing_add_credit(p_user uuid, p_n int) returns void
+language sql security definer set search_path = public as $$
+  update billing set credit_pending = credit_pending + greatest(p_n, 0), updated_at = now() where user_id = p_user
+$$;
+
+-- Stripe の状態を反映する。p：customer・user_id（どちらか）・sub_id・status・period_end・cancel_at_end・paid（支払いが済んだ金額。請求の支払いのとき）
+-- 返す値：referrer（紹介者：無料の月を渡す相手）・tsunuke（紹介者のつ抜けの状態。Stripe の割引を合わせる）
+create or replace function public.billing_apply(p jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare b billing; r billing; n int; cnt int; on_ boolean; out jsonb := '{}'::jsonb; d date;
+begin
+  select * into b from billing where stripe_customer = p->>'customer';
+  if not found and p->>'user_id' is not null then
+    perform billing_ensure((p->>'user_id')::uuid);
+    update billing set stripe_customer = coalesce(stripe_customer, p->>'customer') where user_id = (p->>'user_id')::uuid;
+    select * into b from billing where user_id = (p->>'user_id')::uuid;
+  end if;
+  if b.user_id is null then return jsonb_build_object('unknown', true); end if;
+
+  if p ? 'status' then
+    update billing set sub_id = coalesce(p->>'sub_id', sub_id), sub_status = p->>'status',
+           period_end = (p->>'period_end')::timestamptz, cancel_at_end = coalesce((p->>'cancel_at_end')::boolean, false),
+           trial_used = trial_used or p->>'status' = 'trialing', updated_at = now()
+     where user_id = b.user_id;
+    d := ((p->>'period_end')::timestamptz at time zone 'Asia/Tokyo')::date;
+    if p->>'status' in ('active', 'trialing') then
+      -- 会員の期限：次の支払い日（無料期間の終わり）＋1日（支払いの処理に少し時間がかかるため）
+      update profiles set member_until = greatest(coalesce(member_until, d), d + 1) where id = b.user_id;
+    elsif p->>'status' in ('past_due', 'unpaid', 'canceled', 'incomplete_expired', 'paused') then
+      -- 支払いができない・解約：会員から外す（ログインのまま。記録は見られる）
+      update profiles set member_until = least(coalesce(member_until, current_date - 1), (now() at time zone 'Asia/Tokyo')::date - 1)
+       where id = b.user_id and role <> 'admin';
+    end if;
+  end if;
+
+  if coalesce((p->>'paid')::int, 0) > 0 then
+    update billing set first_paid_at = coalesce(first_paid_at, now()), updated_at = now() where user_id = b.user_id;
+    select * into b from billing where user_id = b.user_id;
+    if b.referred_by is not null and not b.ref_rewarded then
+      update billing set ref_rewarded = true where user_id = b.user_id;
+      perform billing_ensure(b.referred_by);
+      update billing set credit_pending = credit_pending + 1, credit_total = credit_total + 1, updated_at = now()
+       where user_id = b.referred_by;
+      out := out || jsonb_build_object('referrer', b.referred_by::text);
+    end if;
+  end if;
+
+  -- 紹介者のつ抜け（支払い中の紹介が10人以上）を数え直す
+  select * into b from billing where user_id = b.user_id;
+  if b.referred_by is not null then
+    n := coalesce((select v::int from app_settings where k = 'tsunuke_n'), 10);
+    cnt := billing_paying_refs(b.referred_by);
+    on_ := cnt >= n;
+    update profiles set tsunuke = on_ where id = b.referred_by and tsunuke is distinct from on_;
+    select * into r from billing where user_id = b.referred_by;
+    out := out || jsonb_build_object('tsunuke', jsonb_build_object('user_id', b.referred_by, 'on', on_, 'count', cnt,
+                                     'customer', r.stripe_customer, 'sub_id', r.sub_id, 'status', r.sub_status));
+  end if;
+  return out || jsonb_build_object('user_id', b.user_id);
+end $$;
+
+-- 本人のつ抜けの状態（申し込み・状態の読み直しのときに、割引を合わせるため）
+create or replace function public.billing_tsunuke_of(p_user uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce((select tsunuke from profiles where id = p_user), false)
+$$;
+
+revoke execute on function public.billing_new_code(), public.billing_ensure(uuid), public.billing_paying_refs(uuid),
+  public.billing_link_customer(uuid, text), public.billing_take_credit(uuid), public.billing_add_credit(uuid, int),
+  public.billing_apply(jsonb), public.billing_tsunuke_of(uuid) from public, anon, authenticated;
+grant execute on function public.billing_link_customer(uuid, text), public.billing_take_credit(uuid), public.billing_add_credit(uuid, int),
+  public.billing_apply(jsonb), public.billing_tsunuke_of(uuid), public.billing_ensure(uuid) to service_role;
+revoke execute on function public.billing_me(), public.billing_set_referrer(text) from public, anon;
+grant execute on function public.billing_me(), public.billing_set_referrer(text) to authenticated;
+
+-- 管理者：会員の支払いと紹介の一覧
+create or replace function public.admin_billing() returns table(nickname text, status text, period_end timestamptz, member_until date,
+  referred_by text, refs_total int, refs_paying int, tsunuke boolean, credit_total int, first_paid_at timestamptz)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception '権限がありません'; end if;
+  return query
+  select p.nickname, b.sub_status, b.period_end, p.member_until, (select nickname from profiles x where x.id = b.referred_by),
+         (select count(*)::int from billing y where y.referred_by = b.user_id), billing_paying_refs(b.user_id), p.tsunuke, b.credit_total, b.first_paid_at
+    from billing b join profiles p on p.id = b.user_id
+   where b.stripe_customer is not null or b.referred_by is not null or exists(select 1 from billing z where z.referred_by = b.user_id)
+   order by b.updated_at desc limit 500;
+end $$;
+revoke execute on function public.admin_billing() from public, anon;
+grant  execute on function public.admin_billing() to authenticated;
 
 -- ---------------------------------------------------------------------
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
