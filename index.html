@@ -1755,15 +1755,25 @@ function suggestSpecies(){
 }
 $("f_species").addEventListener("input",suggestSpecies);
 $("f_species").addEventListener("focus",suggestSpecies);
-// 候補を押したとき：押した時点では入力欄から外れないようにだけして（pointerdown）、確定は click で行う。
-// pointerdown で候補を閉じると、指を離したときの click が裏にある魚種のボタンに届いてしまうため
-let spPickAt=0;
-$("spSuggest").addEventListener("pointerdown",e=>{ if(e.target.closest("button")) e.preventDefault(); });
-$("spSuggest").addEventListener("click",e=>{
+// 候補を押したとき：指が触れた時点では入力欄から外れないようにして（キーボードが閉じて画面がずれるのを防ぐ）、
+// 指を離した時点で、触れた候補の上なら確定する。確定した直後の「押した」合図は、裏にあるボタンに届かないように捨てる
+let spPickAt=0, spDown=null;
+function spPick(b){ spPickAt=Date.now(); $("f_species").value=b.textContent; $("spSuggest").hidden=true; syncChips(); $("f_species").blur(); }
+$("spSuggest").addEventListener("touchstart",e=>{ const b=e.target.closest("button"); if(!b) return; e.preventDefault(); spDown=b; },{passive:false});
+$("spSuggest").addEventListener("touchend",e=>{
+  const b=spDown; spDown=null; if(!b) return; e.preventDefault();
+  const t=e.changedTouches[0], el=t && document.elementFromPoint(t.clientX,t.clientY);
+  if(el && el.closest("button")===b) spPick(b);                    // 指をずらして離したときは選ばない
+},{passive:false});
+$("spSuggest").addEventListener("touchcancel",()=>{ spDown=null; });
+$("spSuggest").addEventListener("pointerdown",e=>{ if(e.target.closest("button")) e.preventDefault(); });   // マウス：入力欄から外れない
+$("spSuggest").addEventListener("click",e=>{                       // マウス・キーボード
   const b=e.target.closest("button"); if(!b) return;
-  e.preventDefault(); e.stopPropagation(); spPickAt=Date.now();
-  $("f_species").value=b.textContent; $("spSuggest").hidden=true; syncChips(); $("f_species").blur();
+  e.preventDefault(); e.stopPropagation(); if(Date.now()-spPickAt>700) spPick(b);
 });
+document.addEventListener("click",e=>{                             // 候補を選んだ直後に、裏のボタンへ届いた合図は捨てる
+  if(Date.now()-spPickAt<700 && !e.target.closest?.("#spSuggest")){ e.preventDefault(); e.stopPropagation(); }
+},true);
 $("f_species").addEventListener("blur",()=>setTimeout(()=>$("spSuggest").hidden=true,150));
 $("f_species").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); const b=$("spSuggest").querySelector("button"); if(!$("spSuggest").hidden&&b){ $("f_species").value=b.textContent; } $("spSuggest").hidden=true; $("f_species").blur(); syncChips(); } });
 
@@ -1773,7 +1783,6 @@ function drawSpeciesChips(){
   $("spChips").innerHTML=list.map(n=>`<button type="button" class="chip" data-v="${esc(n)}">${esc(n)}</button>`).join("");
 }
 $("spChips").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return;
-  if(Date.now()-spPickAt<600) return;                              // 候補を選んだ直後に裏のボタンへ届いた触れ方は無視
   $("f_species").value=b.dataset.v; $("spSuggest").hidden=true; syncChips(); });
 
 /* ---------- 選択ボタン（data-for の入力欄に値を入れる。もう一度押すと解除。multi は複数選択） ---------- */
@@ -2663,7 +2672,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.04.1";
+const APP_VER="2026.11.04.2";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
