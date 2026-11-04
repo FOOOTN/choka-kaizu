@@ -1755,9 +1755,14 @@ function suggestSpecies(){
 }
 $("f_species").addEventListener("input",suggestSpecies);
 $("f_species").addEventListener("focus",suggestSpecies);
-$("spSuggest").addEventListener("pointerdown",e=>{               // blurより先に確定させる
+// 候補を押したとき：押した時点では入力欄から外れないようにだけして（pointerdown）、確定は click で行う。
+// pointerdown で候補を閉じると、指を離したときの click が裏にある魚種のボタンに届いてしまうため
+let spPickAt=0;
+$("spSuggest").addEventListener("pointerdown",e=>{ if(e.target.closest("button")) e.preventDefault(); });
+$("spSuggest").addEventListener("click",e=>{
   const b=e.target.closest("button"); if(!b) return;
-  e.preventDefault(); $("f_species").value=b.textContent; $("spSuggest").hidden=true; syncChips(); $("f_species").blur();
+  e.preventDefault(); e.stopPropagation(); spPickAt=Date.now();
+  $("f_species").value=b.textContent; $("spSuggest").hidden=true; syncChips(); $("f_species").blur();
 });
 $("f_species").addEventListener("blur",()=>setTimeout(()=>$("spSuggest").hidden=true,150));
 $("f_species").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); const b=$("spSuggest").querySelector("button"); if(!$("spSuggest").hidden&&b){ $("f_species").value=b.textContent; } $("spSuggest").hidden=true; $("f_species").blur(); syncChips(); } });
@@ -1767,7 +1772,9 @@ function drawSpeciesChips(){
   if(list.length<8) for(const d of ["フクラギ","ガンド","ブリ","マダイ","アオリイカ","キジハタ（アコウ）","アジ","カサゴ"]) if(!list.includes(d)&&list.length<8) list.push(d);
   $("spChips").innerHTML=list.map(n=>`<button type="button" class="chip" data-v="${esc(n)}">${esc(n)}</button>`).join("");
 }
-$("spChips").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return; $("f_species").value=b.dataset.v; $("spSuggest").hidden=true; syncChips(); });
+$("spChips").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return;
+  if(Date.now()-spPickAt<600) return;                              // 候補を選んだ直後に裏のボタンへ届いた触れ方は無視
+  $("f_species").value=b.dataset.v; $("spSuggest").hidden=true; syncChips(); });
 
 /* ---------- 選択ボタン（data-for の入力欄に値を入れる。もう一度押すと解除。multi は複数選択） ---------- */
 function buildChips(){
@@ -2656,7 +2663,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.03.1";
+const APP_VER="2026.11.04.1";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
