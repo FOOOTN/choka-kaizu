@@ -1528,8 +1528,14 @@ function nearMarks(pt){
   if(!pt) return [];
   const R=TAP_R(), out=[];
   const near=(ll,item)=>{ const q=map.latLngToContainerPoint(ll), d=Math.hypot(q.x-pt.x,q.y-pt.y); if(d<=R) out.push({...item,d}); };
-  if(map.hasLayer(catchLayer)) for(const r of records){ if(markers.has(r.id)) near([r.lat,r.lon],{r}); }
-  if(map.hasLayer(postLayer)) for(const l of postLayer.getLayers()) if(l._post) near(l.getLatLng(),{p:l._post});
+  // 同じ釣果を2回数えない：自分の釣果は、この端末の記録（くわしい方）だけを出し、新着に載せた分（みんなの印）は数えない
+  const recIds=new Set(), postIds=new Set();
+  if(map.hasLayer(catchLayer)) for(const r of records){ if(markers.has(r.id) && !recIds.has(String(r.id))){ recIds.add(String(r.id)); near([r.lat,r.lon],{r}); } }
+  if(map.hasLayer(postLayer)) for(const l of postLayer.getLayers()){
+    const p=l._post; if(!p || postIds.has(p.id)) continue; postIds.add(p.id);
+    if(p.mine && p.catch_id && recIds.has(String(p.catch_id))) continue;
+    near(l.getLatLng(),{p});
+  }
   return out.sort((a,b)=>a.d-b.d);
 }
 function openNear(hits,ll,add){
@@ -2672,7 +2678,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.04.2";
+const APP_VER="2026.11.05.1";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
