@@ -38,6 +38,24 @@ export async function applySub(sub: Stripe.Subscription, userId?: string) {
     sub_id: sub.id, status: sub.status, cancel_at_end: !!sub.cancel_at_period_end,
     period_end: end ? new Date(end * 1000).toISOString() : null } });
 }
+// 申し込みで登録したカードを確かめる：利用停止のカードなら購読を止め、無料期間を付けられないカード
+// （プリペイド・ほかの人がこのカードで無料期間を使った）なら、無料期間を終わらせてすぐ課金にする
+async function checkCard(sub: Stripe.Subscription, userId: string | null | undefined) {
+  if (!userId || !["trialing", "active", "past_due", "incomplete"].includes(sub.status)) return;
+  const pick = (x: any) => (typeof x === "string" ? x : x?.id) || null;
+  let pmId = pick((sub as any).default_payment_method);
+  if (!pmId) {
+    const cust: any = await stripe.customers.retrieve(pick(sub.customer as any)!);
+    pmId = pick(cust?.invoice_settings?.default_payment_method);
+  }
+  if (!pmId) return;
+  const pm: any = await stripe.paymentMethods.retrieve(pmId);
+  const card = pm?.card;
+  if (!card?.fingerprint) return;
+  const r: any = await rpc("billing_set_card", { p_user: userId, p_fp: card.fingerprint, p_funding: card.funding || "unknown" });
+  if (r?.banned) { await stripe.subscriptions.cancel(sub.id); return; }
+  if (!r?.trial_ok && sub.status === "trialing") await stripe.subscriptions.update(sub.id, { trial_end: "now", proration_behavior: "none" });
+}
 // 2か月後の同じ日の終わり（日本時間）
 function trialEnd() {
   const d = new Date(Date.now() + 9 * 3600e3);
@@ -52,7 +70,7 @@ Deno.serve(async (req) => {
     const { data: { user } } = await sb.auth.getUser();
     if (!user) return json({ error: "ログインしてください" }, 401);
     const me = await (async () => { const { data, error } = await sb.rpc("billing_me"); if (error) throw new Error(error.message); return data; })();
-    const { action } = await req.json().catch(() => ({ action: "" }));
+    const { action, user_id: target } = await req.json().catch(() => ({ action: "" }));
     const { data: b } = await admin.from("billing").select("*").eq("user_id", user.id).single();
     const { data: prof } = await admin.from("profiles").select("tsunuke,nickname").eq("id", user.id).single();
 
@@ -72,9 +90,21 @@ Deno.serve(async (req) => {
         payment_method_collection: "always",                         // 無料期間でもカードの登録は必須
         subscription_data: { metadata: { user_id: user.id }, ...(b.trial_used ? {} : { trial_end: trialEnd() }) },
         ...(tsunuke ? { discounts: [{ coupon: TSUNUKE_COUPON }] } : {}),
+        // 支払いの画面の「申し込む」ボタンの近くに出す注意（無料期間を付けるときだけ）
+        ...(b.trial_used ? {} : { custom_text: { submit: { message:
+          "※プリペイド式のカードや、ほかのアカウントですでに無料期間を使ったカードでは、無料期間は付かず、申し込みのときに初回のお支払いになります。この画面の「無料」の表示は、カードを登録したあとで切り替わります。" } } }),
         success_url: APP_URL + "?billing=ok", cancel_url: APP_URL + "?billing=cancel",
       });
       return json({ url: session.url });
+    }
+
+    if (action === "admin_cancel") {                                // 管理者：利用停止にした人の購読をすぐ止める（それ以上請求しない）
+      const { data: me2 } = await admin.from("profiles").select("role").eq("id", user.id).single();
+      if (me2?.role !== "admin") return json({ error: "権限がありません" }, 403);
+      const { data: tb } = await admin.from("billing").select("sub_id,sub_status").eq("user_id", target).maybeSingle();
+      if (!tb?.sub_id || ["canceled", "incomplete_expired"].includes(tb.sub_status)) return json({ ok: true, none: true });
+      await stripe.subscriptions.cancel(tb.sub_id);
+      return json({ ok: true });
     }
 
     if (action === "portal") {
@@ -86,7 +116,7 @@ Deno.serve(async (req) => {
     if (action === "sync") {                                       // 申し込みのあと・状態が変なとき：Stripe から読み直す
       if (b.stripe_customer) {
         const list = await stripe.subscriptions.list({ customer: b.stripe_customer, status: "all", limit: 1 });
-        if (list.data[0]) await applySub(list.data[0], user.id);
+        if (list.data[0]) { await applySub(list.data[0], user.id); await checkCard(list.data[0], user.id).catch(() => {}); }
         await flushCredit(user.id, b.stripe_customer).catch(() => {});
       }
       const { data } = await sb.rpc("billing_me");

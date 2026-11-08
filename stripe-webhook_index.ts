@@ -45,6 +45,24 @@ async function syncTsunuke(t: any) {
     await stripe.subscriptions.deleteDiscount(t.sub_id);
   }
 }
+// 申し込みで登録したカードを確かめる：利用停止のカードなら購読を止め、無料期間を付けられないカード
+// （プリペイド・ほかの人がこのカードで無料期間を使った）なら、無料期間を終わらせてすぐ課金にする
+async function checkCard(sub: Stripe.Subscription, userId: string | null | undefined) {
+  if (!userId || !["trialing", "active", "past_due", "incomplete"].includes(sub.status)) return;
+  const pick = (x: any) => (typeof x === "string" ? x : x?.id) || null;
+  let pmId = pick((sub as any).default_payment_method);
+  if (!pmId) {
+    const cust: any = await stripe.customers.retrieve(pick(sub.customer as any)!);
+    pmId = pick(cust?.invoice_settings?.default_payment_method);
+  }
+  if (!pmId) return;
+  const pm: any = await stripe.paymentMethods.retrieve(pmId);
+  const card = pm?.card;
+  if (!card?.fingerprint) return;
+  const r: any = await rpc("billing_set_card", { p_user: userId, p_fp: card.fingerprint, p_funding: card.funding || "unknown" });
+  if (r?.banned) { await stripe.subscriptions.cancel(sub.id); return; }
+  if (!r?.trial_ok && sub.status === "trialing") await stripe.subscriptions.update(sub.id, { trial_end: "now", proration_behavior: "none" });
+}
 async function after(out: any) {
   if (out?.referrer) await flushCredit(out.referrer);
   if (out?.tsunuke) await syncTsunuke(out.tsunuke);
@@ -65,7 +83,9 @@ Deno.serve(async (req) => {
       case "checkout.session.completed": {
         if (o.mode !== "subscription" || !o.subscription) break;
         const sub = await stripe.subscriptions.retrieve(o.subscription);
-        await after(await applySub(sub, o.client_reference_id));
+        const out = await applySub(sub, o.client_reference_id);
+        await after(out);
+        await checkCard(sub, out?.user_id);
         break;
       }
       case "customer.subscription.created":
@@ -75,7 +95,9 @@ Deno.serve(async (req) => {
       case "customer.subscription.resumed": {
         // 届く順番が前後することがあるので、いつも Stripe から今の状態を読み直す
         const sub = await stripe.subscriptions.retrieve(o.id).catch(() => o);
-        await after(await applySub(sub));
+        const out = await applySub(sub);
+        await after(out);
+        if (ev.type !== "customer.subscription.deleted") await checkCard(sub, out?.user_id);
         break;
       }
       case "invoice.paid":
