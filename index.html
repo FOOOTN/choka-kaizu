@@ -716,6 +716,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
         </div>
         <div class="status" id="loginMsg"></div>
         <p class="hint">パスワードは使いません。届いたメールのリンクを開くか、コードを入れるとログインできます。</p>
+        <p class="hint"><a href="#" data-doc="terms">利用規約</a>　<a href="#" data-doc="privacy">プライバシーポリシー</a>　<a href="#" data-doc="tokusho">特定商取引法に基づく表記</a></p>
       </div>
 
       <div id="shProfile" hidden>
@@ -729,6 +730,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
           <label><input type="checkbox">決まりに反した出品は管理者が削除し、利用を停止することがあります</label>
           <label><input type="checkbox">出品の内容・申し込み・やり取りのメッセージは、トラブル対応とアプリの改善のため管理者が見ることがあります</label>
           <label><input type="checkbox">記録した釣果（位置・日時・魚種・数・大きさ・釣法・気象・メモなど。写真は除く）は、釣果の分析とアプリの改善のため運営者に送られます（ほかの利用者には公開しません）</label>
+          <label><input type="checkbox"><span><a href="#" data-doc="terms">利用規約</a>と<a href="#" data-doc="privacy">プライバシーポリシー</a>に同意します</span></label>
         </div>
         <button type="button" class="btn primary" id="btnProfile">同意して始める</button>
         <div class="status" id="profMsg"></div>
@@ -2658,10 +2660,9 @@ function memberGate(what){
     <ul class="mfeat">${MEMBER_FEATURES.map(([t,d])=>`<li${what&&(t.includes(what)||what.includes(t.slice(0,4)))?' class="hit"':""}><b>${t}</b><span>${d}</span></li>`).join("")}</ul>
     <p class="hint">${logged?"会員でなくても、新着の釣果と投稿を見る・いいね・コメント・メッセージは使えます。":"ログイン（無料）すると、いいね・コメント・メッセージが使えます。"}</p>
     <p class="hint">${logged?`会員は月${esc(BILL.price)}円です。はじめて申し込むときは、最初の2か月が無料です（カードの登録が必要）。`:"会員になるには、ログイン（無料）してから申し込みます。会員の方は、ログインしてください。"}</p>
-    <p class="hint">これまでの釣果と航跡は、会員でなくても（支払いが止まっても）「釣果一覧」「航跡」で見られ、バックアップもできます。<a href="#" id="gtTk">特定商取引法に基づく表記</a></p>
+    <p class="hint">これまでの釣果と航跡は、会員でなくても（支払いが止まっても）「釣果一覧」「航跡」で見られ、バックアップもできます。</p><p class="hint">${legalLinks()}</p>
     <div class="actions">${logged?`<button type="button" class="btn primary" id="gtJoin">会員になる・くわしく</button>`:`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
   b.querySelector("#gtJoin")?.addEventListener("click",()=>billingDlg());
-  b.querySelector("#gtTk").onclick=e=>{ e.preventDefault(); tokushoDlg(); };
   b.querySelector("#gtClose").onclick=()=>$("dlg").close();
   b.querySelector("#gtLogin")?.addEventListener("click",()=>{ $("dlg").close(); showTab("share"); });
   return false;
@@ -2678,7 +2679,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.05.1";
+const APP_VER="2026.11.08.1";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -4056,7 +4057,7 @@ async function billingDlg(note){
     <p>紹介した人 ${me.refs_total}人（うち支払い中 ${me.refs_paying}人）${me.tsunuke?"":`・つ抜けまで あと${need}人`}・紹介でもらった無料 ${me.credit_total}か月${me.credit_pending?`（${me.credit_pending}か月分は、申し込むと使われます）`:""}</p>
     ${me.referred_by_name?`<p class="hint">あなたを紹介した人：${esc(me.referred_by_name)}</p>`:""}
     ${me.can_set_referrer?`<label>紹介コードを入れる（申し込みの前だけ・1回だけ）<span style="display:flex;gap:6px"><input id="blCode" maxlength="12" autocapitalize="characters" autocomplete="off" style="flex:1"><button type="button" class="btn" id="blSet">登録</button></span></label>`:""}
-    <p class="hint" style="margin-top:10px"><a href="#" id="blTk">特定商取引法に基づく表記</a></p>`;
+    <p class="hint" style="margin-top:10px">${legalLinks()}</p>`;
   if(note) shMsg("blStat",note,"ok");
   const go=async(btn,action)=>{ setBusy(btn,true,"開いています…"); try{ const d=await billFn(action); if(d.url) location.href=d.url; }catch(e){ setBusy(btn,false); shMsg("blStat",e.message,"err"); } };
   box.querySelector("#blJoin")?.addEventListener("click",e=>go(e.target,"checkout"));
@@ -4072,7 +4073,6 @@ async function billingDlg(note){
     if(error){ setBusy(e.target,false); shMsg("blStat",shErr(error),"err"); return; }
     billingDlg(`${data}さんを紹介した人として登録しました`);
   });
-  box.querySelector("#blTk").onclick=ev=>{ ev.preventDefault(); tokushoDlg(); };
 }
 /* 特定商取引法に基づく表記（管理者が画面で書く。だれでも見られる） */
 const TOKUSHO_TPL=`販売事業者：［氏名または屋号］
@@ -4089,32 +4089,39 @@ const TOKUSHO_TPL=`販売事業者：［氏名または屋号］
 返金：デジタルサービスの性質上、お支払い済みの料金は返金しません（無料期間中に解約すれば料金はかかりません）
 紹介の特典：紹介した方の料金の割引（1か月無料・つ抜け会員の無料）だけで、金銭の支払いはありません
 動作環境：最新のブラウザ（Chrome・Safari・Edge）`;
-async function tokushoDlg(){
-  openDlg("特定商取引法に基づく表記",`<div id="tkBox"><div class="empty">読み込み中…</div></div>`);
+/* 特定商取引法に基づく表記・利用規約・プライバシーポリシー（管理者が画面で書く。だれでも見られる） */
+const DOCS={tokusho:["特定商取引法に基づく表記",()=>TOKUSHO_TPL], terms:["利用規約",()=>""], privacy:["プライバシーポリシー",()=>""]};
+async function docDlg(k){
+  const [title,tpl]=DOCS[k]||DOCS.tokusho;
+  openDlg(title,`<div id="tkBox"><div class="empty">読み込み中…</div></div>`);
   if(!SH.started) await shStart();
-  let t=""; try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k","tokusho").maybeSingle(); t=data?.v||""; }catch{}
+  let t=""; try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k",k).maybeSingle(); t=data?.v||""; }catch{}
   const adm=SH.profile?.role==="admin", box=$("tkBox"); if(!box) return;
   box.innerHTML=(t?`<div style="white-space:pre-wrap;line-height:1.8">${esc(t)}</div>`:`<p class="hint">準備中です。</p>`)
-    + (adm?`<label style="margin-top:12px">管理者：表記を書く・直す（［ ］の中を書き換えてください）<textarea id="tkEdit" rows="16">${esc(t||TOKUSHO_TPL)}</textarea></label>
+    + `<p class="hint" style="margin-top:12px">${legalLinks(k)}</p>`
+    + (adm?`<label style="margin-top:12px">管理者：${esc(title)}を書く・直す<textarea id="tkEdit" rows="16">${esc(t||tpl())}</textarea></label>
       <div class="actions"><button type="button" class="btn primary" id="tkSave">保存</button></div><div class="status" id="tkStat"></div>`:"");
   box.querySelector("#tkSave")?.addEventListener("click",async e=>{
     setBusy(e.target,true,"保存中…");
-    const {error}=await SH.sb.from("app_settings").update({v:$("tkEdit").value.trim(),updated_at:new Date().toISOString()}).eq("k","tokusho");
-    setBusy(e.target,false); if(error) shMsg("tkStat",shErr(error),"err"); else tokushoDlg();
+    const {error}=await SH.sb.from("app_settings").update({v:$("tkEdit").value.trim(),updated_at:new Date().toISOString()}).eq("k",k);
+    setBusy(e.target,false); if(error) shMsg("tkStat",shErr(error),"err"); else docDlg(k);
   });
 }
+const tokushoDlg=()=>docDlg("tokusho");
+/* 3つの文書へのリンク（今開いているものは除く）。data-doc を押すとどこでも開く */
+const legalLinks=(skip)=>Object.keys(DOCS).filter(k=>k!==skip).map(k=>`<a href="#" data-doc="${k}">${DOCS[k][0]}</a>`).join("　");
+document.addEventListener("click",e=>{ const a=e.target.closest?.("[data-doc]"); if(!a) return; e.preventDefault(); e.stopPropagation(); docDlg(a.dataset.doc); },true);
 /* 管理者：会員の支払いと紹介の一覧 */
 async function billAdminLoad(){
   const box=$("billBox"); if(!box) return;
   const {data,error}=await SH.sb.rpc("admin_billing");
   const ST=s=>BILL_ST[s]||s||"―";
   box.innerHTML=`<div class="sec-h">会員の支払いと紹介</div>
-    <div class="actions" style="justify-content:flex-start"><button type="button" class="btn sm" id="admTk">特定商取引法に基づく表記を書く</button></div>
+    <div class="actions" style="justify-content:flex-start"><button type="button" class="btn sm" data-doc="tokusho">特定商取引法に基づく表記を書く</button><button type="button" class="btn sm" data-doc="terms">利用規約を書く</button><button type="button" class="btn sm" data-doc="privacy">プライバシーポリシーを書く</button></div>
     ${error?`<p class="status err">${esc(shErr(error))}（schema.sql を最新のものにして実行し直してください）</p>`
     : (data||[]).length?`<div style="overflow-x:auto"><table class="mini"><tr><th>表示名</th><th>状態</th><th>次の日付</th><th>会員の期限</th><th>紹介者</th><th>紹介</th><th>支払い中</th><th>特典</th></tr>
       ${data.map(r=>`<tr><td>${r.tsunuke?tsuMark()+" ":""}${esc(r.nickname)}</td><td>${esc(ST(r.status))}</td><td>${r.period_end?fmtJ(r.period_end):""}</td><td>${esc(r.member_until||"")}</td><td>${esc(r.referred_by||"")}</td><td class="n">${r.refs_total}</td><td class="n">${r.refs_paying}</td><td class="n">${r.credit_total}か月</td></tr>`).join("")}</table></div>`
     : `<div class="empty">まだ申し込み・紹介はありません。</div>`}`;
-  box.querySelector("#admTk").onclick=()=>tokushoDlg();
 }
 function profileDlg(){
   const P=SH.profile; let pick=null, clear=false;
@@ -4127,6 +4134,7 @@ function profileDlg(){
     <p class="hint">電話番号：${P.phone_verified_at?`認証済み（末尾 ${esc(P.phone_tail||"")}）`:"未認証"} <button type="button" class="btn sm" id="avPhone">${P.phone_verified_at?"番号を変える":"認証する"}</button></p>
     <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員${P.tsunuke?"（つ抜け会員 "+tsuMark()+"）":""}`):"無料（コメント・いいね・メッセージができます）"} <button type="button" class="btn sm" id="avBill">会員・お支払い・紹介…</button></p>
     <p class="hint">ログアウトやお店の登録は「おすそわけ」タブから。　アプリの版：${APP_VER}</p>
+    <p class="hint">${legalLinks()}</p>
     <div class="actions"><button type="button" class="btn" id="avShare">おすそわけタブへ</button><button type="button" class="btn primary" id="avSave">保存</button></div>
     <div class="status" id="avStat"></div>`);
   $("avPref").value=P.home_pref||"";

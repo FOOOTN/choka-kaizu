@@ -1864,6 +1864,8 @@ grant select on public.billing to authenticated;
 insert into public.app_settings values ('price_month', '150', now()) on conflict (k) do nothing;   -- 表示用（実際の金額は Stripe の価格）
 insert into public.app_settings values ('tsunuke_n', '10', now()) on conflict (k) do nothing;
 insert into public.app_settings values ('tokusho', '', now()) on conflict (k) do nothing;          -- 特定商取引法に基づく表記（管理者が画面で入れる）
+insert into public.app_settings values ('terms', '', now()) on conflict (k) do nothing;            -- 利用規約（管理者が画面で入れる）
+insert into public.app_settings values ('privacy', '', now()) on conflict (k) do nothing;          -- プライバシーポリシー（管理者が画面で入れる）
 
 -- 紹介コード（読み間違えやすい 0/O・1/I/L を使わない6文字）
 create or replace function public.billing_new_code() returns text
@@ -2041,6 +2043,35 @@ begin
 end $$;
 revoke execute on function public.admin_billing() from public, anon;
 grant  execute on function public.admin_billing() to authenticated;
+
+
+-- ---------------------------------------------------------------------
+-- 14. 安全点検（Supabase の自動点検で指摘された点への対応）
+--     ・関数が使う場所（search_path）を固定する
+--     ・トリガーの関数は、画面（API）からは呼べないようにする（トリガーとしては今までどおり動く）
+--     ・ブロックの有無を調べる関数は、ほかの関数の中だけで使う（だれがだれをブロックしたかを外から調べられないように）
+--     ・使用量の関数は、ログインした人だけ
+--     次の指摘は、わざとそう作っているもの：
+--       user_cards（管理者の画面だけで使い、管理者以外には0件）・security definer の表示用ビュー（中で見せてよい行と列だけに絞っている）
+--       app_secrets（だれも直接読めないようにしている）・ログインした人が呼べる関数（中で本人か管理者かを確かめている）
+-- ---------------------------------------------------------------------
+alter function public.kana_norm(text) set search_path = public;
+alter function public.want_matches(public.wants, public.listings) set search_path = public;
+alter function public.catch_feed(text, int, int) set search_path = public;
+alter function public.catch_search(text, text, int, int, int) set search_path = public;
+alter function public.catch_find(jsonb) set search_path = public;
+alter function public.my_favorites(int, int) set search_path = public;
+revoke execute on function public.is_blocked(uuid, uuid) from public, anon, authenticated;
+revoke execute on function public.cloud_usage() from public, anon;
+grant  execute on function public.cloud_usage() to authenticated;
+do $$
+declare f record;
+begin
+  for f in select p.oid::regprocedure as sig from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'public' and p.prorettype = 'trigger'::regtype loop
+    execute format('revoke execute on function %s from public, anon, authenticated', f.sig);
+  end loop;
+end $$;
 
 -- ---------------------------------------------------------------------
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
