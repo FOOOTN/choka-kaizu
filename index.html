@@ -4943,21 +4943,23 @@ const SAMPLES = [
 
 
 <script>
-/* ヘッダーに「管理」「会員登録」ボタンを追加（管理は管理者ログイン時のみ表示） */
+/* ヘッダーに「管理」「会員登録」「ログアウト」ボタンを追加（本体コードは変更しない） */
 (function () {
   function run() {
     var ref = document.getElementById("btnRefresh");
-    if (!ref || document.getElementById("btnJoinHdr")) return;
+    var acc = document.getElementById("btnAccount");
+    if (!ref || !acc || document.getElementById("btnJoinHdr")) return;
+
+    var loggedIn = function () {
+      try { return typeof hasProfile === "function" && hasProfile(); } catch (e) { return false; }
+    };
 
     // 会員登録（全ユーザー表示）：会員・お支払い・紹介のダイアログを開く
     var join = document.createElement("button");
     join.id = "btnJoinHdr"; join.type = "button"; join.className = "btn";
     join.title = "会員登録・お支払い・紹介"; join.textContent = "会員登録";
     join.addEventListener("click", function () {
-      try {
-        if (typeof billingDlg === "function") billingDlg();
-        else showTab("share");
-      } catch (e) {}
+      try { if (typeof billingDlg === "function") billingDlg(); else showTab("share"); } catch (e) {}
     });
 
     // 管理（管理者のみ表示・一番左）：おすそわけの「管理」画面へ
@@ -4971,13 +4973,34 @@ const SAMPLES = [
       } catch (e) {}
     });
 
-    // 並び順： [管理][会員登録] 更新 アカウント 昼／夜
+    // ログアウト（ログイン中のみ表示・アカウントボタンの隣）
+    var out = document.createElement("button");
+    out.id = "btnLogoutHdr"; out.type = "button"; out.className = "btn"; out.hidden = true;
+    out.title = "ログアウト"; out.textContent = "ログアウト";
+    out.addEventListener("click", function () {
+      try {
+        if (typeof SH !== "undefined" && SH && SH.sb) {
+          SH.sb.auth.signOut().then(function () {
+            try { SH.cache && SH.cache.clear(); SH.deals && SH.deals.clear(); } catch (e) {}
+            try { lsSet("choka-profile", null); } catch (e) {}
+            try { shRefreshMe(); } catch (e) {}
+          });
+        }
+      } catch (e) {}
+    });
+
+    // 並び順： [管理][会員登録] 更新 アカウント [ログアウト] 昼／夜
     ref.parentNode.insertBefore(join, ref);
     ref.parentNode.insertBefore(adm, join);
+    acc.parentNode.insertBefore(out, acc.nextSibling);
 
-    // 管理ボタンの表示はログイン状態に合わせて切替
+    // 表示の切替（ログイン状態に合わせて）
     setInterval(function () {
-      try { adm.hidden = !(typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin"); } catch (e) {}
+      try {
+        var isAdmin = (typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin");
+        adm.hidden = !isAdmin;
+        out.hidden = !loggedIn();
+      } catch (e) {}
     }, 1000);
   }
   if (document.readyState !== "loading") run();
