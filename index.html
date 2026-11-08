@@ -749,7 +749,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
       </div>
 
       <div id="shMain" hidden>
-        <div class="phone-note" id="phoneNote" hidden>おすそわけの出品・申し込みの前に、<b>電話番号の認証</b>（SMS・最初の1回だけ）が必要です。<button type="button" class="btn sm primary" id="btnPhone">認証する</button></div>
+        <div class="phone-note" id="identNote" hidden>おすそわけの出品・申し込みは、<b>会員の申し込みでカードを登録した人</b>が使えます。<button type="button" class="btn sm primary" id="btnIdent">会員・お支払い…</button></div>
         <div class="subtabs" id="shSubs" role="tablist">
           <button type="button" data-sub="find" aria-selected="true">探す</button>
           <button type="button" data-sub="post" aria-selected="false">出品する</button>
@@ -2679,7 +2679,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.08.1";
+const APP_VER="2026.11.08.2";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -2743,7 +2743,7 @@ async function shRefreshMe(){
   if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
   const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
   SH.shop=s||null;
-  await loadSettings(); shShow("shMain"); phoneUi();
+  await loadSettings(); shShow("shMain"); identUi();
   $("shWho").textContent = `ログイン中：${p.nickname}${p.role==="admin"?"（管理者）":""}${SH.shop?.status==="approved"?`・${SH.shop.name}`:""}`;
   $("subAdminBtn").hidden = p.role!=="admin";
   $("fltShop").hidden = !(SH.shop?.status==="approved" || p.role==="admin");
@@ -2912,7 +2912,7 @@ async function shDetail(id){
     ["締め方", shimeText(l)+(l.shime_at?`（${fmtJ(l.shime_at)}）`:"")],
     ["受け渡し", `${l.pickup_area}・${l.handoff}`],
     ["受付", l.status==="open"?`${leftText(l.expires_at)}（${fmtJ(l.expires_at)}まで）`:(L_STATUS[l.status]||l.status)],
-    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}${l.owner_verified?"・電話番号を認証済み":""}）`],
+    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}${l.owner_verified?"・カード登録済み":""}）`],
     ["取り下げの理由", l.status==="cancelled"?(l.cancel_reason||""):""],
     ["写真の日時", l.photo_checked?"釣った時刻と一致":"確認できず（撮影日時の情報なし）"],
     ["ひとこと", l.memo||""],
@@ -3003,7 +3003,7 @@ function editListing(l){
   };
 }
 function reqForm(l){
-  if(!phoneGate()) return;
+  if(!identGate()) return;
   const b=openDlg(`${l.species}に申し込む`,
     `<p class="hint">${l.kind==="gift"?"おすそわけは無料です。お礼としてお金や物を渡す約束はしないでください。":"価格はここで提示し、支払いは受け渡しのときに当事者間で行います。"}</p>
      <label>ひとこと（取りに行ける時間など）<textarea id="rqMsg" maxlength="400" placeholder="例：今日17時以降なら${esc(l.pickup_area)}まで取りに行けます"></textarea></label>
@@ -3120,7 +3120,7 @@ $("pfGps").onclick=()=>{
 };
 $("pfCancel").onclick=()=>{ SH.post=null; shPickEnd(); clearPickup(); shPost(); };
 $("pfSubmit").onclick=async()=>{
-  if(!phoneGate()) return;
+  if(!identGate()) return;
   const P=SH.post; if(!P) return; const r=P.rec;
   const err=m=>{ shMsg("pfStat",m,"err"); };
   if(!P.kind) return err("「おすそわけ」か「お店向け」かを選んでください");
@@ -3379,60 +3379,28 @@ async function shSyncAll(){                     // 前回送ったあとに変�
   }catch(e){ return 0; }                         // 送れなかった分は次に開いたときに送り直す
   finally{ syncing=false; }
 }
-/* ---------- 電話番号（SMS）の認証：おすそわけの出品・申し込みの前に1回だけ ----------
-   Supabase の認証で番号を確かめ（phone_change）、phone_verify でアプリ側の「認証済み」にする。
-   1つの番号で1アカウント、日本の携帯（070/080/090）だけ、利用停止した人の番号は使えない（サーバーで確認） */
-const phoneOk = () => SH.profile?.role==="admin" || !SH.requirePhone || !!SH.profile?.phone_verified_at;
+/* ---------- おすそわけの本人の確かめ：会員の申し込みで登録したカード ----------
+   電話番号は預からない。カードの「指紋」（同じカードかどうかだけが分かる番号）を Stripe から受け取ってサーバーで確かめる。
+   管理者の設定（require_card）がオンのときだけ、出品・申し込みの前に求める */
+const identOk = () => SH.profile?.role==="admin" || !SH.requireCard || !!SH.cardOk;
 async function loadSettings(){
   const {data}=await SH.sb.from("app_settings").select("k,v");
-  if(data) SH.requirePhone = data.some(x=>x.k==="require_phone"&&x.v==="on");
+  if(data) SH.requireCard = data.some(x=>x.k==="require_card"&&x.v==="on");
+  SH.cardOk=false;
+  if(SH.requireCard && hasProfile()){ try{ const me=await billMe(); SH.cardOk=!!me?.card_ok; }catch{} }
 }
-const VB = '<span class="vbadge" title="電話番号を認証済み">認証済み</span>';
-function phoneGate(){ if(phoneOk()) return true; phoneDlg(); return false; }
-function phoneUi(){ $("phoneNote").hidden = !hasProfile() || phoneOk(); }
-function toE164(v){ const d=String(v).replace(/[^\d]/g,"").replace(/^81/,"0"); return /^0[789]0\d{8}$/.test(d) ? "+81"+d.slice(1) : null; }
-function phoneErr(e){
-  const m=(e?.message||String(e));
-  if(/already|exists|registered/i.test(m)) return "この電話番号はほかのアカウントで使われています";
-  if(/provider|unsupported|disabled|not enabled/i.test(m)) return "SMS認証の準備がまだです（管理者がSMSの設定をすると使えます）";
-  if(/expired|invalid|token/i.test(m)) return "コードが違うか、有効期限が切れています。もう一度SMSを送ってください";
-  if(/rate|too many|seconds/i.test(m)) return "短い時間に送りすぎました。しばらく待ってからもう一度お試しください";
-  return shErr(e);
+const VB = '<span class="vbadge" title="会員の申し込みでカードを登録した人">カード登録済み</span>';
+function identGate(){
+  if(identOk()) return true;
+  const b=openDlg("おすそわけを使う前に",`<p>おすそわけを安心して使えるように、出品・申し込みは、会員の申し込みでカードを登録した人だけが使えます。</p>
+    <p class="hint">カードの番号はこのアプリには残りません。Stripe から「同じカードかどうか」だけが分かる番号を受け取り、利用を停止した人がアカウントを作り直して戻ってくるのを防ぎます。</p>
+    <div class="actions"><button type="button" class="btn primary" id="igJoin">会員・お支払い…</button><button type="button" class="btn" id="igClose">閉じる</button></div>`);
+  b.querySelector("#igJoin").onclick=()=>billingDlg();
+  b.querySelector("#igClose").onclick=()=>$("dlg").close();
+  return false;
 }
-function phoneDlg(){
-  let phone=null, cool=0, timer=null;
-  const b=openDlg("電話番号の認証",`<p>おすそわけを安心して使えるように、最初の1回だけ携帯電話番号を確かめます。</p>
-    <ul class="hint" style="margin:0 0 8px 1.2em;padding:0"><li>番号はほかの利用者には見えません（「認証済み」の印だけが出ます）</li>
-      <li>1つの番号で認証できるのは1つのアカウントだけです</li><li>日本の携帯電話番号（070・080・090）が使えます。SMSの受信は無料です</li></ul>
-    <div class="row"><label>携帯電話番号<input id="phNum" type="tel" inputmode="tel" autocomplete="tel" placeholder="090-1234-5678"></label><button type="button" class="btn primary" id="phSend">SMSを送る</button></div>
-    <div class="row" id="phCodeRow" hidden style="margin-top:8px"><label>SMSに書かれた6桁のコード<input id="phCode" inputmode="numeric" autocomplete="one-time-code" maxlength="10"></label><button type="button" class="btn primary" id="phOk">確認</button></div>
-    <div class="status" id="phStat"></div>`);
-  const st=(m,c)=>shMsg("phStat",m,c);
-  const tick=()=>{ const n=Math.ceil((cool-Date.now())/1000), btn=$("phSend"); if(!btn) return clearInterval(timer);
-    if(n>0){ btn.disabled=true; btn.textContent=`再送（${n}秒）`; } else { btn.disabled=false; btn.textContent=phone?"もう一度送る":"SMSを送る"; clearInterval(timer); } };
-  b.querySelector("#phSend").onclick=async e=>{
-    phone=toE164($("phNum").value); if(!phone) return st("日本の携帯電話番号（070・080・090で始まる11桁）を入れてください","err");
-    setBusy(e.target,true,"送信中…");
-    const {error}=await SH.sb.auth.updateUser({phone});
-    setBusy(e.target,false);
-    if(error) return st(phoneErr(error),"err");
-    $("phCodeRow").hidden=false; $("phCode").focus(); st("SMSを送りました。届いた6桁のコードを入れてください","ok");
-    cool=Date.now()+60000; clearInterval(timer); timer=setInterval(tick,1000); tick();
-  };
-  b.querySelector("#phOk").onclick=async e=>{
-    const token=$("phCode").value.replace(/\D/g,""); if(token.length<6) return st("6桁のコードを入れてください","err");
-    setBusy(e.target,true,"確認中…");
-    try{
-      const {error}=await SH.sb.auth.verifyOtp({phone,token,type:"phone_change"}); if(error) throw error;
-      const {data,error:e2}=await SH.sb.rpc("phone_verify"); if(e2) throw e2;
-      SH.profile.phone_verified_at=new Date().toISOString(); SH.profile.phone_tail=data?.tail||phone.slice(-4);
-      lsSet("choka-profile",JSON.stringify(SH.profile)); phoneUi();
-      openDlg("電話番号の認証",`<p>認証できました（末尾 ${esc(SH.profile.phone_tail)}）。おすそわけの出品・申し込みができます。</p><div class="actions"><button type="button" class="btn primary" onclick="document.getElementById('dlg').close()">閉じる</button></div>`);
-    }catch(err){ st(phoneErr(err),"err"); }
-    finally{ setBusy(e.target,false); }
-  };
-}
-$("btnPhone").onclick=()=>phoneDlg();
+function identUi(){ $("identNote").hidden = !hasProfile() || identOk(); }
+$("btnIdent").onclick=()=>billingDlg();
 
 /* ---------- PCとスマホの同期（会員）：釣果（写真は除く）と航跡。新しく変えた方を残す ----------
    ・cloud_items に kind/id ごとに1行。消したら deleted=true を送って、ほかの端末でも消す
@@ -3985,8 +3953,8 @@ function squareShrink(file,px){ return new Promise((res,rej)=>{
    ===================================================================== */
 const REF_KEY="choka-ref", BILL={me:null, started:false, price:"150"};
 try{ const r=new URLSearchParams(location.search).get("ref"); if(r) localStorage.setItem(REF_KEY, r.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,12)); }catch{}
-async function billFn(action){
-  const {data,error}=await SH.sb.functions.invoke("billing",{body:{action}});
+async function billFn(action,extra){
+  const {data,error}=await SH.sb.functions.invoke("billing",{body:{action,...(extra||{})}});
   if(error){ let m=error.message; try{ const j=await error.context?.json(); if(j?.error) m=j.error; }catch{}
     if(/Failed to send|FunctionsFetchError|not found|404/i.test(m)) m="お支払いの準備ができていません（管理者が Stripe の設定を終えると使えます）"; throw new Error(m); }
   if(data?.error) throw new Error(data.error);
@@ -4046,7 +4014,7 @@ async function billingDlg(note){
       ${!adm&&!subOn?`<button type="button" class="btn primary" id="blJoin">${me.trial_used?`会員になる（月${esc(price)}円）`:`会員になる（最初の2か月無料・そのあと月${esc(price)}円）`}</button>`:""}
       ${me.has_customer?`<button type="button" class="btn" id="blPortal">支払い方法の変更・解約</button>`:""}
       <button type="button" class="btn" id="blSync">状態を読み直す</button></div>
-    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
+    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。プリペイド式のカードや、ほかのアカウントですでに無料期間を使ったカードでは、無料期間は付かず、すぐお支払いが始まります。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
     <div class="sec-h">紹介</div>
     <p>あなたの紹介コード：<b class="mono" style="font-size:1.25em;letter-spacing:.08em">${esc(me.ref_code)}</b></p>
     <div class="actions" style="justify-content:flex-start;flex-wrap:wrap"><button type="button" class="btn" id="blCopy">紹介のリンクをコピー</button>${navigator.share?`<button type="button" class="btn" id="blShare">紹介のリンクを送る</button>`:""}</div>
@@ -4119,8 +4087,8 @@ async function billAdminLoad(){
   box.innerHTML=`<div class="sec-h">会員の支払いと紹介</div>
     <div class="actions" style="justify-content:flex-start"><button type="button" class="btn sm" data-doc="tokusho">特定商取引法に基づく表記を書く</button><button type="button" class="btn sm" data-doc="terms">利用規約を書く</button><button type="button" class="btn sm" data-doc="privacy">プライバシーポリシーを書く</button></div>
     ${error?`<p class="status err">${esc(shErr(error))}（schema.sql を最新のものにして実行し直してください）</p>`
-    : (data||[]).length?`<div style="overflow-x:auto"><table class="mini"><tr><th>表示名</th><th>状態</th><th>次の日付</th><th>会員の期限</th><th>紹介者</th><th>紹介</th><th>支払い中</th><th>特典</th></tr>
-      ${data.map(r=>`<tr><td>${r.tsunuke?tsuMark()+" ":""}${esc(r.nickname)}</td><td>${esc(ST(r.status))}</td><td>${r.period_end?fmtJ(r.period_end):""}</td><td>${esc(r.member_until||"")}</td><td>${esc(r.referred_by||"")}</td><td class="n">${r.refs_total}</td><td class="n">${r.refs_paying}</td><td class="n">${r.credit_total}か月</td></tr>`).join("")}</table></div>`
+    : (data||[]).length?`<div style="overflow-x:auto"><table class="mini"><tr><th>表示名</th><th>状態</th><th>次の日付</th><th>会員の期限</th><th>紹介者</th><th>紹介</th><th>支払い中</th><th>特典</th><th>カード</th><th>同じカードの人</th></tr>
+      ${data.map(r=>`<tr><td>${r.tsunuke?tsuMark()+" ":""}${esc(r.nickname)}</td><td>${esc(ST(r.status))}</td><td>${r.period_end?fmtJ(r.period_end):""}</td><td>${esc(r.member_until||"")}</td><td>${esc(r.referred_by||"")}</td><td class="n">${r.refs_total}</td><td class="n">${r.refs_paying}</td><td class="n">${r.credit_total}か月</td><td>${esc(({credit:"クレジット",debit:"デビット",prepaid:"プリペイド"})[r.card_funding]||r.card_funding||"")}${r.card_banned?'<span class="st hot">停止のカード</span>':""}</td><td>${esc(r.same_card||"")}</td></tr>`).join("")}</table></div>`
     : `<div class="empty">まだ申し込み・紹介はありません。</div>`}`;
 }
 function profileDlg(){
@@ -4131,7 +4099,6 @@ function profileDlg(){
     <label>表示名（20文字まで）<input id="avNick" maxlength="20" value="${esc(P.nickname)}"></label>
     <label style="margin-top:8px">住んでいる県（「みんな」の新着で、この県の釣果を先に並べます。ほかの人には見えません）<select id="avPref">${prefOptions("選ばない")}</select></label>
     <p class="hint">アイコンと表示名は、投稿・コメント・メッセージで誰でも見られます。正方形に切り抜いて小さくします。人の顔や他人の画像を使うときは許可を取ってください。</p>
-    <p class="hint">電話番号：${P.phone_verified_at?`認証済み（末尾 ${esc(P.phone_tail||"")}）`:"未認証"} <button type="button" class="btn sm" id="avPhone">${P.phone_verified_at?"番号を変える":"認証する"}</button></p>
     <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員${P.tsunuke?"（つ抜け会員 "+tsuMark()+"）":""}`):"無料（コメント・いいね・メッセージができます）"} <button type="button" class="btn sm" id="avBill">会員・お支払い・紹介…</button></p>
     <p class="hint">ログアウトやお店の登録は「おすそわけ」タブから。　アプリの版：${APP_VER}</p>
     <p class="hint">${legalLinks()}</p>
@@ -4143,7 +4110,6 @@ function profileDlg(){
     catch{ shMsg("avStat","画像を読み込めませんでした（HEIC形式はJPEGに変換してください）","err"); } };
   b.querySelector("#avClear").onclick=()=>{ pick=null; clear=true; $("avPrev").innerHTML=avatar(null,$("avNick").value||P.nickname,72); };
   b.querySelector("#avShare").onclick=()=>{ $("dlg").close(); showTab("share"); };
-  b.querySelector("#avPhone").onclick=()=>phoneDlg();
   b.querySelector("#avBill").onclick=()=>billingDlg();
   b.querySelector("#avSave").onclick=async e=>{
     const nick=$("avNick").value.trim(); if(!nick) return shMsg("avStat","表示名を入れてください","err");
@@ -4745,9 +4711,9 @@ async function shAdmin(){
       <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span><span class="st">${{pending:"返事待ち",accepted:"受け渡し待ち",done:"受け渡し済み",declined:"見送り",cancelled:"取り消し"}[d.status]||d.status}</span></div>
       <div class="facts"><span>出品 ${esc(d.owner_name)}</span><span>申込 ${esc(d.shop_name||d.requester_name)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.updated_at)}</span></div>
       <div class="ops"><button type="button" class="btn sm" data-a="athread">メッセージを見る（${d.msg_count}）</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
-    <div class="sec-h">電話番号（SMS）の認証</div>
-    <label class="checks" style="margin:4px 0"><span><input type="checkbox" id="admReqPhone" ${SH.requirePhone?"checked":""}> おすそわけの出品・申し込みに、電話番号の認証を求める</span></label>
-    <p class="hint">Supabase でSMSの送信（Twilio など）を設定し、自分で認証できることを確かめてからオンにしてください。オフのあいだは、認証しなくても使えます（認証した人には「認証済み」の印が出ます）。</p>
+    <div class="sec-h">おすそわけの本人の確かめ</div>
+    <label class="checks" style="margin:4px 0"><span><input type="checkbox" id="admReqCard" ${SH.requireCard?"checked":""}> おすそわけの出品・申し込みに、会員の申し込みで登録したカードを求める</span></label>
+    <p class="hint">オンにすると、Stripe で申し込んだ会員だけが出品・申し込みできます（管理者が「1年間の会員にする」で会員にした人は、カードがないので使えなくなります）。利用を停止した人のカードでは、アカウントを作り直しても会員になれません。登録して14日間のアカウントは、出品と申し込みの数を少なくしています。</p>
     <div class="sec-h">利用者と会員（会員 ${SH.users.filter(u=>u.role==="admin"||(u.member_until&&u.member_until>=todayStr())).length}人／${SH.users.length}人）</div>
     <p class="hint">決済の仕組みを入れるまでは、ここで会員にします。会員は、釣果・航跡の記録、おすそわけ、投稿が使えます。</p>
     <input type="search" id="usrQ" placeholder="表示名・メールアドレスで絞り込み" style="margin-bottom:6px">
@@ -4860,11 +4826,11 @@ async function sharedCsv(who){
 }
 $("adminBox").addEventListener("change",e=>{ if(e.target.id==="scWho") $("scList").innerHTML=sharedRows(e.target.value); });
 $("adminBox").addEventListener("change",async e=>{
-  if(e.target.id!=="admReqPhone") return;
+  if(e.target.id!=="admReqCard") return;
   const on=e.target.checked;
-  const {error}=await SH.sb.from("app_settings").update({v:on?"on":"off",updated_at:new Date().toISOString()}).eq("k","require_phone");
+  const {error}=await SH.sb.from("app_settings").update({v:on?"on":"off",updated_at:new Date().toISOString()}).eq("k","require_card");
   if(error){ e.target.checked=!on; return shMsg("admStat",shErr(error),"err"); }
-  SH.requirePhone=on; phoneUi(); shMsg("admStat",on?"電話番号の認証を求めるようにしました":"電話番号の認証を求めないようにしました","ok");
+  SH.requireCard=on; await loadSettings(); identUi(); shMsg("admStat",on?"おすそわけに、カードの登録を求めるようにしました":"おすそわけに、カードの登録を求めないようにしました","ok");
 });
 $("adminBox").addEventListener("input",e=>{ if(e.target.id==="usrQ") $("usrList").innerHTML=usersHtml(e.target.value.trim()); });
 function usersHtml(q){
@@ -4873,8 +4839,8 @@ function usersHtml(q){
     const mem=u.role==="admin"||(u.member_until&&u.member_until>=todayStr());
     return `<div class="card deal" data-uid="${u.id}"><div>
       <div class="t"><span class="sp">${esc(u.nickname)}</span><span class="st ${mem?"good":""}">${u.role==="admin"?"管理者":mem?`会員（${u.member_until.replace(/-/g,"/")}まで）`:u.member_until?"会員の期限切れ":"無料"}</span>${u.banned?'<span class="st hot">停止中</span>':""}</div>
-      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span><span>電話 ${u.phone_verified_at?`認証済み（末尾${esc(u.phone_tail||"")}）`:"未認証"}</span></div>
-      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.phone_verified_at?`<button type="button" class="btn sm" data-a="phreset">電話の認証を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
+      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span><span>カード ${u.card_ok?"登録済み":"なし"}</span></div>
+      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
     + (rows.length>50?`<p class="hint">ほか${rows.length-50}人（絞り込んでください）</p>`:"") || `<div class="empty">該当する利用者はいません。</div>`;
 }
 $("adminBox").addEventListener("click",async e=>{
@@ -4898,18 +4864,16 @@ $("adminBox").addEventListener("click",async e=>{
   const usr=b.closest("[data-uid]");
   if(usr){
     const a=b.dataset.a, d=new Date(Date.now()+365*86400000);
-    if(a==="phreset"){
-      if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと外す"; return; }
-      const {error}=await SH.sb.rpc("admin_phone_reset",{p_user:usr.dataset.uid});
-      if(error) return shMsg("admStat",shErr(error),"err");
-      shAdmin(); return;
-    }
     const patch = a==="m1y" ? {member_until:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`}
                 : a==="m0" ? {member_until:null} : a==="ban" ? {banned:true} : a==="unban" ? {banned:false} : null;
     if(!patch) return;
     if((a==="m0"||a==="ban") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
     const {error}=await SH.sb.from("profiles").update(patch).eq("id",usr.dataset.uid);
     if(error) return shMsg("admStat",shErr(error),"err");
+    if(a==="ban"){                                     // 利用を停止した人の会員の支払いも止める（それ以上請求しない）
+      try{ await billFn("admin_cancel",{user_id:usr.dataset.uid}); }
+      catch(err){ shAdmin(); return shMsg("admStat","利用は停止しましたが、支払いを止められませんでした（"+err.message+"）。Stripe の画面で購読をキャンセルしてください","err"); }
+    }
     shAdmin(); return;
   }
   if(b.dataset.a==="rdel"){

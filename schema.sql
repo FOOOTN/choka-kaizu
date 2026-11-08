@@ -23,31 +23,52 @@ alter table public.profiles add column if not exists share_catches boolean not n
 alter table public.profiles add column if not exists member_until date;
 -- アイコン（avatars バケットの「利用者ID/ファイル名」）。誰でも見られる
 alter table public.profiles add column if not exists avatar text check (char_length(avatar) <= 200);
--- 電話番号（SMS）の認証。番号そのものは Supabase の認証（auth.users）にだけあり、ここには元に戻せない形（ハッシュ）だけ残す
-alter table public.profiles add column if not exists phone_verified_at timestamptz;
-alter table public.profiles add column if not exists phone_hash text;
-alter table public.profiles add column if not exists phone_tail text check (char_length(phone_tail) <= 4);
-create unique index if not exists profiles_phone_hash_uq on public.profiles(phone_hash) where phone_hash is not null;
+-- 電話番号（SMS）の認証は、2026年11月にやめました（電話番号は預からない）。本人の確かめは、会員の申し込みで登録したカードで行う（13. の card_marks）
+-- 会員の支払いと紹介（くわしくは 13.）。ほかの表示用ビューが使うので、ここで作る
+create table if not exists public.billing (
+  user_id        uuid primary key references public.profiles(id) on delete cascade,
+  ref_code       text not null unique,                        -- 自分の紹介コード
+  referred_by    uuid references public.profiles(id) on delete set null,   -- 紹介してくれた人（1人だけ・あとから変えられない）
+  stripe_customer text unique,
+  sub_id         text,
+  sub_status     text,                                        -- trialing / active / past_due / canceled など（Stripe のまま）
+  period_end     timestamptz,                                 -- 無料期間の終わり、または次の支払い日
+  cancel_at_end  boolean not null default false,              -- 期間の終わりで解約する予定
+  trial_used     boolean not null default false,              -- 無料期間は1人1回
+  first_paid_at  timestamptz,                                 -- 初めて支払った日時（紹介の特典・つ抜けの数え方に使う）
+  ref_rewarded   boolean not null default false,              -- この人を紹介した人に、特典を渡したか
+  credit_pending int not null default 0 check (credit_pending >= 0),   -- 紹介でもらった無料の月のうち、まだ Stripe に渡していない数
+  credit_total   int not null default 0,                      -- 紹介でもらった無料の月の合計
+  updated_at     timestamptz not null default now(),
+  created_at     timestamptz not null default now()
+);
+create index if not exists billing_referred_by_idx on public.billing(referred_by);
+-- 会員の申し込みで登録したカード（Stripe の「指紋」＝同じカードかどうかだけが分かる番号。カード番号そのものではない）と種類
+alter table public.billing add column if not exists card_fp text;
+alter table public.billing add column if not exists card_funding text;          -- credit / debit / prepaid / unknown
+create index if not exists billing_card_fp_idx on public.billing(card_fp);
+-- カードごとの印：無料期間を使ったか（1枚につき1回）・利用停止になったか（作り直しても会員になれない）
+create table if not exists public.card_marks (
+  fp            text primary key,
+  trial_user    uuid references public.profiles(id) on delete set null,
+  trial_at      timestamptz,
+  banned_at     timestamptz,
+  note          text,
+  created_at    timestamptz not null default now()
+);
 -- 住んでいる県（本人だけが見る。「みんな」の新着で、この県の釣果を先に並べる）
 alter table public.profiles add column if not exists home_pref text check (char_length(home_pref) <= 10);
 -- つ抜け会員（紹介した人のうち、支払い中の会員が10人以上）。アイコンに印を付ける。サーバー（決済の受け取り）だけが書き換える
 alter table public.profiles add column if not exists tsunuke boolean not null default false;
--- 利用停止した人の電話番号（ハッシュ）。アカウントを作り直しても認証できない
-create table if not exists public.banned_phones (
-  phone_hash text primary key,
-  note       text,
-  created_at timestamptz not null default now()
-);
--- アプリの設定（誰でも読める・管理者だけが変える）。require_phone：おすそわけに電話番号の認証を求めるか
+-- アプリの設定（誰でも読める・管理者だけが変える）。require_card：おすそわけに、会員の申し込みで登録したカードを求めるか
 create table if not exists public.app_settings (k text primary key, v text not null, updated_at timestamptz not null default now());
-insert into public.app_settings values ('require_phone', 'off', now()) on conflict (k) do nothing;
+insert into public.app_settings values ('require_card', 'off', now()) on conflict (k) do nothing;
 -- アプリの最低限の版。これより古い版の画面には「読み込み直してください」と出す（写真などを古い版で上書きしないため）
 insert into public.app_settings values ('min_app_ver', '2026.11.02.5', now()) on conflict (k) do update set v = excluded.v, updated_at = now();
--- ハッシュ用の秘密の値（画面からは読めない）
+-- 秘密の値（画面からは読めない。今は使っていない）
 create table if not exists public.app_secrets (k text primary key, v text not null);
 create schema if not exists extensions;
 create extension if not exists pgcrypto with schema extensions;
-insert into public.app_secrets values ('phone_salt', encode(extensions.gen_random_bytes(16), 'hex')) on conflict (k) do nothing;
 
 -- お店（魚介類販売業の許可を持つ店。管理者が許可証を確認して承認）
 create table if not exists public.shops (
@@ -380,18 +401,21 @@ language sql stable security definer set search_path = public as $$
   select exists(select 1 from profiles where id = auth.uid() and not banned)
 $$;
 
--- 電話番号の認証が済んでいるか（管理者は不要）
-create or replace function public.phone_ok() returns boolean
+-- 本人の確かめが済んでいるか：会員の申し込みでカードを登録し、そのカードが利用停止になっていない（管理者は不要）
+create or replace function public.ident_ok() returns boolean
+language plpgsql stable security definer set search_path = public as $$
+begin
+  return is_admin()
+      or coalesce((select v from app_settings where k = 'require_card'), 'off') <> 'on'   -- 求めない設定のあいだは全員OK
+      or exists(select 1 from billing b join profiles p on p.id = b.user_id
+                 where b.user_id = auth.uid() and b.card_fp is not null and not p.banned
+                   and not exists(select 1 from card_marks m where m.fp = b.card_fp and m.banned_at is not null));
+end $$;
+-- 登録して14日以内の新しいアカウント（おすそわけの出品・申し込みの数を少なくする。管理者は除く）
+create or replace function public.new_account() returns boolean
 language sql stable security definer set search_path = public as $$
-  select is_admin()
-      or coalesce((select v from app_settings where k = 'require_phone'), 'off') <> 'on'   -- 認証を求めない設定のあいだは全員OK
-      or exists(select 1 from profiles where id = auth.uid() and phone_verified_at is not null and not banned)
+  select exists(select 1 from profiles where id = auth.uid() and role <> 'admin' and created_at > now() - interval '14 days')
 $$;
-create or replace function public.phone_hash_of(p text) returns text
-language sql stable security definer set search_path = public as $$
-  select encode(extensions.digest(regexp_replace(p, '\D', '', 'g') || (select v from app_secrets where k = 'phone_salt'), 'sha256'), 'hex')
-$$;
-revoke execute on function public.phone_hash_of(text) from public, anon, authenticated;
 
 -- 承認済みのお店を持っていればその店のID
 create or replace function public.my_shop() returns uuid
@@ -471,21 +495,17 @@ $$;
 create or replace function public.profiles_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  if tg_op = 'UPDATE' and new.banned and not old.banned and new.phone_hash is not null then
-    -- 利用停止した人の電話番号は、作り直しても認証できないように残す
-    insert into banned_phones(phone_hash, note) values (new.phone_hash, '利用停止：' || new.nickname) on conflict do nothing;
+  if tg_op = 'UPDATE' and new.banned and not old.banned then
+    -- 利用停止した人のカードは、アカウントを作り直しても会員になれないように印を付ける
+    perform card_ban(new.id, '利用停止：' || new.nickname);
   end if;
   if auth.uid() is null or is_admin() then return new; end if;
   if tg_op = 'INSERT' then
     new.id := auth.uid(); new.role := 'user'; new.banned := false; new.member_until := null; new.tsunuke := false;
-    new.phone_verified_at := null; new.phone_hash := null; new.phone_tail := null;
     new.agreed_at := now(); new.created_at := now();
   else
     if new.role is distinct from old.role or new.banned is distinct from old.banned
-       or new.member_until is distinct from old.member_until or new.id <> old.id or new.tsunuke is distinct from old.tsunuke
-       or ((new.phone_verified_at is distinct from old.phone_verified_at or new.phone_hash is distinct from old.phone_hash)
-           and coalesce(current_setting('app.phone_verify', true), '') <> '1')
-       or (new.phone_tail is distinct from old.phone_tail and coalesce(current_setting('app.phone_verify', true), '') <> '1') then
+       or new.member_until is distinct from old.member_until or new.id <> old.id or new.tsunuke is distinct from old.tsunuke then
       raise exception '権限がありません';
     end if;
   end if;
@@ -535,7 +555,7 @@ begin
   if auth.uid() is null then return new; end if;            -- 管理画面からの投入は素通し
   new.owner := auth.uid();
   if not is_member() then raise exception 'おすそわけ・お店向けの出品は会員の機能です'; end if;
-  if not phone_ok() then raise exception '出品の前に、電話番号の認証をしてください'; end if;
+  if not ident_ok() then raise exception '出品の前に、会員の申し込みでカードを登録してください'; end if;
   new.status := 'open'; new.created_at := now();
 
   v_reason := blocked_reason(new.species);
@@ -571,6 +591,7 @@ begin
      where owner = new.owner and kind = 'gift'
        and (created_at at time zone 'Asia/Tokyo')::date = (now() at time zone 'Asia/Tokyo')::date;
     if v_n >= 5 then raise exception 'おすそわけの出品は1日5件までです'; end if;
+    if new_account() and v_n >= 1 then raise exception '登録して14日間は、おすそわけの出品は1日1件までです'; end if;
   else
     new.expires_at := new.caught_at + interval '24 hours';
     select count(*) into v_n from listings
@@ -579,6 +600,7 @@ begin
     if v_n >= 4 then
       raise exception 'お店向けの出品は1か月4件までです（くり返し売ると漁業とみなされるおそれがあるため）';
     end if;
+    if new_account() and v_n >= 1 then raise exception '登録して14日間は、お店向けの出品は1件までです'; end if;
   end if;
 
   if new.expires_at <= now() then raise exception '受付期限を過ぎています（おすそわけは釣った日のうちだけです）'; end if;
@@ -824,7 +846,7 @@ declare
 begin
   if auth.uid() is null then raise exception 'ログインが必要です'; end if;
   if not is_member() then raise exception 'おすそわけへの申し込みは会員の機能です'; end if;
-  if not phone_ok() then raise exception '申し込みの前に、電話番号の認証をしてください'; end if;
+  if not ident_ok() then raise exception '申し込みの前に、会員の申し込みでカードを登録してください'; end if;
   select * into l from listings where id = p_listing for update;
   if not found or l.status <> 'open' or l.expires_at <= now() then raise exception 'この出品は受付を終了しています'; end if;
   if l.owner = auth.uid() then raise exception '自分の出品には申し込めません'; end if;
@@ -837,6 +859,7 @@ begin
      where requester = auth.uid() and status in ('pending','accepted')
        and created_at > now() - interval '24 hours';
     if v_n >= 5 then raise exception 'おすそわけの申し込みは同時に5件までです'; end if;
+    if new_account() and v_n >= 2 then raise exception '登録して14日間は、おすそわけの申し込みは同時に2件までです'; end if;
   end if;
   -- 自分で取り消した申し込みと、ほかの人に決まったため見送りになった申し込みは、申し込み直せる
   select id into v_id from requests where listing_id = p_listing and requester = auth.uid();
@@ -1014,7 +1037,7 @@ select
   l.expires_at, l.created_at,
   p.nickname as owner_name,
   rating_of(l.owner) as owner_rating,
-  (p.phone_verified_at is not null) as owner_verified,
+  exists(select 1 from billing b where b.user_id = l.owner and b.card_fp is not null) as owner_verified,
   (my_shop() is not null and exists(select 1 from wants w where w.shop_id = my_shop() and w.status = 'open'
       and w.until >= (now() at time zone 'Asia/Tokyo')::date and want_matches(w, l))) as matches_my_want,
   l.cancel_reason,
@@ -1054,7 +1077,7 @@ select
   (r.requester = auth.uid() and (r.status = 'cancelled' or (r.status = 'declined' and r.auto_declined))
      and l.status = 'open' and l.expires_at > now()) as can_reapply,
   rating_of(case when l.owner = auth.uid() then r.requester else l.owner end) as other_rating,
-  (case when l.owner = auth.uid() then rp.phone_verified_at else op.phone_verified_at end) is not null as other_verified,
+  exists(select 1 from billing b where b.user_id = (case when l.owner = auth.uid() then r.requester else l.owner end) and b.card_fp is not null) as other_verified,
   exists(select 1 from ratings g where g.request_id = r.id and g.rater = auth.uid()) as my_rated,
   (r.status = 'done' and r.updated_at > now() - interval '30 days') as can_rate
 from public.requests r
@@ -1177,7 +1200,7 @@ where is_admin();
 drop view if exists public.user_cards;
 create view public.user_cards with (security_barrier = true) as
 select p.id, p.nickname, p.role, p.banned, p.member_until, p.created_at, u.email, u.last_sign_in_at,
-       p.phone_verified_at, p.phone_tail,
+       exists(select 1 from billing b where b.user_id = p.id and b.card_fp is not null) as card_ok,
        (select count(*) from posts x where x.owner = p.id) as posts,
        (select count(*) from listings x where x.owner = p.id) as listings
 from public.profiles p join auth.users u on u.id = p.id
@@ -1553,11 +1576,7 @@ drop policy if exists settings_admin on public.app_settings;
 create policy settings_read on public.app_settings for select to anon, authenticated using (true);
 create policy settings_admin on public.app_settings for update to authenticated using (is_admin()) with check (is_admin());
 revoke insert, delete on public.app_settings from anon, authenticated;
-alter table public.banned_phones enable row level security;
-drop policy if exists banned_phones_admin on public.banned_phones;
-create policy banned_phones_admin on public.banned_phones for select to authenticated using (is_admin());
 revoke all on public.app_secrets from anon, authenticated;
-revoke all on public.banned_phones from anon;
 drop policy if exists cloud_select on public.cloud_items;
 drop policy if exists cloud_insert on public.cloud_items;
 drop policy if exists cloud_update on public.cloud_items;
@@ -1581,40 +1600,6 @@ $$;
 revoke execute on function public.my_lost_catches() from public, anon;
 grant execute on function public.my_lost_catches() to authenticated;
 
--- 電話番号の認証を確定する（SMSのコードで Supabase の認証が電話番号を確認したあとに呼ぶ）
-create or replace function public.phone_verify() returns json
-language plpgsql security definer set search_path = public, auth as $$
-declare v_phone text; v_conf timestamptz; v_hash text; v_other uuid;
-begin
-  if auth.uid() is null then raise exception 'ログインが必要です'; end if;
-  if not exists(select 1 from profiles where id = auth.uid() and not banned) then raise exception '表示名の登録が必要です'; end if;
-  select phone, phone_confirmed_at into v_phone, v_conf from auth.users where id = auth.uid();
-  v_phone := regexp_replace(coalesce(v_phone, ''), '\D', '', 'g');
-  if v_phone = '' or v_conf is null then raise exception 'SMSのコードでの確認が済んでいません'; end if;
-  if v_phone !~ '^81[789]0[0-9]{8}$' then raise exception '日本の携帯電話番号（070・080・090）だけ認証できます'; end if;
-  v_hash := phone_hash_of(v_phone);
-  if exists(select 1 from banned_phones where phone_hash = v_hash) then raise exception 'この電話番号では認証できません'; end if;
-  select id into v_other from profiles where phone_hash = v_hash and id <> auth.uid();
-  if v_other is not null then raise exception 'この電話番号はほかのアカウントで使われています'; end if;
-  perform set_config('app.phone_verify', '1', true);       -- この操作の中だけ、認証の欄を書き換えてよい
-  update profiles set phone_verified_at = now(), phone_hash = v_hash, phone_tail = right(v_phone, 4) where id = auth.uid();
-  perform set_config('app.phone_verify', '', true);
-  return json_build_object('tail', right(v_phone, 4));
-end $$;
--- 管理者：認証を外す（番号の使い回し・機種変更で困った人のため）。Supabase 側の電話番号も外す
-create or replace function public.admin_phone_reset(p_user uuid) returns void
-language plpgsql security definer set search_path = public, auth as $$
-begin
-  if not is_admin() then raise exception '権限がありません'; end if;
-  update profiles set phone_verified_at = null, phone_hash = null, phone_tail = null where id = p_user;
-  begin
-    update auth.users set phone = null, phone_confirmed_at = null where id = p_user;
-  exception when others then null;      -- 外せない環境でも、アプリ側の認証は外す
-  end;
-end $$;
--- 管理者：停止した番号の一覧の件数と、全部の解除（誤って停止したとき用。個別にはSQLで）
-revoke execute on function public.phone_verify(), public.admin_phone_reset(uuid) from public, anon;
-grant execute on function public.phone_verify(), public.admin_phone_reset(uuid) to authenticated;
 
 -- 同期の使用量（本人）
 create or replace function public.cloud_usage() returns json
@@ -1836,24 +1821,7 @@ grant  execute on function public.admin_usage() to authenticated;   -- 中で管
 --     ・支払いができなかったら、すぐ会員から外れる（ログインのまま。記録を見ることはできる）
 --     決済の受け取りは Edge Functions（billing・stripe-webhook）が行い、ここの関数を使う
 -- ---------------------------------------------------------------------
-create table if not exists public.billing (
-  user_id        uuid primary key references public.profiles(id) on delete cascade,
-  ref_code       text not null unique,                        -- 自分の紹介コード
-  referred_by    uuid references public.profiles(id) on delete set null,   -- 紹介してくれた人（1人だけ・あとから変えられない）
-  stripe_customer text unique,
-  sub_id         text,
-  sub_status     text,                                        -- trialing / active / past_due / canceled など（Stripe のまま）
-  period_end     timestamptz,                                 -- 無料期間の終わり、または次の支払い日
-  cancel_at_end  boolean not null default false,              -- 期間の終わりで解約する予定
-  trial_used     boolean not null default false,              -- 無料期間は1人1回
-  first_paid_at  timestamptz,                                 -- 初めて支払った日時（紹介の特典・つ抜けの数え方に使う）
-  ref_rewarded   boolean not null default false,              -- この人を紹介した人に、特典を渡したか
-  credit_pending int not null default 0 check (credit_pending >= 0),   -- 紹介でもらった無料の月のうち、まだ Stripe に渡していない数
-  credit_total   int not null default 0,                      -- 紹介でもらった無料の月の合計
-  updated_at     timestamptz not null default now(),
-  created_at     timestamptz not null default now()
-);
-create index if not exists billing_referred_by_idx on public.billing(referred_by);
+-- （表は 1. で作っています）
 alter table public.billing enable row level security;
 drop policy if exists billing_select on public.billing;
 create policy billing_select on public.billing for select to authenticated using (user_id = auth.uid() or is_admin());
@@ -1914,7 +1882,8 @@ begin
     'tsunuke_n', n,
     'tsunuke', (select tsunuke from profiles where id = auth.uid()),
     'member_until', (select member_until from profiles where id = auth.uid()),
-    'price_month', (select v from app_settings where k = 'price_month'));
+    'price_month', (select v from app_settings where k = 'price_month'),
+    'card_ok', b.card_fp is not null, 'card_funding', b.card_funding);
 end $$;
 
 -- 紹介コードを登録（申し込みの前だけ・1回だけ）
@@ -1980,7 +1949,11 @@ begin
     d := ((p->>'period_end')::timestamptz at time zone 'Asia/Tokyo')::date;
     if p->>'status' in ('active', 'trialing') then
       -- 会員の期限：次の支払い日（無料期間の終わり）＋1日（支払いの処理に少し時間がかかるため）
-      update profiles set member_until = greatest(coalesce(member_until, d), d + 1) where id = b.user_id;
+      -- ただし、前の支払い日（無料期間の終わり）から決めた期限なら、新しい日付に置き換える（無料期間がすぐ終わったときなど）
+      update profiles set member_until = case
+          when b.period_end is not null and member_until = ((b.period_end at time zone 'Asia/Tokyo')::date + 1) then d + 1
+          else greatest(coalesce(member_until, d), d + 1) end
+       where id = b.user_id;
     elsif p->>'status' in ('past_due', 'unpaid', 'canceled', 'incomplete_expired', 'paused') then
       -- 支払いができない・解約：会員から外す（ログインのまま。記録は見られる）
       update profiles set member_until = least(coalesce(member_until, current_date - 1), (now() at time zone 'Asia/Tokyo')::date - 1)
@@ -2020,6 +1993,42 @@ language sql stable security definer set search_path = public as $$
   select coalesce((select tsunuke from profiles where id = p_user), false)
 $$;
 
+
+-- カードを記録して、無料期間を付けてよいか・利用停止のカードかを返す（決済の受け取りだけが使う）
+--   banned：利用停止になったカード → 会員にしない（購読をすぐ止める）
+--   trial_ok：無料期間を付けてよい（プリペイドのカードではなく、ほかの人がこのカードで無料期間を使っていない）
+create or replace function public.billing_set_card(p_user uuid, p_fp text, p_funding text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare m card_marks; v_ok boolean;
+begin
+  if p_fp is null or p_fp = '' then return jsonb_build_object('banned', false, 'trial_ok', true); end if;
+  perform billing_ensure(p_user);
+  update billing set card_fp = p_fp, card_funding = p_funding, updated_at = now() where user_id = p_user;
+  insert into card_marks(fp) values (p_fp) on conflict (fp) do nothing;
+  select * into m from card_marks where fp = p_fp;
+  if m.banned_at is not null then return jsonb_build_object('banned', true, 'trial_ok', false); end if;
+  v_ok := coalesce(p_funding, '') <> 'prepaid' and (m.trial_user is null or m.trial_user = p_user);
+  if v_ok and m.trial_user is null then update card_marks set trial_user = p_user, trial_at = now() where fp = p_fp; end if;
+  return jsonb_build_object('banned', false, 'trial_ok', v_ok, 'funding', p_funding);
+end $$;
+-- 利用停止：その人のカードに印を付ける（profiles_guard から呼ぶ）
+create or replace function public.card_ban(p_user uuid, p_note text) returns void
+language plpgsql security definer set search_path = public as $$
+declare v_fp text;
+begin
+  select card_fp into v_fp from billing where user_id = p_user;
+  if v_fp is null then return; end if;
+  insert into card_marks(fp, banned_at, note) values (v_fp, now(), p_note)
+    on conflict (fp) do update set banned_at = coalesce(card_marks.banned_at, now()), note = coalesce(card_marks.note, excluded.note);
+end $$;
+alter table public.card_marks enable row level security;
+drop policy if exists card_marks_admin on public.card_marks;
+create policy card_marks_admin on public.card_marks for select to authenticated using (is_admin());
+revoke all on public.card_marks from anon;
+revoke insert, update, delete on public.card_marks from authenticated;
+revoke execute on function public.billing_set_card(uuid, text, text), public.card_ban(uuid, text) from public, anon, authenticated;
+grant execute on function public.billing_set_card(uuid, text, text) to service_role;
+
 revoke execute on function public.billing_new_code(), public.billing_ensure(uuid), public.billing_paying_refs(uuid),
   public.billing_link_customer(uuid, text), public.billing_take_credit(uuid), public.billing_add_credit(uuid, int),
   public.billing_apply(jsonb), public.billing_tsunuke_of(uuid) from public, anon, authenticated;
@@ -2029,16 +2038,22 @@ revoke execute on function public.billing_me(), public.billing_set_referrer(text
 grant execute on function public.billing_me(), public.billing_set_referrer(text) to authenticated;
 
 -- 管理者：会員の支払いと紹介の一覧
+drop function if exists public.admin_billing();
 create or replace function public.admin_billing() returns table(nickname text, status text, period_end timestamptz, member_until date,
-  referred_by text, refs_total int, refs_paying int, tsunuke boolean, credit_total int, first_paid_at timestamptz)
+  referred_by text, refs_total int, refs_paying int, tsunuke boolean, credit_total int, first_paid_at timestamptz,
+  card_funding text, same_card text, card_banned boolean)
 language plpgsql stable security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception '権限がありません'; end if;
   return query
-  select p.nickname, b.sub_status, b.period_end, p.member_until, (select nickname from profiles x where x.id = b.referred_by),
-         (select count(*)::int from billing y where y.referred_by = b.user_id), billing_paying_refs(b.user_id), p.tsunuke, b.credit_total, b.first_paid_at
+  select p.nickname, b.sub_status, b.period_end, p.member_until, (select x.nickname from profiles x where x.id = b.referred_by),
+         (select count(*)::int from billing y where y.referred_by = b.user_id), billing_paying_refs(b.user_id), p.tsunuke, b.credit_total, b.first_paid_at,
+         b.card_funding,
+         (select string_agg(x.nickname || case when x.banned then '（停止中）' else '' end, '・') from billing z join profiles x on x.id = z.user_id
+           where z.card_fp = b.card_fp and z.user_id <> b.user_id),
+         exists(select 1 from card_marks m where m.fp = b.card_fp and m.banned_at is not null)
     from billing b join profiles p on p.id = b.user_id
-   where b.stripe_customer is not null or b.referred_by is not null or exists(select 1 from billing z where z.referred_by = b.user_id)
+   where b.stripe_customer is not null or b.referred_by is not null or b.card_fp is not null or exists(select 1 from billing z where z.referred_by = b.user_id)
    order by b.updated_at desc limit 500;
 end $$;
 revoke execute on function public.admin_billing() from public, anon;
@@ -2062,6 +2077,28 @@ alter function public.catch_search(text, text, int, int, int) set search_path = 
 alter function public.catch_find(jsonb) set search_path = public;
 alter function public.my_favorites(int, int) set search_path = public;
 revoke execute on function public.is_blocked(uuid, uuid) from public, anon, authenticated;
+revoke execute on function public.ident_ok(), public.new_account() from anon;
+
+-- 電話番号の認証をやめたので、預かっていた電話番号の情報を消す（何度実行しても同じ）
+do $$
+begin
+  begin
+    update auth.users set phone = null, phone_confirmed_at = null, phone_change = '', phone_change_token = '' where phone is not null or phone_change <> '';
+  exception when others then
+    begin update auth.users set phone = null, phone_confirmed_at = null where phone is not null; exception when others then null; end;
+  end;
+end $$;
+drop function if exists public.phone_verify();
+drop function if exists public.admin_phone_reset(uuid);
+drop function if exists public.phone_ok();
+drop function if exists public.phone_hash_of(text);
+drop index if exists public.profiles_phone_hash_uq;
+alter table public.profiles drop column if exists phone_verified_at;
+alter table public.profiles drop column if exists phone_hash;
+alter table public.profiles drop column if exists phone_tail;
+drop table if exists public.banned_phones;
+delete from public.app_secrets where k = 'phone_salt';
+delete from public.app_settings where k = 'require_phone';
 revoke execute on function public.cloud_usage() from public, anon;
 grant  execute on function public.cloud_usage() to authenticated;
 do $$
