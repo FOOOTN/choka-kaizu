@@ -739,7 +739,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
 
       <div id="shNotMember" hidden>
         <div class="rules"><b>おすそわけ・お店向けの取引は、会員の機能です。</b><br>会員になると、釣果・航跡の記録、おすそわけ、写真やブログの投稿が使えます。<br>会員でなくても、「みんな」タブでの閲覧・いいね・コメント・メッセージは使えます。</div>
-        <p class="hint" id="nmInfo">会員は月150円です。はじめて申し込むときは、最初の2か月が無料です。 <button type="button" class="btn sm primary" id="nmJoin">会員になる・くわしく</button></p>
+        <p class="hint" id="nmInfo">会員は月150円です。はじめて申し込むときは、最初の2か月が無料です（プリペイド式のカードなどを除く）。 <button type="button" class="btn sm primary" id="nmJoin">会員になる・くわしく</button></p>
         <div class="shfoot"><span id="nmWho"></span><button type="button" class="btn sm" data-logout>ログアウト</button></div>
       </div>
 
@@ -2659,7 +2659,7 @@ function memberGate(what){
   const b=openDlg(`${what}は会員の機能です`,`<p>会員になると、次の機能が使えます。</p>
     <ul class="mfeat">${MEMBER_FEATURES.map(([t,d])=>`<li${what&&(t.includes(what)||what.includes(t.slice(0,4)))?' class="hit"':""}><b>${t}</b><span>${d}</span></li>`).join("")}</ul>
     <p class="hint">${logged?"会員でなくても、新着の釣果と投稿を見る・いいね・コメント・メッセージは使えます。":"ログイン（無料）すると、いいね・コメント・メッセージが使えます。"}</p>
-    <p class="hint">${logged?`会員は月${esc(BILL.price)}円です。はじめて申し込むときは、最初の2か月が無料です（カードの登録が必要）。`:"会員になるには、ログイン（無料）してから申し込みます。会員の方は、ログインしてください。"}</p>
+    <p class="hint">${logged?`会員は月${esc(BILL.price)}円です。はじめて申し込むときは、最初の2か月が無料です（カードの登録が必要。プリペイド式のカードなどを除く）。`:"会員になるには、ログイン（無料）してから申し込みます。会員の方は、ログインしてください。"}</p>
     <p class="hint">これまでの釣果と航跡は、会員でなくても（支払いが止まっても）「釣果一覧」「航跡」で見られ、バックアップもできます。</p><p class="hint">${legalLinks()}</p>
     <div class="actions">${logged?`<button type="button" class="btn primary" id="gtJoin">会員になる・くわしく</button>`:`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
   b.querySelector("#gtJoin")?.addEventListener("click",()=>billingDlg());
@@ -2679,7 +2679,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.08.2";
+const APP_VER="2026.11.08.3";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -3968,7 +3968,7 @@ async function refAuto(){
     const me=await billMe();
     if(me.can_set_referrer && me.ref_code!==code){
       const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:code});
-      if(!error) alertStatus(`${data}さんの紹介で登録しました（会員に申し込むと、最初の2か月は無料です）`);
+      if(!error) alertStatus(`${data}さんの紹介で登録しました（会員に申し込むと、最初の2か月は無料です（プリペイド式のカードなどを除く））`);
     }
     lsSet(REF_KEY,null);
   }catch{}
@@ -4011,10 +4011,10 @@ async function billingDlg(note){
     <div class="sec-h">いまの状態</div>
     <p>${me.tsunuke?tsuMark()+" ":""}${esc(head)}</p>
     <div class="actions" style="justify-content:flex-start;flex-wrap:wrap">
-      ${!adm&&!subOn?`<button type="button" class="btn primary" id="blJoin">${me.trial_used?`会員になる（月${esc(price)}円）`:`会員になる（最初の2か月無料・そのあと月${esc(price)}円）`}</button>`:""}
+      ${!adm&&!subOn?`<button type="button" class="btn primary" id="blJoin">${me.trial_used?`会員になる（月${esc(price)}円）`:`会員になる（最初の2か月無料※・そのあと月${esc(price)}円）`}</button>`:""}
       ${me.has_customer?`<button type="button" class="btn" id="blPortal">支払い方法の変更・解約</button>`:""}
       <button type="button" class="btn" id="blSync">状態を読み直す</button></div>
-    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。プリペイド式のカードや、ほかのアカウントですでに無料期間を使ったカードでは、無料期間は付かず、すぐお支払いが始まります。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
+    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。<b>※プリペイド式のカードや、ほかのアカウントですでに無料期間を使ったカードでは、無料期間は付かず、すぐお支払いが始まります</b>（支払いの画面には「無料」と出ますが、カードを登録したあとで切り替わります）。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
     <div class="sec-h">紹介</div>
     <p>あなたの紹介コード：<b class="mono" style="font-size:1.25em;letter-spacing:.08em">${esc(me.ref_code)}</b></p>
     <div class="actions" style="justify-content:flex-start;flex-wrap:wrap"><button type="button" class="btn" id="blCopy">紹介のリンクをコピー</button>${navigator.share?`<button type="button" class="btn" id="blShare">紹介のリンクを送る</button>`:""}</div>
@@ -4034,7 +4034,7 @@ async function billingDlg(note){
     try{ await billFn("sync"); }catch(err){ if(!/準備ができていません/.test(err.message)) shMsg("blStat",err.message,"err"); }
     await shRefreshMe(); billingDlg("読み直しました"); };
   box.querySelector("#blCopy").onclick=async()=>{ try{ await navigator.clipboard.writeText(link); shMsg("blStat","紹介のリンクをコピーしました："+link,"ok"); }catch{ shMsg("blStat",link,"ok"); } };
-  box.querySelector("#blShare")?.addEventListener("click",()=>navigator.share({title:"釣果海図ログ",text:"釣った場所を海図に残せるアプリです。このリンクから会員になると、最初の2か月は無料です。",url:link}).catch(()=>{}));
+  box.querySelector("#blShare")?.addEventListener("click",()=>navigator.share({title:"釣果海図ログ",text:"釣った場所を海図に残せるアプリです。このリンクから会員になると、最初の2か月は無料です（プリペイド式のカードなどを除く）。",url:link}).catch(()=>{}));
   box.querySelector("#blSet")?.addEventListener("click",async e=>{
     setBusy(e.target,true,"登録中…");
     const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:$("blCode").value});
