@@ -1,0 +1,4140 @@
+
+"use strict";
+/* ========== 基本ユーティリティ ========== */
+const $ = id => document.getElementById(id);
+const DIR16 = ["北","北北東","北東","東北東","東","東南東","南東","南南東","南","南南西","南西","西南西","西","西北西","北西","北北西"];
+const deg2dir = d => (d==null||isNaN(d)) ? "" : DIR16[Math.round(((d%360)+360)%360/22.5)%16];
+const pad = n => String(n).padStart(2,"0");
+const esc = s => String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num = v => (v===""||v==null) ? null : Number(v);
+
+function toDM(v, pos, neg){                 // 36°48.123′N 形式（海図・GPSプロッタ表記）
+  if(v==null||isNaN(v)) return "—";
+  const h = v>=0?pos:neg, a=Math.abs(v), d=Math.floor(a), m=(a-d)*60;
+  return `${d}°${m.toFixed(3).padStart(6,"0")}′${h}`;
+}
+const fmtPos = (lat,lon) => `${toDM(lat,"N","S")}  ${toDM(lon,"E","W")}`;
+function nowLocal(){ const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+const fmtDT = s => s ? s.replace("T"," ") : "";
+
+/* ========== 月齢と潮名（日本の慣用区分・目安） ========== */
+function moonAge(dateStr){                  // dateStr: "YYYY-MM-DDTHH:mm"（日本時間）
+  const t = new Date(dateStr+":00+09:00").getTime();
+  const ref = Date.UTC(2000,0,6,18,14);     // 基準新月
+  const syn = 29.530588853;
+  let a = ((t-ref)/86400000) % syn; if(a<0) a+=syn;
+  return a;
+}
+function tideName(age){
+  const day = Math.floor(age)+1;            // 旧暦日の近似（1〜30）
+  const map = {1:"大潮",2:"大潮",3:"大潮",4:"中潮",5:"中潮",6:"中潮",7:"中潮",8:"小潮",9:"小潮",10:"小潮",
+    11:"長潮",12:"若潮",13:"中潮",14:"中潮",15:"大潮",16:"大潮",17:"大潮",18:"大潮",19:"中潮",20:"中潮",21:"中潮",22:"中潮",
+    23:"小潮",24:"小潮",25:"小潮",26:"長潮",27:"若潮",28:"中潮",29:"中潮",30:"大潮"};
+  return map[Math.min(day,30)];
+}
+
+/* ========== 保存（IndexedDB） ========== */
+const DB = {
+  db:null,
+  open(){ return new Promise((res,rej)=>{
+    const r = indexedDB.open("choka-kaizu",4);
+    r.onupgradeneeded = () => { const db=r.result;
+      if(!db.objectStoreNames.contains("catches")) db.createObjectStore("catches",{keyPath:"id"});
+      if(!db.objectStoreNames.contains("tracks")) db.createObjectStore("tracks",{keyPath:"id"});
+      if(!db.objectStoreNames.contains("trash")) db.createObjectStore("trash",{keyPath:"id"});      // 削除した釣果（30日とっておく）
+      if(!db.objectStoreNames.contains("hist")) db.createObjectStore("hist",{keyPath:"id"}); };     // 変更の履歴（変更を戻す）
+    r.onsuccess = () => { this.db=r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });},
+  tx(mode,s="catches"){ return this.db.transaction(s,mode).objectStore(s); },
+  all(s){ return new Promise((res,rej)=>{ const r=this.tx("readonly",s).getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
+  put(o,s){ return new Promise((res,rej)=>{ const r=this.tx("readwrite",s).put(o); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); }); },
+  del(id,s){ return new Promise((res,rej)=>{ const r=this.tx("readwrite",s).delete(id); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); }); },
+  get(id,s){ return new Promise((res,rej)=>{ const r=this.tx("readonly",s).get(id); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
+};
+let memStore = null, memTracks = new Map();   // IndexedDBが使えない環境用（保存されない）
+async function loadAll(){ return memStore ? [...memStore.values()] : DB.all("catches"); }
+async function saveRec(o){
+  // 中身が変わるときは、変える前の記録を履歴にとっておく（「変更を戻す」用。どの画面・同期で変わっても）
+  try{ const old=memStore ? memStore.get(o.id) : await DB.get(o.id,"catches");
+    if(old && old!==o && !o.sample && histKey(old)!==histKey(o)) await histPut(old,o); }catch{}
+  if(memStore) memStore.set(o.id,o); else await DB.put(o,"catches"); }
+async function delRec(id,fromCloud){ if(memStore) memStore.delete(id); else await DB.del(id,"catches"); if(!fromCloud) cloudForget("catch",id); }
+/* 削除した釣果の一時保管（この端末・写真も含めて30日） */
+const memTrash=new Map(), TRASH_DAYS=30;
+async function trashPut(r){ if(!r || r.sample) return; const o={...r, deletedAt:new Date().toISOString()};
+  try{ if(memStore) memTrash.set(o.id,o); else await DB.put(o,"trash"); }catch{} }
+async function trashAll(){ let a=[]; try{ a=memStore?[...memTrash.values()]:await DB.all("trash"); }catch{}
+  const lim=new Date(Date.now()-TRASH_DAYS*86400000).toISOString(), keep=[];
+  for(const o of a){ if((o.deletedAt||"")<lim){ try{ memStore?memTrash.delete(o.id):await DB.del(o.id,"trash"); }catch{} } else keep.push(o); }
+  return keep; }
+async function trashDel(id){ try{ memStore?memTrash.delete(id):await DB.del(id,"trash"); }catch{} }
+/* 変更の履歴（この端末・写真も含めて、1件につき直近10回分を90日） */
+const memHist=new Map(), HIST_N=10, HIST_DAYS=90;
+const HIST_SKIP=new Set(["id","updatedAt","feedPost","feedDirty","feedLog","photos","photoDates","photoAt","cloudPhotos","cloudSig","sample"]);
+function histFields(r){ const o={}; for(const k of Object.keys(r||{}).sort()) if(!HIST_SKIP.has(k) && r[k]!=null && r[k]!=="") o[k]=r[k]; return o; }
+const histKey = r => JSON.stringify(histFields(r)) + "#" + photoSig(localPh(r));
+async function histGet(id){ try{ const h=memStore?memHist.get(id):await DB.get(id,"hist"); return h?.list||[]; }catch{ return []; } }
+async function histPut(old,next){
+  const e={at:old.updatedAt||new Date().toISOString(), saved:new Date().toISOString(), rec:{...old}};
+  for(const k of ["feedPost","feedDirty","feedLog"]) delete e.rec[k];
+  if(photoSig(localPh(old))===photoSig(localPh(next))){ delete e.rec.photos; delete e.rec.photoDates; e.samePh=true; }   // 写真が同じなら写真はとらない（容量を節約）
+  const lim=new Date(Date.now()-HIST_DAYS*86400000).toISOString();
+  const list=[e,...(await histGet(old.id))].filter(x=>(x.saved||"")>lim).slice(0,HIST_N);
+  const o={id:old.id,list};
+  if(memStore) memHist.set(old.id,o); else await DB.put(o,"hist");
+}
+/* 履歴の版の写真：写真をとっていない版は、ひとつ新しい版と同じ写真（なければ今の記録の写真） */
+function histPhotos(list,i,cur){ for(let j=i;j>=0;j--) if(!list[j].samePh && list[j].rec) return {photos:list[j].rec.photos||[],photoDates:list[j].rec.photoDates||[]};
+  return {photos:localPh(cur),photoDates:cur.photoDates||[]}; }
+async function loadTrks(){ return memStore ? [...memTracks.values()] : DB.all("tracks"); }
+async function saveTrk(o,fromCloud){ if(!fromCloud) o.updatedAt=new Date().toISOString(); if(memStore) memTracks.set(o.id,o); else await DB.put(o,"tracks"); }
+async function delTrk(id,fromCloud){ if(memStore) memTracks.delete(id); else await DB.del(id,"tracks"); if(!fromCloud) cloudForget("track",id); }
+
+/* ========== 地図 ========== */
+const map = L.map("map",{zoomControl:true}).setView([36.80,137.30],11);
+const gsiAttr = '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">地理院タイル</a>';
+/* 航空写真：沖合で写真のない所（黒い画素・欠けたタイル）を透明にして、
+   下に「粗い航空写真」と「淡色地図」を敷く */
+const PHOTO_URL="https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg";
+const ClearBlackTiles = L.GridLayer.extend({
+  createTile(coords,done){
+    const size=this.getTileSize(), c=document.createElement("canvas");
+    c.width=256; c.height=256; c.style.width=size.x+"px"; c.style.height=size.y+"px";
+    const img=new Image(); img.crossOrigin="anonymous";
+    img.onload=()=>{
+      const ctx=c.getContext("2d"); ctx.drawImage(img,0,0,256,256);
+      try{
+        const d=ctx.getImageData(0,0,256,256), a=d.data;
+        for(let i=0;i<a.length;i+=4) if(a[i]+a[i+1]+a[i+2]<30) a[i+3]=0;
+        ctx.putImageData(d,0,0);
+      }catch{}
+      done(null,c);
+    };
+    img.onerror=()=>done(null,c);           // 写真がないタイルは透明のまま
+    img.src=L.Util.template(PHOTO_URL,{z:coords.z,x:coords.x,y:coords.y});
+    return c;
+  }
+});
+function photoLayer(){
+  return L.layerGroup([
+    L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
+    new ClearBlackTiles({maxZoom:18,maxNativeZoom:12,minZoom:2}),
+    new ClearBlackTiles({maxZoom:18,maxNativeZoom:18,minZoom:13,attribution:gsiAttr}),
+  ]);
+}
+const base = {
+  "淡色地図": L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
+  "標準地図": L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",{maxZoom:18,attribution:gsiAttr}),
+  "航空写真": photoLayer(),
+};
+const seamark = L.tileLayer("https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
+  {maxZoom:18,attribution:'航路標識 © <a href="https://www.openseamap.org" target="_blank" rel="noopener">OpenSeaMap</a>'});
+base["淡色地図"].addTo(map); seamark.addTo(map);
+const catchLayer = L.layerGroup().addTo(map);
+const trackLayer = L.layerGroup().addTo(map);
+const shareLayer = L.layerGroup();            // おすそわけ・お店の出品（そのタブを開いている間だけ表示）
+const postLayer = L.layerGroup();             // みんなの投稿の釣った位置（ログインした人だけ）
+/* ========== 水深（GEBCO 1度区画を必要な分だけ読み込む） ========== */
+const isoRenderer=L.canvas({padding:0.3});
+const isoGroup=L.layerGroup().addTo(map);
+const labelGroup=L.layerGroup();
+const T={index:null,keys:new Set(),res:1/240,size:241,json:new Map(),bin:new Map(),layers:new Map(),data:new Map(),want:new Set(),failed:false};
+const MAJOR=new Set([50,100,200,500,1000,2000,3000,4000,5000,6000,7000,8000,9000]);
+function isoVisible(d,z){ return z>=10 || MAJOR.has(d) || (z>=9 && d<=300); }
+
+/* 等深線の色：地図の種類ごとに記憶（航空写真は黄色、地図は青が初期値） */
+const ISO_PALETTE=[["#2a5d9f","青"],["#ffd23f","黄"],["#ffffff","白"],["#5ce1ff","水色"],["#ff4fa3","桃"],["#16263a","黒"]];
+let baseName="淡色地図";
+map.on("baselayerchange",e=>{ baseName=e.name; applyIsoColor(); });
+function isoColor(){
+  let c=null; try{ c=localStorage.getItem("choka-iso-"+baseName); }catch{}
+  return c || (baseName==="航空写真" ? "#ffd23f" : "#2a5d9f");
+}
+function isLight(hex){ const n=parseInt(hex.slice(1),16); return ((n>>16)*299+((n>>8)&255)*587+(n&255)*114)/1000 > 150; }
+function isoStyle(f){
+  const d=f.properties.d, z=map.getZoom(), show=isoVisible(d,z);
+  return {renderer:isoRenderer,color:isoColor(),weight:show?(d%100===0||d===50?1.6:0.8):0,opacity:show?(d<50?0.7:0.9):0,dashArray:d<50?"4 3":null};
+}
+function applyIsoColor(){
+  for(const l of T.layers.values()) l.setStyle(isoStyle);
+  placeLabels(); drawIsoPicker();
+}
+const isoPick=L.control({position:"topright"});
+isoPick.onAdd=()=>{
+  const d=L.DomUtil.create("div","iso-pick leaflet-bar");
+  L.DomEvent.disableClickPropagation(d); L.DomEvent.disableScrollPropagation(d);
+  d.innerHTML=`<button type="button" class="iso-pick-btn" id="isoPickBtn" title="等深線の色">等深線<span class="sw" id="isoSw"></span></button><div class="iso-pal" id="isoPal" hidden></div>`;
+  return d;
+};
+isoPick.addTo(map);
+function drawIsoPicker(){
+  const c=isoColor(); $("isoSw").style.background=c;
+  $("isoPal").innerHTML=ISO_PALETTE.map(([v,n])=>`<button type="button" data-c="${v}" title="${n}" aria-label="${n}" aria-pressed="${v===c}" style="background:${v}"></button>`).join("");
+}
+document.addEventListener("click",e=>{
+  if(e.target.closest("#isoPickBtn")){ $("isoPal").hidden=!$("isoPal").hidden; return; }
+  const b=e.target.closest("#isoPal button");
+  if(b){ try{ localStorage.setItem("choka-iso-"+baseName,b.dataset.c); }catch{} applyIsoColor(); $("isoPal").hidden=true; }
+});
+
+const isoNote=L.control({position:"bottomleft"});
+isoNote.onAdd=()=>{ const d=L.DomUtil.create("div"); d.id="isoNote"; d.style.cssText="background:rgba(255,255,255,.85);color:#16263a;font-size:11px;padding:2px 6px;border-radius:2px"; return d; };
+isoNote.addTo(map);
+/* 地図の隅に現在地の緯度・経度（押すとそこへ移動） */
+{ const d=document.createElement("div"); d.className="here-box"; d.id="hereBox"; d.setAttribute("role","button"); d.textContent="現在地：取得中…"; d.title="押すと現在地へ移動";
+  document.getElementById("mapwrap").appendChild(d); }
+let hereWatch=null, hereFix=null, hereMarker=null;
+function hereStart(){
+  if(!navigator.geolocation){ $("hereBox").textContent="現在地：この端末では使えません"; return; }
+  if(hereWatch!=null) return;
+  hereWatch=navigator.geolocation.watchPosition(p=>{
+    const c=p.coords; hereFix={lat:c.latitude,lon:c.longitude,acc:c.accuracy};
+    lastGps={lat:c.latitude,lon:c.longitude,t:Date.now()};
+    $("hereBox").innerHTML=`<span class="mono"><span class="ln">${toDM(c.latitude,"N","S")}</span> <span class="ln">${toDM(c.longitude,"E","W")}</span></span><small>${c.accuracy>=1000?`±${(c.accuracy/1000).toFixed(c.accuracy<10000?1:0)}km（おおよそ）`:`±${Math.round(c.accuracy)}m`}</small>`;
+    $("hereBox").title = c.accuracy>=1000 ? "GPSがない機器（PCなど）では、Wi-Fiや回線から推定するため数kmずれます。スマホでは数m〜数十mになります。" : "現在地（押すとこの場所へ移動）";
+    if(!hereMarker) hereMarker=L.circleMarker([c.latitude,c.longitude],{radius:6,color:"#fff",weight:2,fillColor:"#1a73e8",fillOpacity:1,interactive:false}).addTo(map);
+    else hereMarker.setLatLng([c.latitude,c.longitude]);
+  },e=>{ $("hereBox").textContent = e.code===1 ? "現在地：位置情報が許可されていません" : "現在地：取得できません"; },
+  {enableHighAccuracy:true,maximumAge:10000,timeout:30000});
+}
+function hereStop(){ if(hereWatch!=null){ navigator.geolocation.clearWatch(hereWatch); hereWatch=null; } }
+document.addEventListener("visibilitychange",()=>{ document.visibilityState==="visible"?hereStart():hereStop(); });
+document.getElementById("hereBox").addEventListener("click",()=>{ if(hereFix) map.setView([hereFix.lat,hereFix.lon],Math.max(map.getZoom(),13)); });
+const note=t=>{ const el=document.getElementById("isoNote"); if(el){ el.textContent=t; el.hidden=!t; } };
+
+async function loadIndex(){
+  if(T.index||T.failed) return T.index;
+  try{
+    const r=await fetch("tiles/index.json"); if(!r.ok) throw 0;
+    T.index=await r.json(); T.keys=new Set(T.index.tiles); T.res=T.index.res; T.size=T.index.size;
+  }catch{ T.failed=true; note(location.protocol==="file:"?"等深線はWebサーバー経由で開くと表示されます":"等深線データを読み込めませんでした"); }
+  return T.index;
+}
+const tileKey=(lat,lon)=>`${Math.floor(lat)}_${Math.floor(lon)}`;
+function getJson(k){ if(!T.json.has(k)) T.json.set(k,fetch(`tiles/${k}.json`).then(r=>r.ok?r.json():null).catch(()=>null)); return T.json.get(k); }
+function getBin(k){ if(!T.bin.has(k)) T.bin.set(k,fetch(`tiles/${k}.bin`).then(r=>r.ok?r.arrayBuffer():null).then(b=>b?new Int16Array(b):null).catch(()=>null)); return T.bin.get(k); }
+
+async function refreshIso(){
+  if(!map.hasLayer(isoGroup)){ map.removeLayer(labelGroup); note(""); return; }
+  if(!await loadIndex()) return;
+  const z=map.getZoom();
+  if(z<8){ isoGroup.clearLayers(); labelGroup.clearLayers(); T.want=new Set(); note("等深線は拡大すると表示されます"); return; }
+  note("");
+  const b=map.getBounds().pad(0.15), want=new Set();
+  for(let la=Math.floor(b.getSouth()); la<=Math.floor(b.getNorth()); la++)
+    for(let lo=Math.floor(b.getWest()); lo<=Math.floor(b.getEast()); lo++){ const k=`${la}_${lo}`; if(T.keys.has(k)) want.add(k); }
+  if(want.size>30){ note("等深線：表示範囲が広すぎます。もう少し拡大してください"); return; }
+  T.want=want;
+  for(const [k,l] of T.layers){ if(!want.has(k)) isoGroup.removeLayer(l); }
+  for(const k of want){
+    let l=T.layers.get(k);
+    if(!l){
+      const data=await getJson(k); if(!data) continue;
+      for(const f of data.features){                     // 線ごとの範囲（ラベル配置の絞り込み用）
+        let s=90,n=-90,w=180,e=-180; for(const [x,y] of f.geometry.coordinates){ if(y<s)s=y; if(y>n)n=y; if(x<w)w=x; if(x>e)e=x; }
+        f.bbox=[w,s,e,n];
+      }
+      T.data.set(k,data);
+      l=L.geoJSON(data,{style:isoStyle,onEachFeature:(f,x)=>x.bindTooltip(`水深 ${f.properties.d}m`,{sticky:true})});
+      T.layers.set(k,l);
+    } else l.setStyle(isoStyle);
+    if(!isoGroup.hasLayer(l)) isoGroup.addLayer(l);
+  }
+  placeLabels();
+}
+
+/* 数字：いま見えている範囲の線の上に、一定の間隔（画面上の距離）で置き直す */
+function placeLabels(){
+  labelGroup.clearLayers();
+  const z=map.getZoom();
+  if(!map.hasLayer(isoGroup) || z<10){ map.removeLayer(labelGroup); return; }
+  const size=map.getSize(), vb=map.getBounds(), M=24, SP=z>=13?240:300;
+  const c=isoColor(), bg=isLight(c)?"rgba(10,20,30,.72)":"rgba(243,241,232,.88)";
+  let n=0;
+  for(const k of T.want){
+    const data=T.data.get(k); if(!data) continue;
+    for(const f of data.features){
+      const d=f.properties.d; if(!isoVisible(d,z)) continue;
+      const [w,s,e,nn]=f.bbox;
+      if(e<vb.getWest()||w>vb.getEast()||nn<vb.getSouth()||s>vb.getNorth()) continue;
+      let acc=SP*0.5, prev=null;
+      for(const [x,y] of f.geometry.coordinates){
+        const p=map.latLngToContainerPoint([y,x]);
+        if(prev) acc+=p.distanceTo(prev);
+        prev=p;
+        if(acc>=SP && p.x>M && p.y>M && p.x<size.x-M && p.y<size.y-M){
+          L.marker([y,x],{interactive:false,keyboard:false,icon:L.divIcon({className:"",iconSize:[0,0],
+            html:`<span class="iso-label" style="color:${c};background:${bg}">${d}</span>`})}).addTo(labelGroup);
+          acc=0; if(++n>=220) break;
+        }
+      }
+      if(n>=220) break;
+    }
+  }
+  labelGroup.addTo(map);
+}
+let isoTimer=null;
+map.on("moveend zoomend overlayadd overlayremove",()=>{ clearTimeout(isoTimer); isoTimer=setTimeout(refreshIso,150); });
+drawIsoPicker();
+
+/* 推定水深：区画の格子を双線形補間（陸に近い点は海の格子だけで平均）。範囲外は undefined、陸は null */
+async function depthAt(lat,lon){
+  if(!await loadIndex()) return undefined;
+  const k=tileKey(lat,lon); if(!T.keys.has(k)) return undefined;
+  const g=await getBin(k); if(!g) return undefined;
+  const la=Math.floor(lat), lo=Math.floor(lon), n=T.size, res=T.res;
+  const fy=Math.min(Math.max((la+1-lat)/res-0.5,0),n-1.001), fx=Math.min(Math.max((lon-lo)/res-0.5,0),n-1.001);
+  const y0=Math.floor(fy), x0=Math.floor(fx), ty=fy-y0, tx=fx-x0;
+  const pts=[[y0,x0,(1-ty)*(1-tx)],[y0,x0+1,(1-ty)*tx],[y0+1,x0,ty*(1-tx)],[y0+1,x0+1,ty*tx]];
+  let sw=0,sz=0,landW=0;
+  for(const [y,x,w] of pts){ const v=g[y*n+x]; if(v<0) landW+=w; else { sw+=w; sz+=w*v; } }
+  if(sw===0||landW>0.5) return null;
+  return Math.round(sz/sw);
+}
+async function depthText(lat,lon){
+  const z=await depthAt(lat,lon);
+  if(z===undefined) return T.failed?"":"推定水深：データ範囲外";
+  return z==null?"推定水深：陸／岸際":`推定水深 約${z}m（GEBCO・参考）`;
+}
+
+L.control.layers(base,{"等深線（GEBCO）":isoGroup,"航跡":trackLayer,"航路標識（OpenSeaMap）":seamark,"釣果":catchLayer},{collapsed:true}).addTo(map);
+refreshIso();
+L.control.scale({imperial:false,metric:true}).addTo(map);
+map.attributionControl.addAttribution('水深 GEBCO Compilation Group (2026) GEBCO 2026 Grid（参考値・航海用不可）');
+
+const draftIcon = L.divIcon({className:"",html:'<div class="draft-pin"></div>',iconSize:[0,0]});
+let draft = null;
+function setDraft(lat,lon,pan){
+  $("f_lat").value = lat.toFixed(6); $("f_lon").value = lon.toFixed(6);
+  $("posText").textContent = fmtPos(lat,lon);
+  $("posDepth").textContent="";
+  depthAt(lat,lon).then(async z=>{ $("posDepth").textContent=await depthText(lat,lon); $("f_depth").placeholder = z ? `約${z}` : ""; showDepthEst(z); });
+  scheduleWx(false);
+  if(!$("f_pref").dataset.manual){ const k=`${lat},${lon}`; $("f_pref").dataset.for=k;
+    guessPref(lat,lon).then(p=>{ if(!$("f_pref").dataset.manual && $("f_pref").dataset.for===k) $("f_pref").value=p; }); }
+  if(!draft) draft = L.marker([lat,lon],{icon:moveIcon,draggable:true,autoPan:true,zIndexOffset:1000}).addTo(map)
+    .on("drag",e=>{ const p=e.target.getLatLng(); $("posText").textContent=fmtPos(p.lat,p.lng); posMoved(p.lat,p.lng); })
+    .on("dragend",e=>{const p=e.target.getLatLng(); setDraft(p.lat,p.lng,false);});
+  else draft.setLatLng([lat,lon]);
+  posMoved(lat,lon);
+  if(pan) map.panTo([lat,lon]);
+}
+function clearDraft(){ if(draft){ map.removeLayer(draft); draft=null; } }
+/* 編集画面：元の位置からどれだけ動かしたか */
+const FM={id:null,orig:null};
+function posMoved(lat,lon){
+  const o=FM.orig, d=o?haversine(o,[lat,lon]):0;
+  $("posMoved").textContent = o && d>=1 ? `元の位置から ${d<1000?Math.round(d)+"m":(d/1000).toFixed(2)+"km"} 動かしました（保存すると確定）` : "";
+  $("btnPosReset").hidden = !(o && d>=1);
+}
+function formMarkStyle(on){                          // 編集中の記録の元のマークを薄くする
+  const m=FM.id!=null && markers.get(FM.id); if(m) m.setStyle(on?{opacity:.35,fillOpacity:.3}:{opacity:1,fillOpacity:.9});
+}
+$("btnPosReset").onclick=()=>{ if(FM.orig) setDraft(FM.orig[0],FM.orig[1],true); };
+$("btnPosMap").onclick=()=>{
+  const lat=num($("f_lat").value), lon=num($("f_lon").value);
+  if(isPhone()){                                     // スマホは地図を大きくしてから位置へ
+    document.body.classList.add("map-big"); $("btnMapSize").textContent="地図を小さく";
+    $("mapwrap").scrollIntoView({block:"start",behavior:"smooth"});
+    setTimeout(()=>{ map.invalidateSize(); if(lat!=null && lon!=null) map.setView([lat,lon],Math.max(map.getZoom(),14)); },260);
+  } else if(lat!=null && lon!=null) map.setView([lat,lon],Math.max(map.getZoom(),14));
+};
+
+/* ---------- 地図の「見る／登録」切り替え ----------
+   見る：マークを触ると釣果の記録が開く。何もない所を触ると緯度経度と水深だけ出る
+   登録：何もない所を触ると「ここで釣果を登録」が出る（マークを触ったときは記録が開く） */
+let mapMode = (()=>{ try{ return localStorage.getItem("choka-mapmode")==="add"?"add":"view"; }catch{ return "view"; } })();
+const modeCtl=L.control({position:"topleft"});
+modeCtl.onAdd=()=>{
+  const d=L.DomUtil.create("div","mode-ctl leaflet-bar");
+  L.DomEvent.disableClickPropagation(d); L.DomEvent.disableScrollPropagation(d);
+  d.innerHTML=`<button type="button" data-mm="view" title="マークを触って記録を見る">見る</button><button type="button" data-mm="add" title="地図を触った場所で釣果を登録する">登録</button>`;
+  d.addEventListener("click",e=>{ const b=e.target.closest("button[data-mm]"); if(!b) return;
+    if(b.dataset.mm==="add" && !memberGate("釣果の記録")) return;
+    setMapMode(b.dataset.mm); });
+  return d;
+};
+modeCtl.addTo(map);
+function setMapMode(m){
+  mapMode=m; try{ localStorage.setItem("choka-mapmode",m); }catch{}
+  document.querySelectorAll(".mode-ctl button").forEach(b=>b.setAttribute("aria-pressed",String(b.dataset.mm===m)));
+  map.closePopup(); popClosedAt=0; mapHint();
+}
+/* 地図の上の案内（登録フォーム・登録モードのとき） */
+function mapHint(){
+  const el=$("mapmode"), form=!$("viewForm").hidden, share=!$("viewShare").hidden;
+  if(MV.r){ el.hidden=true; return; }
+  if(form){ el.textContent="地図をタップして釣った位置を指定"; el.className="mapmode"; el.hidden=false; return; }
+  if(mapMode==="add" && !share){ el.textContent="登録モード：地図をタップした場所で釣果を登録"; el.className="mapmode add"; el.hidden=false; return; }
+  el.hidden=true;
+}
+let popClosedAt=0;
+map.on("popupclose",()=>{ popClosedAt=Date.now(); });
+
+map.on("click",e=>{
+  if(SH.pick){ setPickup(e.latlng.lat,e.latlng.lng); shPickEnd(true); return; }
+  if(MV.r){ MV.pin.setLatLng(e.latlng); moveInfo(); return; }
+  if(!$("viewForm").hidden){ setDraft(e.latlng.lat,e.latlng.lng,false); return; }
+  if(!$("viewShare").hidden) return;
+  if(Date.now()-popClosedAt<400) return;                 // 開いていた吹き出しを閉じるために触っただけ
+  { const hits=nearMarks(e.containerPoint); if(hits.length){ openNear(hits,e.latlng,mapMode==="add"); return; } }   // 点の近くを触ったら、その記録を開く（登録モードでは登録も選べる）
+  const {lat,lng} = e.latlng, add = mapMode==="add";
+  const el = document.createElement("div");
+  el.className="pop";
+  el.innerHTML = `<div class="coord mono">${fmtPos(lat,lng)}</div><div style="font-size:12px" class="pdepth"></div>`
+    + (add ? `<button class="btn sm primary" style="margin-top:6px">ここで釣果を登録</button>`
+           : `<div class="hint" style="margin:4px 0 0;font-size:11px">釣果を登録するときは、左上の「登録」に切り替えます</div>`);
+  el.querySelector("button")?.addEventListener("click",() => { map.closePopup(); openForm(null,{lat,lon:lng}); });
+  L.popup().setLatLng(e.latlng).setContent(el).openOn(map);
+  depthText(lat,lng).then(t=>{ el.querySelector(".pdepth").textContent=t; });
+});
+
+/* ---------- 釣った場所の県（新着の並び順・絞り込みに使う） ----------
+   陸・港・川・湖は国土地理院の逆ジオコーダで市区町村から決める。海の上は、県の海岸の代表点のうち一番近い県（120km以内）にする */
+const PREFS=["北海道","青森県","岩手県","宮城県","秋田県","山形県","福島県","茨城県","栃木県","群馬県","埼玉県","千葉県","東京都","神奈川県","新潟県","富山県","石川県","福井県","山梨県","長野県","岐阜県","静岡県","愛知県","三重県","滋賀県","京都府","大阪府","兵庫県","奈良県","和歌山県","鳥取県","島根県","岡山県","広島県","山口県","徳島県","香川県","愛媛県","高知県","福岡県","佐賀県","長崎県","熊本県","大分県","宮崎県","鹿児島県","沖縄県"];
+const PREF_PTS={ // 県の番号: [緯度,経度, …]（県庁と海岸の代表点）
+ 1:[43.06,141.35,41.77,140.73,42.98,144.38,45.41,141.67,44.02,144.27,42.32,140.97,43.19,140.99,42.30,143.32,44.35,143.35,43.33,145.58,41.43,140.10,42.64,141.60,43.95,141.64,42.17,139.45],
+ 2:[40.82,140.74,41.29,141.21,40.51,141.49,40.60,140.00,41.15,140.30,40.95,141.37,41.52,140.92],
+ 3:[39.70,141.15,39.64,141.95,39.27,141.89,39.07,141.72,40.19,141.79],
+ 4:[38.27,140.87,38.43,141.30,38.90,141.57,38.32,141.02,37.95,140.92],
+ 5:[39.72,140.10,40.21,140.03,39.39,140.05,39.88,139.85],
+ 6:[38.24,140.36,38.91,139.84,38.72,139.69,39.06,139.88],
+ 7:[37.75,140.47,37.05,140.89,37.83,140.96,37.42,141.03],
+ 8:[36.34,140.45,36.31,140.57,36.79,140.75,35.95,140.65,35.89,140.66],
+ 9:[36.57,139.88],10:[36.39,139.06],11:[35.86,139.65],
+ 12:[35.61,140.12,35.74,140.83,35.15,140.32,34.99,139.86,35.38,139.92,35.53,140.45,35.11,140.10],
+ 13:[35.69,139.69,35.63,139.78,34.75,139.36,33.11,139.79,27.09,142.19,34.20,139.13],
+ 14:[35.45,139.64,35.15,139.62,35.31,139.55,35.25,139.15,35.32,139.40,35.28,139.67],
+ 15:[37.92,139.04,37.37,138.55,37.04,137.86,37.15,138.24,38.08,138.44,38.22,139.48,37.81,138.28],
+ 16:[36.70,137.21,36.86,136.99,36.82,137.41,36.87,137.45,36.95,137.56,36.76,137.34,36.78,137.10],
+ 17:[36.59,136.63,37.39,136.90,37.44,137.26,37.04,136.97,36.30,136.31,36.89,136.78,37.30,137.15,36.41,136.45],
+ 18:[36.06,136.22,35.65,136.06,35.49,135.75,36.22,136.15,35.95,135.97,35.50,135.50],
+ 19:[35.66,138.57],20:[36.65,138.18],21:[35.39,136.72],
+ 22:[34.98,138.38,34.71,137.73,35.10,139.07,34.67,138.94,34.75,138.77,35.02,138.50,34.60,138.22,35.09,138.86,34.97,139.10],
+ 23:[35.18,136.91,34.77,137.39,34.58,137.02,34.70,136.97,34.88,136.83,34.83,137.22],
+ 24:[34.73,136.51,34.97,136.62,34.48,136.84,34.28,136.82,34.07,136.19,33.89,136.10,34.25,136.55],
+ 25:[35.00,135.87,35.30,136.15],
+ 26:[35.02,135.76,35.47,135.39,35.60,134.90,35.54,135.20,35.67,135.28],
+ 27:[34.69,135.52,34.46,135.37,34.32,135.15],
+ 28:[34.69,135.18,34.83,134.69,34.34,134.90,35.65,134.82,35.62,134.45,34.64,134.99,34.24,134.73],
+ 29:[34.69,135.83],
+ 30:[34.23,135.17,33.73,135.38,33.47,135.77,33.72,136.00,33.89,135.15,34.03,135.18],
+ 31:[35.50,134.24,35.54,133.23,35.51,133.78],
+ 32:[35.47,133.05,35.40,132.68,34.90,132.08,34.67,131.84,36.20,133.33,35.56,133.32],
+ 33:[34.66,133.93,34.47,133.80,34.73,134.27,34.50,133.50],
+ 34:[34.40,132.46,34.25,132.57,34.48,133.36,34.34,132.91,34.41,133.20],
+ 35:[34.19,131.47,33.95,130.94,34.41,131.40,34.05,131.81,33.96,132.11,34.17,132.22,34.37,131.18,33.95,131.25],
+ 36:[34.07,134.55,33.92,134.66,33.60,134.35,34.19,134.61],
+ 37:[34.34,134.04,34.29,133.80,34.13,133.66,34.48,134.23],
+ 38:[33.84,132.77,34.07,133.00,33.22,132.56,33.96,133.28,33.46,132.42,32.97,132.57,33.34,132.02],
+ 39:[33.56,133.53,32.72,133.02,33.25,134.18,32.93,132.72,33.39,133.29,33.03,133.05,33.50,133.90],
+ 40:[33.59,130.40,33.88,130.88,33.03,130.45,33.85,130.53,33.60,130.15],
+ 41:[33.25,130.30,33.45,129.97,33.53,129.88,33.15,130.28],
+ 42:[32.75,129.87,33.17,129.72,32.70,128.84,34.20,129.29,34.65,129.47,33.75,129.69,33.37,129.55,32.78,130.36,32.90,129.96,32.61,130.19],
+ 43:[32.79,130.74,32.51,130.60,32.21,130.40,32.46,130.19,32.20,130.03,32.62,130.47],
+ 44:[33.24,131.61,33.28,131.49,32.96,131.90,33.60,131.19,33.56,131.73,33.13,131.80],
+ 45:[31.91,131.42,32.58,131.67,31.58,131.41,32.42,131.62,31.47,131.23],
+ 46:[31.56,130.56,31.27,130.30,31.38,130.85,30.73,131.00,30.34,130.52,28.38,129.49,27.73,128.98,32.03,130.19,31.82,130.30,31.00,130.67,31.82,129.88],
+ 47:[26.21,127.68,26.75,128.18,24.80,125.28,24.34,124.16,26.33,127.80,24.47,123.00]};
+function nearPref(lat,lon){
+  let best=0, bd=Infinity;
+  for(const [k,a] of Object.entries(PREF_PTS)) for(let i=0;i<a.length;i+=2){
+    const d=haversine([lat,lon],[a[i],a[i+1]]); if(d<bd){ bd=d; best=+k; } }
+  return bd<=120000 ? PREFS[best-1] : "";
+}
+const prefCache=new Map();
+async function guessPref(lat,lon){
+  const key=`${lat.toFixed(3)},${lon.toFixed(3)}`;
+  if(prefCache.has(key)) return prefCache.get(key);
+  let p="";
+  try{
+    const ac=new AbortController(), t=setTimeout(()=>ac.abort(),4000);
+    const j=await (await fetch(`https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat=${lat}&lon=${lon}`,{signal:ac.signal})).json();
+    clearTimeout(t);
+    const cd=parseInt(String(j?.results?.muniCd||"").padStart(5,"0").slice(0,2),10);
+    if(cd>=1 && cd<=47) p=PREFS[cd-1];
+  }catch{}
+  if(!p) p=nearPref(lat,lon);
+  prefCache.set(key,p);
+  return p;
+}
+const prefOptions = (first) => `<option value="">${first}</option>`+PREFS.map(p=>`<option>${p}</option>`).join("");
+
+/* 魚種ごとの色（同じ魚種は同じ色） */
+const PAL = ["#a3195b","#1f6f8b","#c4581b","#3b7d3a","#6a3fa0","#b8860b","#2b4c9a","#8b2f2f","#0f7f73","#7a5230"];
+function spColor(s){ let h=0; for(const c of (s||"")) h=(h*31+c.codePointAt(0))>>>0; return PAL[h%PAL.length]; }
+
+/* ========== 状態と描画 ========== */
+let records = [];
+const markers = new Map();
+/* 締めた日時（前の版の「時刻だけ」の記録は、釣った日に当てはめる。釣った時刻より前なら翌日） */
+function fullShime(r){
+  const v=r?.shimeAt; if(!v) return "";
+  if(/^\d{2}:\d{2}$/.test(v) && r.datetime){
+    let d=new Date(`${r.datetime.slice(0,10)}T${v}:00+09:00`).getTime();
+    if(d<new Date(r.datetime+":00+09:00").getTime()-10*60000) d+=86400000;
+    return toLocalInput(d);
+  }
+  return String(v).slice(0,16);
+}
+function toLocalInput(ms){ const d=new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+const localMs = v => v ? new Date(v+":00+09:00").getTime() : NaN;
+const mdhm = v => v ? `${+v.slice(5,7)}/${+v.slice(8,10)} ${v.slice(11,16)}` : "";
+const shimeLine = r => [r.shime, ...(r.treat?String(r.treat).split(","):[]), r.cooling?`保冷：${r.cooling}`:"", fullShime(r)?`${mdhm(fullShime(r))}締め`:""].filter(Boolean).join("・");
+/* 釣った日時と締めた日時の食い違いを調べる */
+function timeProblem(dt,sh){
+  const now=Date.now(), a=localMs(dt), b=localMs(sh);
+  if(!isNaN(a) && a>now+10*60000) return {msg:`釣った日時（${mdhm(dt)}）が未来になっています。`};
+  if(!isNaN(b) && b>now+10*60000) return {msg:`締めた日時（${mdhm(sh)}）が未来になっています。`};
+  if(!isNaN(a) && !isNaN(b) && b<a-10*60000) return {msg:`締めた日時（${mdhm(sh)}）が、釣った日時（${mdhm(dt)}）より前になっています。`, fix:true};
+  return null;
+}
+
+/* この端末の写真が最新か（ほかの端末で差し替えられていないか） */
+/* ---------- 写真の状態（どの写真を見せるかは、すべてここで決める） ----------
+   記録に同期される目印：photoSig（最新の写真の目印。""＝写真なし）・photoAt（写真を変えた日時）・cloudPhotos/cloudSig（写真の同期の写真とその目印）
+   端末だけにあるもの：photos（写真そのもの）。サーバーの新着の写真とその目印は MYP に読み込む
+   local＝この端末の写真が最新／feed・cloud＝最新の写真はサーバーにある／missing＝最新の写真はほかの端末だけ／none＝写真なし */
+function photosCurrent(r){ return r.photoSig===undefined || sigEq(r.photoSig,r.photos); }
+function photoState(r){
+  const local=r.photos||[], f=MYP.get(String(r.id));
+  if(r.photoSig===undefined){                                   // 前の版の記録（目印なし）
+    // 新着に「最新の写真」として載っている写真（目印つき）がこの端末の写真と違えば、新着の写真を出す
+    const fs=knownFeedSig(f);
+    if(local.length && f?.photos?.length && fs && !sigEq(fs,local)) return {kind:"feed",paths:f.photos};
+    if(local.length) return {kind:"local"};
+    if(f?.photos?.length) return {kind:"feed",paths:f.photos};
+    if((r.cloudPhotos||[]).length) return {kind:"cloud",paths:r.cloudPhotos};
+    return {kind:"none"};
+  }
+  if(r.photoSig==="") return {kind:"none"};                     // どこかの端末で写真を全部外した
+  if(sigEq(r.photoSig,local)) return {kind:"local"};
+  if(f?.photos?.length && knownFeedSig(f)===r.photoSig) return {kind:"feed",paths:f.photos};
+  if((r.cloudPhotos||[]).length && knownCloudSig(r)===r.photoSig) return {kind:"cloud",paths:r.cloudPhotos};
+  return {kind:"missing"};
+}
+const localPh = r => photoState(r).kind==="local" ? (r.photos||[]) : [];
+/* ---------- 写真をそろえる：端末・新着・写真の同期で写真が食い違っているとき、正しい写真を選んでもらう ---------- */
+/* サーバーの写真の目印：前の版で載せた写真には目印がないので、一度だけ写真を読み込んで中身から作り、端末に覚えておく */
+const FS_KEY="choka-photosig"; let FSC=null;
+function fsc(){ if(!FSC){ try{ FSC=JSON.parse(lsGet(FS_KEY)||"{}"); }catch{ FSC={}; } } return FSC; }
+function pathsSig(paths){ const c=fsc(), a=(paths||[]).map(p=>c[p]); return a.length && a.every(x=>x!=null) ? a.join("|") : null; }
+const knownFeedSig = f => !f ? null : f.sig!=null ? f.sig : !f.photos.length ? "" : pathsSig(f.photos);
+const knownCloudSig = r => (r.cloudPhotos||[]).length ? (r.cloudSig ?? pathsSig(r.cloudPhotos)) : null;
+const resolving=new Set();
+async function resolveSigs(r){                       // 分からない目印を、写真を読み込んで調べる（記録を開いたときだけ。1回きり）
+  const id=String(r.id); if(resolving.has(id) || !(SH.sb && hasProfile())) return;
+  resolving.add(id);
+  try{
+    const f=MYP.get(id), jobs=[];
+    if(f?.photos?.length && knownFeedSig(f)==null) jobs.push(...f.photos.map(p=>[p,postUrl(p)]));
+    if((r.cloudPhotos||[]).length && knownCloudSig(r)==null){
+      const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600).catch(()=>({data:null}));
+      (data||[]).forEach((x,i)=>{ if(x.signedUrl) jobs.push([r.cloudPhotos[i],x.signedUrl]); });
+    }
+    const c=fsc(), todo=jobs.filter(([p])=>c[p]==null); if(!todo.length) return;
+    for(const [p,u] of todo){ const res=await fetch(u); if(!res.ok) return; c[p]=photoSig([await blobToDataUrl(await res.blob())]); }
+    const keys=Object.keys(c); if(keys.length>3000) for(const k of keys.slice(0,keys.length-3000)) delete c[k];
+    lsSet(FS_KEY,JSON.stringify(c));
+    // 開いている吹き出し・編集画面を出し直す
+    if(curPop?.id===r.id && map.hasLayer(curPop.pop)){ const cur=records.find(x=>x.id===r.id); if(cur) openRecPopup(cur); }
+    if(FM.id===r.id && !$("viewForm").hidden) photoNoteUi();
+    render();
+  }catch{} finally{ resolving.delete(id); }
+}
+function alignOptions(r){                         // 前の版の記録（目印なし）で、端末の写真と新着・写真の同期の写真が違うとき
+  if(r.sample || r.photoSig!==undefined) return [];
+  const local=r.photos||[], f=MYP.get(String(r.id)), o=[["local","この端末の写真を最新にする"]];
+  if(!local.length) return [];
+  const fs=knownFeedSig(f), cs=knownCloudSig(r);
+  if((f?.photos?.length && fs==null) || ((r.cloudPhotos||[]).length && cs==null)) resolveSigs(r);   // 分からないうちは「違う」と言わない
+  if(f?.photos?.length && fs!=null && !sigEq(fs,local)) o.push(["feed","新着に載っている写真にそろえる"]);
+  if((r.cloudPhotos||[]).length && cs!=null && !sigEq(cs,local)) o.push(["cloud","写真の同期の写真（ほかの端末から送った写真）にそろえる"]);
+  return o.length>1 ? o : [];
+}
+async function alignFetch(r,src){                    // 選んだ写真を data URL で
+  if(src==="local") return [...(r.photos||[])];
+  let urls=[];
+  if(src==="feed") urls=(MYP.get(String(r.id))?.photos||[]).map(x=>postUrl(x));
+  else { const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); urls=(data||[]).map(x=>x.signedUrl).filter(Boolean); }
+  const ph=[]; for(const u of urls){ const res=await fetch(u); if(!res.ok) throw new Error("写真を取り込めませんでした"); ph.push(await blobToDataUrl(await res.blob())); }
+  if(!ph.length) throw new Error("写真が見つかりませんでした");
+  return ph;
+}
+async function alignPhotos(r,src){                   // その写真を「最新の写真」にして保存（ほかの端末と新着もこの写真になる）
+  if(!memberGate("釣果の記録")) return false;
+  const ph=await alignFetch(r,src), now=new Date().toISOString();
+  r.photos=ph; r.photoDates=ph.map((_,i)=>src==="local"?(r.photoDates?.[i]??null):null);
+  r.photoSig=photoSig(ph); r.photoAt=now; r.updatedAt=now;
+  if(src==="cloud") r.cloudSig=r.photoSig;
+  await saveRec(r); shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost) await feedPush(r);
+  render(); return true;
+}
+/* 写真の状態（うまく表示されないときに、画面を送ってもらうための表） */
+function photoDiagHtml(r){
+  const st=photoState(r), f=MYP.get(String(r.id)), short=x=>x==null?"—":x===""?"（写真なし）":String(x).slice(0,10);
+  const KIND={local:"この端末の写真（最新）",feed:"新着の写真（サーバー）",cloud:"写真の同期の写真（サーバー）",missing:"最新の写真はほかの端末",none:"写真なし"};
+  const rows=[["アプリの版",APP_VER],["表示している写真",KIND[st.kind]],
+    ["この端末の写真",`${(r.photos||[]).length}枚 ${short(photoSig(r.photos))}`],
+    ["最新の写真の目印",r.photoSig===undefined?"なし（前の版の記録）":`${short(r.photoSig)} ${r.photoAt?fmtJ(r.photoAt):""}`],
+    ["新着の写真",!mypLoaded?"まだ読み込んでいません":f?`${f.photos.length}枚 ${short(f.sig)}`:"新着に載っていません"],
+    ["写真の同期",(r.cloudPhotos||[]).length?`${r.cloudPhotos.length}枚 ${short(r.cloudSig)}`:"なし"],
+    ["同期",SH.foreign?"止まっています（別のアカウントの記録）":cloudOn()?`オン（最後 ${lsGet(clKey("at"))?fmtJ(lsGet(clKey("at"))):"—"}）`:hasProfile()?"オフ（会員でない）":"オフ（ログインしていない）"],
+    ["記録を直した日時",r.updatedAt?fmtJ(r.updatedAt):"—"],
+    ["新着への最後の送信",r.feed?(r.feedLog||"この端末からはまだ送っていません")+(r.feedDirty?"（送り直し待ち）":""):"新着に載せない記録"]];
+  return `<table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
+    ${r.feed && feedOnline()?`<button type="button" class="btn sm" data-a="resend" style="margin-top:4px">新着に送り直す</button>`:""}`;
+}
+function popupHtml(r){
+  const rows = [
+    ["日時", fmtDT(r.datetime)],
+    ["匹数・サイズ", [r.count?`${r.count}匹`:"", r.length?`${r.length}cm`:"", r.weight?`${r.weight}g`:""].filter(Boolean).join(" / ")],
+    ["棚／水深", [r.tana!=null?`${r.tanaRef||""}${r.tana}m`:"", r.depth!=null?`水深${r.depth}m`:""].filter(Boolean).join(" ／ ")],
+    ["釣法", [r.method,r.bait].filter(Boolean).join("・")],
+    ["締め", shimeLine(r)],
+    ["天気・風", [r.weather, r.temp!=null?`${r.temp}℃`:"", r.windDir?`${r.windDir}${r.wind??""}m/s`:""].filter(Boolean).join(" ")],
+    ["波・水温", [r.wave!=null?`${r.wave}m`:"", r.wavePer!=null?`${r.wavePer}s`:"", r.sst!=null?`水温${r.sst}℃`:""].filter(Boolean).join(" ")],
+    ["潮", [r.tideName, r.tideMove, r.moon!=null?`月齢${r.moon}`:""].filter(Boolean).join(" ")],
+    ["メモ", r.memo],
+  ].filter(x=>x[1]);
+  const ph=localPh(r);
+  return `<div class="pop recpop"><h4>${esc(r.species)} ${r.sample?'<span class="tag">例</span>':""}</h4>
+    <div class="coord mono">${fmtPos(r.lat,r.lon)}${r.spot?` ・ ${esc(r.spot)}`:""}</div>
+    ${r.sample?"":`<div class="rec-ops"><button type="button" class="btn sm" data-a="edit">記録を直す</button><button type="button" class="btn sm primary" data-a="move">位置を直す</button><button type="button" class="btn sm" data-a="undo">変更を戻す</button></div>`}
+    ${alignOptions(r).length?`<div class="align"><div>端末によって写真が違います。正しい写真を選ぶと、すべての端末と新着がその写真になります。</div>${alignOptions(r).map(([k,t])=>`<button type="button" class="btn sm" data-align="${k}">${t}</button>`).join("")}</div>`:""}
+    ${r.sample?"":`<details class="phdiag"><summary>写真の状態を調べる</summary>${photoDiagHtml(r)}</details>`}
+    <table>${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
+    ${ph.length>1?`<div class="gal-s">${ph.map((p,i)=>`<img src="${p}" alt="${esc(r.species)}の写真${i+1}">`).join("")}</div>`
+      :ph[0]?`<img src="${ph[0]}" alt="${esc(r.species)}の写真">`:""}
+    ${r.feed?`<div class="feed-on">${r.feedDirty?"「みんな」の新着への反映待ち（電波のよいところで自動で送ります）":`「みんな」の新着に載せています${r.pref?`（${esc(r.pref)}）`:""}`}</div>`:""}</div>`;
+}
+/* マークを触ったとき：登録フォーム中はその位置を指定、それ以外は記録を開く */
+let curPop=null;                                     // 開いている記録の吹き出し
+function openRecPopup(r){
+  const tmp=document.createElement("div"); tmp.innerHTML=popupHtml(r);
+  const el=tmp.firstElementChild;
+  el.style.maxHeight=Math.max(160,map.getSize().y-(isPhone()?130:110))+"px";        // 小さい地図でも吹き出しの中でスクロールできる
+  el.addEventListener("click",async e=>{
+    const al=e.target.closest("button[data-align]");
+    if(al){ setBusy(al,true,"そろえています…");
+      try{ if(await alignPhotos(r,al.dataset.align)){ map.closePopup(); openRecPopup(r); } else setBusy(al,false); }
+      catch(err){ setBusy(al,false); al.insertAdjacentHTML("afterend",`<div class="srv" style="color:#a3195b">${esc(shErr(err))}</div>`); }
+      return; }
+    const a=e.target.closest("button[data-a]")?.dataset.a; if(!a) return;
+    if(a==="resend"){ const b=e.target.closest("button"); setBusy(b,true,"送っています…");
+      await loadMyPhotos(); await feedPush(records.find(x=>x.id===r.id)||r);
+      const cur=records.find(x=>x.id===r.id)||r; map.closePopup(); openRecPopup(cur);
+      const d=document.querySelector(".leaflet-popup .phdiag"); if(d) d.open=true; return; }
+    map.closePopup();
+    if(a==="edit") openForm(r); else if(a==="undo") histDlg(r.id); else moveStart(r);
+  });
+  const pop=L.popup({maxWidth:280,autoPanPaddingTopLeft:[10,isPhone()?84:60]}).setLatLng([r.lat,r.lon]).setContent(el).openOn(map);
+  curPop={id:r.id,pop};
+  const fit=()=>{ if(map.hasLayer(pop)) pop.update(); };              // 写真が読み込まれたら吹き出しの大きさを合わせ直す
+  el.querySelectorAll("img").forEach(i=>i.complete?0:i.addEventListener("load",fit,{once:true}));
+  const pst=photoState(r);
+  if(pst.kind==="missing"){ const n=document.createElement("div"); n.className="srv"; n.textContent="最新の写真は、写真を変えた端末にだけあります（その端末で開くと新着に送られます）"; el.querySelector("table")?.after(n); }
+  if((pst.kind==="feed"||pst.kind==="cloud") && !r.sample){          // 最新の写真がサーバーにある：それを出す
+    remotePhotoUrls(r).then(urls=>{
+      if(!urls.length || !el.isConnected) return;
+      const g=document.createElement("div"); g.className=urls.length>1?"gal-s":"";
+      g.innerHTML=urls.map((u,i)=>`<img src="${esc(u)}" alt="${esc(r.species)}の写真${i+1}">`).join("")+`<div class="srv">写真はサーバーから表示しています（この端末にはありません）</div>`;
+      el.querySelector("table")?.after(g);
+      g.querySelectorAll("img").forEach(i=>i.addEventListener("load",fit,{once:true}));
+    }).catch(()=>{});
+  }
+}
+/* 小さいマークでは Leaflet がマークの中心を返すので、触った所そのものを使う */
+function tapLL(e){ try{ if(e.originalEvent?.clientX!=null) return map.mouseEventToLatLng(e.originalEvent); }catch{} return e.latlng; }
+function onCatchMarker(r,e){
+  const ll=tapLL(e);
+  if(SH.pick){ setPickup(ll.lat,ll.lng); shPickEnd(true); return; }
+  if(MV.r){ MV.pin.setLatLng(ll); moveInfo(); return; }
+  if(!$("viewForm").hidden){ setDraft(ll.lat,ll.lng,false); return; }   // 登録・編集中はマークの上でも触った所が位置になる
+  const hits=nearMarks(e.containerPoint);
+  if(hits.length>1){ openNear(hits,e.latlng); return; }         // 点が重なっているときは選んでもらう
+  openRecPopup(r);
+}
+/* ---------- 指でも点を触りやすく ----------
+   スマホは指で触った所から 30px 以内（PCは 12px）の点を探す。1つならその記録を開き、いくつかあれば一覧から選ぶ */
+const coarse = () => matchMedia("(pointer:coarse)").matches;
+const TAP_R = () => coarse() ? 30 : 12;
+function nearMarks(pt){
+  if(!pt) return [];
+  const R=TAP_R(), out=[];
+  const near=(ll,item)=>{ const q=map.latLngToContainerPoint(ll), d=Math.hypot(q.x-pt.x,q.y-pt.y); if(d<=R) out.push({...item,d}); };
+  // 同じ釣果を2回数えない：自分の釣果は、この端末の記録（くわしい方）だけを出し、新着に載せた分（みんなの印）は数えない
+  const recIds=new Set(), postIds=new Set();
+  if(map.hasLayer(catchLayer)) for(const r of records){ if(markers.has(r.id) && !recIds.has(String(r.id))){ recIds.add(String(r.id)); near([r.lat,r.lon],{r}); } }
+  if(map.hasLayer(postLayer)) for(const l of postLayer.getLayers()){
+    const p=l._post; if(!p || postIds.has(p.id)) continue; postIds.add(p.id);
+    if(p.mine && p.catch_id && recIds.has(String(p.catch_id))) continue;
+    near(l.getLatLng(),{p});
+  }
+  return out.sort((a,b)=>a.d-b.d);
+}
+function openNear(hits,ll,add){
+  if(hits.length===1 && !add){ const h=hits[0]; h.r ? openRecPopup(h.r) : postDetail(h.p.id); return; }
+  const el=document.createElement("div"); el.className="pop near";
+  el.innerHTML=(add?`<button type="button" class="btn sm primary" id="nearAdd" style="width:100%;min-height:40px;margin-bottom:6px">ここで釣果を登録</button>`:"")
+    +`<h4>近くの釣果 ${hits.length}件</h4>`+hits.slice(0,12).map((h,i)=>{
+    const x=h.r||h.p, when=h.r?fmtDT(h.r.datetime):(h.p.caught_at?fmtJ(h.p.caught_at):"");
+    const who=h.p?`・${esc(h.p.owner_name||"")}`:"";
+    return `<button type="button" class="near-i" data-i="${i}"><span class="dot" style="background:${spColor(x.species)}"></span><b>${esc(x.species||"写真")}</b><span>${esc(when)}${who}</span></button>`;
+  }).join("")+(hits.length>12?`<p class="hint" style="margin:4px 0 0">ほか${hits.length-12}件（地図を拡大すると分かれます）</p>`:"");
+  el.addEventListener("click",ev=>{
+    if(ev.target.closest("#nearAdd")){ map.closePopup(); openForm(null,{lat:ll.lat,lon:ll.lng}); return; }
+    const b=ev.target.closest(".near-i"); if(!b) return; const h=hits[+b.dataset.i]; map.closePopup(); h.r?openRecPopup(h.r):postDetail(h.p.id); });
+  L.popup({maxWidth:260,autoPanPaddingTopLeft:[10,isPhone()?84:60]}).setLatLng(ll).setContent(el).openOn(map);
+}
+
+/* ---------- 位置を直す（ピンをつまんでずらす） ---------- */
+const MV={r:null,pin:null};
+const moveIcon=L.divIcon({className:"",html:'<div class="move-pin"><span>つまんで動かす</span></div>',iconSize:[0,0]});
+function moveStart(r){
+  if(r.sample){ openDlg("サンプルの記録","<p>サンプルの位置は直せません。自分の記録で使ってください。</p>"); return; }
+  if(!memberGate("釣果の記録")) return;
+  moveEnd();
+  if(!$("viewForm").hidden) showTab("list");
+  MV.r=r;
+  markers.get(r.id)?.setStyle({opacity:.35,fillOpacity:.3});
+  MV.pin=L.marker([r.lat,r.lon],{icon:moveIcon,draggable:true,autoPan:true,zIndexOffset:1000}).addTo(map);
+  MV.pin.on("drag dragend",moveInfo);
+  $("mvSp").textContent=r.species; $("moveBar").hidden=false;
+  document.body.classList.add("moving"); mapHint();
+  if(isPhone()) $("mapwrap").scrollIntoView({block:"start"});
+  const z=Math.max(map.getZoom(),14);
+  map.setView([r.lat,r.lon],z,{animate:false});
+  setTimeout(()=>{                                   // スマホは地図を大きくしてから、ピンが下の案内に隠れないよう少し上に置く
+    if(!MV.r) return;
+    map.invalidateSize({pan:false});
+    map.setView([r.lat,r.lon],z,{animate:false});
+    map.panBy([0,Math.round($("moveBar").offsetHeight/2)+8],{animate:false});
+  },260);
+  moveInfo();
+}
+let mvT=null;
+function moveInfo(){
+  if(!MV.r) return;
+  const p=MV.pin.getLatLng(), d=haversine([MV.r.lat,MV.r.lon],[p.lat,p.lng]);
+  const base=`${fmtPos(p.lat,p.lng)}　元の位置から ${d<1000?Math.round(d)+"m":(d/1000).toFixed(2)+"km"}`;
+  $("mvInfo").textContent=base;
+  clearTimeout(mvT); mvT=setTimeout(async()=>{ const t=await depthText(p.lat,p.lng); if(MV.r) $("mvInfo").textContent=base+(t?`　${t}`:""); },250);
+}
+function moveEnd(){
+  if(MV.pin) map.removeLayer(MV.pin);
+  if(MV.r) markers.get(MV.r.id)?.setStyle({opacity:1,fillOpacity:.9});
+  const was=!!MV.r;
+  MV.r=null; MV.pin=null; $("moveBar").hidden=true; document.body.classList.remove("moving"); mapHint();
+  if(was) setTimeout(()=>map.invalidateSize(),260);
+}
+$("mvCancel").onclick=()=>{ const r=MV.r; moveEnd(); if(r) openRecPopup(r); };
+$("mvSave").onclick=async()=>{
+  const r=MV.r; if(!r) return;
+  const p=MV.pin.getLatLng();
+  r.lat=+p.lat.toFixed(6); r.lon=+p.lng.toFixed(6); r.updatedAt=new Date().toISOString();
+  if(!r.prefManual){ const pf=await guessPref(r.lat,r.lon); if(pf) r.pref=pf; }
+  await saveRec(r);
+  shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost) feedPush(r);
+  moveEnd(); render(); openRecPopup(r);
+};
+
+function render(){
+  const q = $("filter").value.trim();
+  const list = records.filter(r=>!q || (r.species+r.memo+r.spot+r.bait).includes(q))
+                      .sort((a,b)=>b.datetime.localeCompare(a.datetime));
+  // 地図
+  catchLayer.clearLayers(); markers.clear();
+  for(const r of list){
+    const m = L.circleMarker([r.lat,r.lon],{radius:(coarse()?9:7)+Math.min(6,(r.count||1)-1),color:"#fff",weight:2,fillColor:spColor(r.species),fillOpacity:.9,bubblingMouseEvents:false})
+      .bindTooltip(r.species,{direction:"top",offset:[0,-6]}).on("click",e=>onCatchMarker(r,e));
+    if(MV.r?.id===r.id || (FM.id!=null && FM.id===r.id && !$("viewForm").hidden)) m.setStyle({opacity:.35,fillOpacity:.3});
+    m.addTo(catchLayer); markers.set(r.id,m);
+  }
+  // 集計
+  const total = list.reduce((s,r)=>s+(r.count||1),0);
+  const bySp = {}; list.forEach(r=>bySp[r.species]=(bySp[r.species]||0)+(r.count||1));
+  const top = Object.entries(bySp).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([k,v])=>`${k} ${v}`).join("・");
+  $("summary").textContent = list.length ? `${list.length}件・計${total}匹　${top}` : "";
+  $("sampleBanner").hidden = !records.some(r=>r.sample);
+  // 一覧
+  const box = $("list"); box.innerHTML="";
+  if(!list.length){ box.innerHTML = `<div class="empty">${q?"条件に合う記録はありません。":"まだ記録がありません。<br>地図をタップするか「＋ 登録」から最初の釣果を入れてください。"}</div>`; return; }
+  for(const r of list){
+    const el = document.createElement("div"); el.className="rec"; el.tabIndex=0;
+    const f = [];
+    if(r.tana!=null) f.push(`棚 <b>${esc(r.tanaRef||"")}${r.tana}m</b>`);
+    if(r.depth!=null) f.push(`水深 <b>${r.depth}m</b>`);
+    if(r.shime) f.push(esc([r.shime, ...(r.treat?String(r.treat).split(","):[])].join("・")));
+    if(r.tideName) f.push(`${esc(r.tideName)}${r.tideMove?"・"+esc(r.tideMove):""}`);
+    if(r.wave!=null) f.push(`波 <b>${r.wave}m</b>`);
+    if(r.windDir||r.wind!=null) f.push(`${esc(r.windDir||"")} <b>${r.wind??"-"}m/s</b>`);
+    if(r.sst!=null) f.push(`水温 <b>${r.sst}℃</b>`);
+    const th = recThumbHtml(r); if(th) el.classList.add("hasimg");
+    el.innerHTML = `<span class="dot" style="background:${spColor(r.species)}"></span>
+      <div><div class="t"><span class="sp">${esc(r.species)}</span><span>${r.count||1}匹${r.length?` ・${r.length}cm`:""}</span>
+        ${r.sample?'<span class="tag">例</span>':""}<span class="when">${fmtDT(r.datetime)}</span></div>
+        <div class="facts">${f.join("")?f.map(x=>`<span>${x}</span>`).join(""):""}</div>
+        <div class="facts"><span class="coord">${fmtPos(r.lat,r.lon)}</span>${r.spot?`<span>${esc(r.spot)}</span>`:""}</div>
+        <div class="ops"><button class="btn sm" data-a="edit">編集</button><button class="btn sm danger" data-a="del">削除</button></div></div>${th}`;
+    el.addEventListener("click",async e=>{
+      const a = e.target.dataset?.a;
+      if(a==="edit"){ openForm(r); return; }
+      if(a==="del"){ delConfirm(r); return; }   // 2回続けて触っても消えないよう、確認の画面を出す
+      map.flyTo([r.lat,r.lon],Math.max(map.getZoom(),13),{duration:.6});
+      setTimeout(()=>openRecPopup(r),700);
+      if(isPhone()) $("mapwrap").scrollIntoView({block:"start",behavior:"smooth"});
+    });
+    box.appendChild(el);
+  }
+  observeThumbs();
+}
+
+/* ========== タブとフォーム ========== */
+function showTab(which){
+  const views={list:"viewList",form:"viewForm",track:"viewTrack",share:"viewShare",feed:"viewFeed"}, tabs={list:"tabList",form:"tabForm",track:"tabTrack",share:"tabShare",feed:"tabFeed"};
+  for(const k in views){ $(views[k]).hidden = k!==which; $(tabs[k]).setAttribute("aria-selected", String(k===which)); }
+  const form = which==="form";
+  shPickEnd(); moveEnd();
+  if(!form){ formMarkStyle(false); FM.id=null; FM.orig=null; }
+  document.body.classList.toggle("form-open",form);
+  mapHint();
+  if(!form) clearDraft();
+  if(which==="track") drawTrackList();
+  if(which==="share"){ shareLayer.addTo(map); shOpen(); }
+  else { map.removeLayer(shareLayer); clearPickup(); }
+  if(which==="feed"||which==="share") map.closePopup();
+  if(which==="feed"){ postLayer.addTo(map); feedOpen(); } else map.removeLayer(postLayer);
+  if(isPhone()){                                      // 下の方を見ていたら、タブのすぐ下から表示する
+    const top=$("panel").getBoundingClientRect().top+scrollY;
+    if(scrollY>top) scrollTo({top});
+  }
+  setTimeout(()=>map.invalidateSize(),250);
+}
+const isPhone=()=>matchMedia("(max-width:820px)").matches;
+/* スマホ：地図の大きさを切り替えるボタン */
+const mapSize=L.control({position:"bottomright"});
+mapSize.onAdd=()=>{
+  const d=L.DomUtil.create("div","map-size leaflet-bar");
+  L.DomEvent.disableClickPropagation(d);
+  d.innerHTML=`<button type="button" id="btnMapSize" aria-label="地図を大きくする">地図を大きく</button>`;
+  return d;
+};
+mapSize.addTo(map);
+$("btnMapSize").onclick=()=>{
+  const big=document.body.classList.toggle("map-big");
+  $("btnMapSize").textContent=big?"地図を小さく":"地図を大きく";
+  setTimeout(()=>map.invalidateSize(),250);
+};
+$("tabList").onclick=()=>showTab("list");
+$("tabForm").onclick=()=>openForm(null);
+$("tabTrack").onclick=()=>showTab("track");
+$("tabShare").onclick=()=>showTab("share");
+$("tabFeed").onclick=()=>showTab("feed");
+$("btnNew").onclick=()=>openForm(null);
+$("btnCancel").onclick=()=>showTab("list");
+
+for(const id of ["f_windDir","f_waveDir"]) $(id).innerHTML = `<option value=""></option>`+DIR16.map(d=>`<option>${d}</option>`).join("");
+
+const FIELDS = {species:"f_species",count:"f_count",length:"f_len",weight:"f_wt",method:"f_method",bait:"f_bait",
+  tana:"f_tana",tanaRef:"f_tanaRef",depth:"f_depth",bottom:"f_bottom",echo:"f_echo",drift:"f_drift",
+  shime:"f_shime",treat:"f_treat",cooling:"f_cooling",shimeAt:"f_shimeAt",
+  weather:"f_weather",temp:"f_temp",press:"f_press",windDir:"f_windDir",wind:"f_wind",gust:"f_gust",sst:"f_sst",
+  wave:"f_wave",wavePer:"f_wavePer",waveDir:"f_waveDir",color:"f_color",
+  tideName:"f_tideName",moon:"f_moon",tideMove:"f_tideMove",tideLv:"f_tideLv",high:"f_high",low:"f_low",
+  spot:"f_spot",memo:"f_memo"};
+const NUMERIC = new Set(["count","length","weight","tana","depth","temp","press","wind","gust","sst","wave","wavePer","moon","tideLv"]);
+const WX_KEYS = ["weather","temp","press","windDir","wind","gust","sst","wave","wavePer","waveDir","tideName","moon","tideMove","tideLv","high","low"];
+let photos = [];
+let photoDates = [];                            // 各写真の撮影日時（Exif。なければ null）。出品時の確認に使う
+let isNew = true;
+let photosTouched = false;                       // 編集画面で写真を足したり外したりしたか
+
+/* ---------- 魚種の候補（読みはひらがな。頭文字・途中一致で候補表示） ---------- */
+const SPECIES = [
+  ["ブリ","ぶり"],["ワラサ","わらさ"],["イナダ","いなだ"],["ガンド","がんど"],["フクラギ","ふくらぎ"],["コズクラ","こずくら"],["ツバイソ","つばいそ"],
+  ["ハマチ","はまち"],["メジロ","めじろ"],["ツバス","つばす"],["ヒラマサ","ひらまさ"],["カンパチ","かんぱち"],
+  ["マダイ","まだい たい"],["チダイ","ちだい"],["キダイ（レンコダイ）","きだい れんこだい"],["クロダイ（チヌ）","くろだい ちぬ"],["キチヌ","きちぬ"],
+  ["イシダイ","いしだい"],["イシガキダイ","いしがきだい"],["メジナ（グレ）","めじな ぐれ"],["イサキ","いさき"],
+  ["マアジ","まあじ あじ"],["アジ","あじ"],["マサバ","まさば さば"],["ゴマサバ","ごまさば さば"],["マイワシ","まいわし いわし"],["カタクチイワシ","かたくちいわし いわし"],
+  ["サワラ","さわら"],["サゴシ","さごし"],["タチウオ","たちうお"],["スズキ（シーバス）","すずき しーばす"],["セイゴ","せいご"],["フッコ","ふっこ"],
+  ["ヒラメ","ひらめ"],["マゴチ","まごち こち"],["マコガレイ","まこがれい かれい"],["カレイ","かれい"],["キス","きす"],
+  ["カワハギ","かわはぎ"],["ウマヅラハギ","うまづらはぎ"],["キジハタ（アコウ）","きじはた あこう"],["アカハタ","あかはた"],["オオモンハタ","おおもんはた"],["マハタ","まはた"],["クエ","くえ"],
+  ["カサゴ","かさご がしら"],["メバル","めばる"],["クロソイ","くろそい そい"],["アイナメ","あいなめ"],["ホッケ","ほっけ"],
+  ["アマダイ","あまだい"],["アカムツ（ノドグロ）","あかむつ のどぐろ"],["マダラ","まだら たら"],["メダイ","めだい"],["クロムツ","くろむつ むつ"],["キンメダイ","きんめだい"],
+  ["ハタハタ","はたはた"],["ニギス","にぎす"],["ホウボウ","ほうぼう"],["カナガシラ","かながしら"],["ベラ","べら"],["サヨリ","さより"],["ボラ","ぼら"],
+  ["シイラ","しいら"],["カツオ","かつお"],["キハダ","きはだ まぐろ"],["クロマグロ","くろまぐろ まぐろ"],["ソウダガツオ","そうだがつお"],
+  ["アオリイカ","あおりいか いか"],["スルメイカ","するめいか いか"],["ヤリイカ","やりいか いか"],["ケンサキイカ","けんさきいか まいか いか"],["コウイカ","こういか いか"],["ヒイカ","ひいか いか"],
+  ["マダコ","まだこ たこ"],["ミズダコ","みずだこ たこ"],["ヤナギダコ","やなぎだこ たこ"],
+];
+const kata2hira = s => s.replace(/[ァ-ヶ]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60));
+const normJa = s => kata2hira((s||"").normalize("NFKC").trim().toLowerCase());
+
+function speciesPool(){
+  const pool = new Map(SPECIES.map(([n,k])=>[n,normJa(n)+" "+k]));
+  for(const r of records) if(r.species && !pool.has(r.species)) pool.set(r.species, normJa(r.species));
+  return pool;
+}
+function speciesRank(){                       // 自分の記録で多い順（サンプル除く）
+  const c={}; for(const r of records) if(!r.sample&&r.species) c[r.species]=(c[r.species]||0)+1;
+  return Object.keys(c).sort((a,b)=>c[b]-c[a]);
+}
+function suggestSpecies(){
+  const q=normJa($("f_species").value), box=$("spSuggest");
+  if(!q){ box.hidden=true; return; }
+  const rank=speciesRank(), hits=[];
+  for(const [name,keys] of speciesPool()){
+    const words=keys.split(" ");
+    const score = words.some(w=>w.startsWith(q)) ? 0 : keys.includes(q) ? 1 : -1;
+    if(score>=0) hits.push([name,score,rank.indexOf(name)]);
+  }
+  hits.sort((a,b)=>a[1]-b[1] || (a[2]<0?999:a[2])-(b[2]<0?999:b[2]));
+  const top=hits.slice(0,8);
+  if(!top.length || (top.length===1 && top[0][0]===$("f_species").value)){ box.hidden=true; return; }
+  box.innerHTML=top.map(([n])=>`<button type="button" role="option">${esc(n)}</button>`).join("");
+  box.hidden=false;
+}
+$("f_species").addEventListener("input",suggestSpecies);
+$("f_species").addEventListener("focus",suggestSpecies);
+// 候補を押したとき：指が触れた時点では入力欄から外れないようにして（キーボードが閉じて画面がずれるのを防ぐ）、
+// 指を離した時点で、触れた候補の上なら確定する。確定した直後の「押した」合図は、裏にあるボタンに届かないように捨てる
+let spPickAt=0, spDown=null;
+function spPick(b){ spPickAt=Date.now(); $("f_species").value=b.textContent; $("spSuggest").hidden=true; syncChips(); $("f_species").blur(); }
+$("spSuggest").addEventListener("touchstart",e=>{ const b=e.target.closest("button"); if(!b) return; e.preventDefault(); spDown=b; },{passive:false});
+$("spSuggest").addEventListener("touchend",e=>{
+  const b=spDown; spDown=null; if(!b) return; e.preventDefault();
+  const t=e.changedTouches[0], el=t && document.elementFromPoint(t.clientX,t.clientY);
+  if(el && el.closest("button")===b) spPick(b);                    // 指をずらして離したときは選ばない
+},{passive:false});
+$("spSuggest").addEventListener("touchcancel",()=>{ spDown=null; });
+$("spSuggest").addEventListener("pointerdown",e=>{ if(e.target.closest("button")) e.preventDefault(); });   // マウス：入力欄から外れない
+$("spSuggest").addEventListener("click",e=>{                       // マウス・キーボード
+  const b=e.target.closest("button"); if(!b) return;
+  e.preventDefault(); e.stopPropagation(); if(Date.now()-spPickAt>700) spPick(b);
+});
+document.addEventListener("click",e=>{                             // 候補を選んだ直後に、裏のボタンへ届いた合図は捨てる
+  if(Date.now()-spPickAt<700 && !e.target.closest?.("#spSuggest")){ e.preventDefault(); e.stopPropagation(); }
+},true);
+$("f_species").addEventListener("blur",()=>setTimeout(()=>$("spSuggest").hidden=true,150));
+$("f_species").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); const b=$("spSuggest").querySelector("button"); if(!$("spSuggest").hidden&&b){ $("f_species").value=b.textContent; } $("spSuggest").hidden=true; $("f_species").blur(); syncChips(); } });
+
+function drawSpeciesChips(){
+  let list=speciesRank().slice(0,8);
+  if(list.length<8) for(const d of ["フクラギ","ガンド","ブリ","マダイ","アオリイカ","キジハタ（アコウ）","アジ","カサゴ"]) if(!list.includes(d)&&list.length<8) list.push(d);
+  $("spChips").innerHTML=list.map(n=>`<button type="button" class="chip" data-v="${esc(n)}">${esc(n)}</button>`).join("");
+}
+$("spChips").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return;
+  $("f_species").value=b.dataset.v; $("spSuggest").hidden=true; syncChips(); });
+
+/* ---------- 選択ボタン（data-for の入力欄に値を入れる。もう一度押すと解除。multi は複数選択） ---------- */
+function buildChips(){
+  document.querySelectorAll(".chips[data-values]").forEach(box=>{
+    const vals=box.dataset.values.split(","), labels=(box.dataset.labels||box.dataset.values).split(",");
+    box.innerHTML=vals.map((v,i)=>`<button type="button" class="chip" data-v="${esc(v)}">${esc(labels[i])}</button>`).join("");
+    if(box.id==="depthChips") box.insertAdjacentHTML("afterbegin",`<button type="button" class="chip est" id="depthEst" hidden></button>`);
+  });
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest(".chips[data-for] .chip"); if(!b) return;
+  const box=b.parentElement, inp=$(box.dataset.for);
+  if(box.classList.contains("multi")){
+    const set=new Set(inp.value?inp.value.split(","):[]);
+    set.has(b.dataset.v) ? set.delete(b.dataset.v) : set.add(b.dataset.v);
+    inp.value=box.dataset.values.split(",").filter(v=>set.has(v)).join(",");
+  } else {
+    const seg=box.classList.contains("seg");
+    inp.value = (!seg && inp.value===b.dataset.v) ? "" : b.dataset.v;
+  }
+  if(box.dataset.for==="f_shime" && inp.value && !$("f_shimeAt").value){ $("f_shimeAt").value=$("f_dt").value; $("f_shimeAt").dataset.auto="1"; }
+  if(box.dataset.for==="f_shime") checkTimes();
+  inp.dispatchEvent(new Event("input",{bubbles:true}));
+  syncChips();
+});
+function syncChips(){
+  document.querySelectorAll(".chips[data-for]").forEach(box=>{
+    const v=$(box.dataset.for).value, multi=box.classList.contains("multi"), sel=v?v.split(","):[];
+    box.querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed", String(multi ? sel.includes(c.dataset.v) : (c.dataset.v===v && v!==""))));
+  });
+  const sp=$("f_species").value;
+  $("spChips").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.v===sp)));
+}
+document.addEventListener("input",e=>{ if(e.target.closest("#form")) syncChips(); });
+document.querySelectorAll(".step").forEach(b=>b.onclick=()=>{
+  const inp=$(b.dataset.for); inp.value=Math.max(1,(num(inp.value)||1)+Number(b.dataset.step)); syncChips();
+});
+
+/* ---------- 前回の釣法・仕掛け・ポイント名・締め方を引き継ぐ ---------- */
+function lastRecord(){ return records.filter(r=>!r.sample).sort((a,b)=>(b.updatedAt||"").localeCompare(a.updatedAt||""))[0]; }
+function fillBaitList(){
+  const seen=new Set(); for(const r of records) if(r.bait) seen.add(r.bait);
+  $("baitList").innerHTML=[...seen].slice(0,30).map(b=>`<option value="${esc(b)}">`).join("");
+}
+
+/* ---------- フォームを開く ---------- */
+function resetWx(){ $("wxSum").textContent="位置と日時が決まると自動で入ります"; status(""); lastWxKey=""; }
+function openForm(r, pos, carry){
+  if(!memberGate("釣果の記録")) return;
+  $("form").reset(); photos=[]; photoDates=[]; photosTouched=false; resetWx(); autoStatus("");
+  isNew = !r;
+  formMarkStyle(false); FM.id = r ? r.id : null; FM.orig = r ? [r.lat,r.lon] : null;
+  $("f_id").value = r?.id || "";
+  $("f_tanaRef").value = "底から";
+  for(const id of ["f_shime","f_treat","f_cooling"]) $(id).value = "";   // hidden は reset で消えないため
+  $("f_dt").value = r?.datetime || carry?.datetime || nowLocal();
+  const src = r || carry;
+  if(src) for(const [k,id] of Object.entries(FIELDS)) if(src[k]!=null) $(id).value = src[k];
+  $("f_shimeAt").value = r ? fullShime(r) : ""; delete $("f_shimeAt").dataset.auto;        // 新規・次の1匹は空から（締め方を選ぶと釣った日時が入る）
+  if(!r && !carry){                                  // 新規：前回の釣法・締め方などを引き継ぐ
+    const last=lastRecord();
+    if(last) for(const k of ["method","bait","tanaRef","spot","shime","treat","cooling"]) if(last[k]) $(FIELDS[k]).value=last[k];
+  }
+  if(carry){ $("f_count").value=1; $("f_len").value=""; $("f_wt").value=""; $("f_memo").value=""; }
+  // みんなの新着：新規は前回の選び方、直すときはその記録の設定
+  const fd=feedDefaults();
+  $("feedOpt").hidden=!feedOnline();
+  $("f_feed").checked = r ? r.feed!==false : fd.on;             // これまでの記録（未設定）も載せる
+  $("f_pref").value = r?.pref || carry?.pref || "";
+  if(r?.prefManual || carry?.prefManual) $("f_pref").dataset.manual="1"; else delete $("f_pref").dataset.manual;
+  drawSpeciesChips(); fillBaitList();
+  if(r){ photos=[...localPh(r)]; photoDates=photos.map((_,i)=>r.photoDates?.[i]??null); setDraft(r.lat,r.lon,true); }   // 古い写真は出さない
+  else if(pos) setDraft(pos.lat,pos.lon,false);
+  else {
+    clearDraft(); $("posText").textContent="未指定（地図をタップ／現在地）"; $("posDepth").textContent=""; $("f_depth").placeholder=""; $("depthEst").hidden=true;
+    if(navigator.geolocation && matchMedia("(pointer:coarse)").matches) getGps();   // スマホは自動で現在地
+  }
+  if(!r && !carry) fillTideCalc();
+  if(r || carry) wxSummary();
+  drawPhotos(); syncChips(); checkTimes(); showTab("form"); formMarkStyle(true);
+  $("btnSave").textContent = r ? "変更を保存" : "保存";
+  $("btnSaveNext").hidden = !!r;
+  $("btnUndo").hidden = !r || !!r.sample;
+  if(!r) scheduleWx(false);
+}
+
+function onLatLonInput(){ const a=num($("f_lat").value), b=num($("f_lon").value); if(a!=null&&b!=null&&!isNaN(a)&&!isNaN(b)) setDraft(a,b,true); }
+$("f_lat").addEventListener("change",onLatLonInput); $("f_lon").addEventListener("change",onLatLonInput);
+$("f_pref").innerHTML=prefOptions("（沖合・県が決まらない）");
+$("f_pref").addEventListener("change",()=>{ $("f_pref").dataset.manual="1"; });
+$("f_dt").addEventListener("change",()=>{ fillTideCalc(); scheduleWx(true); checkTimes(); });
+$("f_shimeAt").addEventListener("change",()=>{ delete $("f_shimeAt").dataset.auto; checkTimes(); });
+$("dtQuick").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-m]"); if(!b) return;
+  $("f_dt").value=toLocalInput(Date.now()-b.dataset.m*60000);
+  $("f_dt").dispatchEvent(new Event("change"));
+});
+function checkTimes(){
+  const sh=$("f_shimeAt");                       // 自動で入れた締めた日時は、手で直すまで釣った日時に合わせて動かす
+  if(sh.dataset.auto==="1" && sh.value!==$("f_dt").value) sh.value=$("f_dt").value;
+  const p=timeProblem($("f_dt").value,$("f_shimeAt").value), w=$("timeWarn");
+  if(!p){ w.innerHTML=""; w.className="status"; return true; }
+  w.className="status err";
+  w.innerHTML=esc(p.msg)+(p.fix?` <button type="button" class="btn sm" id="fixDt">釣った日時を${esc(mdhm($("f_shimeAt").value))}に直す</button> <button type="button" class="btn sm" id="fixSh">締めた日時を釣った日時に合わせる</button>`:"");
+  $("fixDt")?.addEventListener("click",()=>{ $("f_dt").value=$("f_shimeAt").value; $("f_dt").dispatchEvent(new Event("change")); });
+  $("fixSh")?.addEventListener("click",()=>{ $("f_shimeAt").value=$("f_dt").value; $("f_shimeAt").dataset.auto="1"; checkTimes(); });
+  return false;
+}
+
+function fillTideCalc(){
+  const dt=$("f_dt").value; if(!dt) return;
+  const age=moonAge(dt); $("f_moon").value=age.toFixed(1); $("f_tideName").value=tideName(age);
+}
+
+let lastGps=null;
+function getGps(){
+  if(lastGps && Date.now()-lastGps.t<20000){ setDraft(lastGps.lat,lastGps.lon,true); return; }
+  if(!navigator.geolocation){ autoStatus("この端末では現在地を取得できません。地図をタップしてください。","err"); return; }
+  $("btnGps").textContent="取得中…";
+  navigator.geolocation.getCurrentPosition(p=>{ lastGps={lat:p.coords.latitude,lon:p.coords.longitude,t:Date.now()}; setDraft(p.coords.latitude,p.coords.longitude,true); $("btnGps").textContent="現在地"; },
+    err=>{ $("btnGps").textContent="現在地"; autoStatus("現在地を取得できませんでした。地図をタップして指定してください。","err"); },
+    {enableHighAccuracy:true,timeout:15000,maximumAge:60000});
+}
+$("btnGps").onclick=getGps;
+function autoStatus(msg,cls){ const s=$("autoStatus"); s.textContent=msg; s.className="status "+(cls||""); }
+
+/* 推定水深のボタン（setDraft から呼ぶ） */
+function showDepthEst(z){
+  const b=$("depthEst"); if(!b) return;
+  if(z){ b.hidden=false; b.dataset.v=String(z); b.textContent=`推定 ${z}`; } else b.hidden=true;
+  syncChips();
+}
+
+/* ---------- 写真：Exif（撮影日時・GPS）を読んでから長辺1280pxに縮小 ---------- */
+function readExif(buf){
+  const v=new DataView(buf);
+  if(v.byteLength<4||v.getUint16(0)!==0xFFD8) return null;
+  let p=2;
+  while(p+4<v.byteLength){
+    const mk=v.getUint16(p), len=v.getUint16(p+2);
+    if(mk===0xFFE1 && v.getUint32(p+4)===0x45786966){ return parseTiff(v,p+10); }
+    if((mk&0xFF00)!==0xFF00||mk===0xFFDA) break;
+    p+=2+len;
+  }
+  return null;
+}
+function parseTiff(v,t){
+  const le=v.getUint16(t)===0x4949;
+  const u16=o=>v.getUint16(t+o,le), u32=o=>v.getUint32(t+o,le);
+  const ifd=o=>{ const n=u16(o), m={}; for(let i=0;i<n;i++){ const e=o+2+i*12; m[u16(e)]={type:u16(e+2),count:u32(e+4),off:e+8}; } return m; };
+  const str=en=>{ const o=en.count>4?u32(en.off):en.off; let s=""; for(let i=0;i<en.count-1;i++) s+=String.fromCharCode(v.getUint8(t+o+i)); return s; };
+  const rats=en=>{ const o=u32(en.off), a=[]; for(let i=0;i<en.count;i++) a.push(u32(o+i*8)/(u32(o+i*8+4)||1)); return a; };
+  const out={};
+  try{
+    const i0=ifd(u32(4));
+    if(i0[0x8769]){ const ex=ifd(u32(i0[0x8769].off)); const d=ex[0x9003]||ex[0x9004]; if(d) out.date=str(d); }
+    if(!out.date && i0[0x0132]) out.date=str(i0[0x0132]);
+    if(i0[0x8825]){
+      const g=ifd(u32(i0[0x8825].off));
+      if(g[2]&&g[4]){
+        const dm=a=>a[0]+a[1]/60+a[2]/3600;
+        let lat=dm(rats(g[2])), lon=dm(rats(g[4]));
+        if(g[1]&&String.fromCharCode(v.getUint8(g[1].off))==="S") lat=-lat;
+        if(g[3]&&String.fromCharCode(v.getUint8(g[3].off))==="W") lon=-lon;
+        if(isFinite(lat)&&isFinite(lon)&&(lat||lon)) { out.lat=lat; out.lon=lon; }
+      }
+    }
+  }catch{}
+  return out;
+}
+const exifToLocal = s => { const m=/^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2})/.exec(s||""); return m?`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}`:null; };
+
+$("f_photo").addEventListener("change",async e=>{
+  const files=[...e.target.files]; e.target.value="";
+  let used=false, sawExif=false, bad=[];
+  for(const f of files){
+    try{
+      const ex=readExif(await f.slice(0,262144).arrayBuffer());
+      const dt=ex?exifToLocal(ex.date):null;
+      if(isNew && !used && ex){
+        const got=[];
+        if(dt){ $("f_dt").value=dt; fillTideCalc(); checkTimes(); got.push("日時"); }
+        if(ex.lat!=null){ setDraft(ex.lat,ex.lon,true); got.push("位置"); }
+        if(got.length){ used=true; sawExif=true; autoStatus(`写真から${got.join("と")}を入れました`,"ok"); scheduleWx(true); }
+      }
+      photos.push(await shrink(f,1280)); photoDates.push(dt); photosTouched=true;
+    }catch{ bad.push(f.name); }
+  }
+  if(bad.length){
+    const heic=bad.some(n=>/\.(heic|heif)$/i.test(n));
+    autoStatus(`${bad.join("、")} を読み込めませんでした。${heic?"HEIC形式（iPhoneの写真）はこのブラウザでは開けません。JPEGに変換するか、スマホから登録してください。":"JPEG・PNG形式の写真を選んでください。"}`,"err");
+  }
+  else if(isNew && !sawExif && files.length) autoStatus("写真に撮影日時・位置の情報がなかったので、今の日時と位置のままです");
+  drawPhotos();
+});
+function shrink(file,max){ return new Promise((res,rej)=>{
+  const img=new Image(), url=URL.createObjectURL(file);
+  img.onload=()=>{ const s=Math.min(1,max/Math.max(img.width,img.height)); const c=document.createElement("canvas");
+    c.width=Math.round(img.width*s); c.height=Math.round(img.height*s); c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+    URL.revokeObjectURL(url); res(c.toDataURL("image/jpeg",0.82)); };
+  img.onerror=rej; img.src=url; });}
+function drawPhotos(){
+  $("photoPrev").innerHTML = photos.map((p,i)=>`<figure><img src="${p}" alt="写真${i+1}"><button type="button" data-i="${i}" aria-label="写真${i+1}を外す">×</button></figure>`).join("");
+  $("photoPrev").querySelectorAll("button").forEach(b=>b.onclick=()=>{photos.splice(+b.dataset.i,1);photoDates.splice(+b.dataset.i,1);photosTouched=true;drawPhotos();});
+  photoNoteUi();
+}
+/* 編集する記録の写真が、この端末にないか古いとき：サーバーの写真を取り込めるようにする */
+/* 別の端末の写真を取り込む：この記録について、新着に載っている写真と写真の同期の写真から、まだ入っていない写真を足す */
+function otherPhUi(){
+  const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
+  $("btnOtherPh").hidden = !r || r.sample;                      // 記録の編集ではいつも出す（写真がない釣果でも）
+}
+$("btnOtherPh").onclick=async e=>{
+  const r=FM.id!=null ? records.find(x=>x.id===FM.id) : null; if(!r) return;
+  if(!(SH.sb && hasProfile())){ autoStatus("別の端末の写真を取り込むには、ログインしてください（ほかの端末で新着に載せた写真か、「写真の同期」で送った写真を取り込めます）"); return; }
+  setBusy(e.target,true,"取り込み中…");
+  try{
+    await loadMyPhotos();                                          // 新着の写真の一覧を最新にしてから探す
+    const urls=(MYP.get(String(r.id))?.photos||[]).map(x=>postUrl(x));
+    if((r.cloudPhotos||[]).length){ const {data}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); urls.push(...(data||[]).map(x=>x.signedUrl).filter(Boolean)); }
+    const have=new Set(photos.map(p=>photoSig([p]))); let n=0;
+    for(const u of urls){
+      if(photos.length>=6) break;
+      const res=await fetch(u); if(!res.ok) continue;
+      const d=await blobToDataUrl(await res.blob()); const k=photoSig([d]);
+      if(have.has(k)) continue; have.add(k); photos.push(d); photoDates.push(null); n++;
+    }
+    if(n){ photosTouched=true; drawPhotos(); autoStatus(`ほかの端末の写真を${n}枚取り込みました。「変更を保存」で確定します`,"ok"); }
+    else autoStatus(urls.length ? "足せる写真はありませんでした（同じ写真はすでに入っています）"
+      : "この釣果の写真は、まだサーバーにありません。写真がある端末でこの釣果を開いて新着に載せるか、「釣果一覧」の「写真の同期…」で送ってから、もう一度押してください");
+  }catch(err){ autoStatus("写真を取り込めませんでした："+shErr(err),"err"); }
+  finally{ setBusy(e.target,false); }
+};
+function photoNoteUi(){
+  otherPhUi();
+  const el=$("photoNote"), r=FM.id!=null ? records.find(x=>x.id===FM.id) : null;
+  const st=r ? photoState(r) : null;
+  const opts=r && !photosTouched ? alignOptions(r) : [];
+  if(opts.length){
+    el.hidden=false;
+    el.innerHTML=`端末によって写真が違います。正しい写真を選んで「変更を保存」してください。<span style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${opts.map(([k,t])=>`<button type="button" class="btn sm" data-alignf="${k}">${t}</button>`).join("")}</span>`;
+    el.querySelectorAll("button[data-alignf]").forEach(btn=>btn.onclick=async()=>{
+      setBusy(btn,true,"取り込み中…");
+      try{ const ph=await alignFetch(r,btn.dataset.alignf); photos=ph; photoDates=ph.map(()=>null); photosTouched=true; drawPhotos();
+        el.hidden=false; el.textContent="写真を選びました。「変更を保存」で確定すると、すべての端末と新着がこの写真になります。"; }
+      catch(err){ setBusy(btn,false); autoStatus(shErr(err),"err"); } });
+    return;
+  }
+  if(!r || photosTouched || st.kind==="local" || st.kind==="none"){ el.hidden=true; return; }
+  el.hidden=false;
+  const rm=`<button type="button" class="btn sm danger" id="btnDropPh">写真を外す（どの端末でも写真なしにする）</button>`;
+  if(st.kind==="missing"){ el.innerHTML=`この記録の最新の写真は、写真を変えた端末にだけあります。このまま保存しても写真は変わりません（ここで写真を選ぶと、その写真に差し替わります）。 ${rm}`; }
+  else el.innerHTML=`この記録の写真はサーバーにあります。このまま保存しても写真は変わりません。 <button type="button" class="btn sm" id="btnPullPh">写真をこの端末に取り込む</button> ${rm}`;
+  $("btnDropPh").onclick=()=>{ photos=[]; photoDates=[]; photosTouched=true; drawPhotos(); autoStatus("写真を外しました。「変更を保存」で確定します","ok"); };
+  if(!$("btnPullPh")) return;
+  $("btnPullPh").onclick=async e=>{ setBusy(e.target,true,"取り込み中…");
+    try{ if(await pullPhotos(r)){ photos=[...r.photos]; photoDates=photos.map((_,i)=>r.photoDates?.[i]??null); drawPhotos(); render(); } }
+    catch(err){ autoStatus("写真を取り込めませんでした："+shErr(err),"err"); }
+    finally{ if($("btnPullPh")) setBusy($("btnPullPh"),false); } };
+}
+
+/* ---------- 保存 ---------- */
+async function saveForm(next){
+  const lat=num($("f_lat").value), lon=num($("f_lon").value);
+  if(lat==null||lon==null){ autoStatus("位置が未指定です。地図をタップするか「現在地」を押してください。","err"); $("autoStatus").scrollIntoView({block:"center"}); return; }
+  if(!checkTimes()){ $("timeWarn").scrollIntoView({block:"center"}); return; }
+  const id = $("f_id").value || (Date.now().toString(36)+Math.random().toString(36).slice(2,7));
+  const r = {id,lat,lon,datetime:$("f_dt").value,photos,photoDates,updatedAt:new Date().toISOString()};
+  for(const [k,fid] of Object.entries(FIELDS)){ const v=$(fid).value.trim(); r[k] = NUMERIC.has(k)?num(v):(v||null); }
+  r.species = r.species || "不明";
+  const old = records.find(x=>x.id===id);
+  if(photosTouched || !old){                                      // 写真を変えたときだけ「最新の写真」の目印と日時を更新（同期される）
+    r.photoSig=photoSig(photos); r.photoAt=new Date().toISOString();
+    if(old?.cloudPhotos?.length && cloudOn()) SH.sb.storage.from("cloud").remove(old.cloudPhotos).then(()=>{},()=>{});   // 古い写真の同期分は消す
+  } else {
+    for(const k of ["photoSig","photoAt","cloudPhotos","cloudSig"]) if(old[k]!==undefined) r[k]=old[k];
+    if(!photos.length && (old.photos||[]).length && !localPh(old).length){ r.photos=old.photos; r.photoDates=old.photoDates; }   // 古い写真も端末には残す（表示はしない）
+  }
+  if(!$("feedOpt").hidden){
+    r.feed=$("f_feed").checked;
+    if(!old) lsSet("choka-feed-def",JSON.stringify({on:r.feed}));
+  } else if(old){ r.feed=old.feed; }
+  r.pref=$("f_pref").value||null; if($("f_pref").dataset.manual) r.prefManual=true;
+  if(old?.feedPost) r.feedPost=old.feedPost;
+  await saveRec(r);
+  shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost||old?.feed) feedPush(r);
+  records = records.filter(x=>x.id!==id).concat(r);
+  render();
+  if(next){                                           // 同じ場所・時刻・条件で次の1匹
+    openForm(null,{lat,lon},r);
+    autoStatus(`${r.species}を保存しました。続けて入力できます`,"ok");
+    $("viewForm").scrollTop=0;
+    if(isPhone()) scrollTo({top:0});
+  } else { showTab("list"); openRecPopup(r); }
+}
+$("form").addEventListener("submit",e=>{ e.preventDefault(); saveForm(false); });
+$("btnSaveNext").onclick=()=>{ if(!$("f_species").value.trim()){ $("f_species").focus(); return; } saveForm(true); };
+
+function status(msg,cls){ const s=$("fetchStatus"); s.textContent=msg; s.className="status "+(cls||""); }
+function wxSummary(){
+  const p=[];
+  if($("f_weather").value) p.push($("f_weather").value);
+  if($("f_windDir").value||$("f_wind").value) p.push(`${$("f_windDir").value}${$("f_wind").value?$("f_wind").value+"m/s":""}`);
+  if($("f_wave").value) p.push(`波${$("f_wave").value}m`);
+  if($("f_sst").value) p.push(`水温${$("f_sst").value}℃`);
+  if($("f_tideName").value) p.push($("f_tideName").value+($("f_tideMove").value?"・"+$("f_tideMove").value:""));
+  $("wxSum").textContent = p.length ? p.join(" ") : "位置と日時が決まると自動で入ります";
+}
+
+/* ========== 気象・海況の自動取得（Open-Meteo） ========== */
+const WMO = c => c==null?"":c===0?"快晴":c<=2?"晴れ":c===3?"曇り":c<=48?"霧":c<=57?"小雨":c<=67?"雨":c<=77?"雪":c<=82?"雨":c<=86?"雪":"雷雨";
+let wxTimer=null, lastWxKey="";
+function scheduleWx(force){                        // 位置か日時が決まったら自動取得（同じ条件では再取得しない）
+  if($("viewForm").hidden) return;
+  if(!force && $("f_temp").value) return;
+  clearTimeout(wxTimer); wxTimer=setTimeout(()=>fetchWx(false),700);
+}
+
+async function fetchWx(manual){
+  const lat=num($("f_lat").value), lon=num($("f_lon").value), dt=$("f_dt").value;
+  if(lat==null||lon==null||!dt){ if(manual) status("先に位置と日時を指定してください。","err"); return; }
+  const key=`${lat.toFixed(2)},${lon.toFixed(2)},${dt.slice(0,13)}`;
+  if(!manual && key===lastWxKey) return;
+  lastWxKey=key;
+  const date=dt.slice(0,10), hourKey=dt.slice(0,13)+":00";
+  const ageDays = (Date.now()-new Date(date+"T00:00:00+09:00").getTime())/86400000;
+  if(ageDays < -15){ status("16日以上先の日付は取得できません。","err"); return; }
+  status("取得中…"); $("wxSum").textContent="取得中…";
+  const q = `latitude=${lat}&longitude=${lon}&start_date=${date}&end_date=${date}&timezone=Asia%2FTokyo`;
+  const wHost = ageDays>80 ? "https://archive-api.open-meteo.com/v1/archive" : "https://api.open-meteo.com/v1/forecast";
+  const wUrl = `${wHost}?${q}&hourly=temperature_2m,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m&wind_speed_unit=ms`;
+  const mUrl = `https://marine-api.open-meteo.com/v1/marine?${q}&hourly=wave_height,wave_direction,wave_period,sea_surface_temperature,sea_level_height_msl`;
+  const got=[], miss=[];
+  const [w,m] = await Promise.allSettled([fetch(wUrl).then(r=>r.ok?r.json():Promise.reject(r.status)), fetch(mUrl).then(r=>r.ok?r.json():Promise.reject(r.status))]);
+  const set=(id,v,d=1)=>{ if(v!=null&&!isNaN(v)){ $(id).value = typeof v==="number"?+v.toFixed(d):v; return true;} return false; };
+
+  if(w.status==="fulfilled"){
+    const h=w.value.hourly, i=h.time.indexOf(hourKey);
+    if(i>=0){
+      set("f_temp",h.temperature_2m[i]); set("f_press",h.pressure_msl[i]); set("f_wind",h.wind_speed_10m[i]); set("f_gust",h.wind_gusts_10m[i]);
+      if(h.wind_direction_10m[i]!=null) $("f_windDir").value=deg2dir(h.wind_direction_10m[i]);
+      if(h.weather_code[i]!=null) $("f_weather").value=WMO(h.weather_code[i]);
+      got.push("気象");
+    } else miss.push("気象");
+  } else miss.push("気象");
+
+  if(m.status==="fulfilled"){
+    const h=m.value.hourly, i=h.time.indexOf(hourKey);
+    if(i>=0){
+      let ok=false;
+      ok=set("f_wave",h.wave_height[i])||ok; ok=set("f_wavePer",h.wave_period[i])||ok; ok=set("f_sst",h.sea_surface_temperature[i])||ok;
+      if(h.wave_direction[i]!=null){ $("f_waveDir").value=deg2dir(h.wave_direction[i]); ok=true; }
+      ok ? got.push("波浪・水温") : miss.push("波浪（陸に近すぎる地点はモデル値なし）");
+      const sl=h.sea_level_height_msl||[];
+      if(sl[i]!=null){
+        $("f_tideLv").value=Math.round(sl[i]*100);
+        const prev=sl[i-1], next=sl[i+1];
+        if(prev!=null&&next!=null){
+          if(sl[i]>=prev&&sl[i]>=next) $("f_tideMove").value="満潮前後";
+          else if(sl[i]<=prev&&sl[i]<=next) $("f_tideMove").value="干潮前後";
+          else $("f_tideMove").value = next>prev?"上げ":"下げ";
+        }
+        const hi=[],lo=[];
+        for(let k=1;k<sl.length-1;k++){ if(sl[k]==null||sl[k-1]==null||sl[k+1]==null) continue;
+          if(sl[k]>sl[k-1]&&sl[k]>=sl[k+1]) hi.push(h.time[k].slice(11,16));
+          if(sl[k]<sl[k-1]&&sl[k]<=sl[k+1]) lo.push(h.time[k].slice(11,16)); }
+        if(hi.length) $("f_high").value=hi.join(", "); if(lo.length) $("f_low").value=lo.join(", ");
+        got.push("潮位");
+      } else miss.push("潮位");
+    } else miss.push("波浪");
+  } else miss.push("波浪");
+
+  fillTideCalc(); wxSummary();
+  if(got.length) status(`取得しました：${got.join("・")}（${hourKey.slice(11)}時点のモデル値）${miss.length?"／取得できず："+miss.join("・"):""}`,"ok");
+  else { status("取得できませんでした。電波の良い所で「もう一度取得」を押すか、手入力してください。","err"); lastWxKey=""; }
+}
+$("btnFetch").onclick=()=>fetchWx(true);
+buildChips();
+
+/* ========== 航跡（船の軌跡） ========== */
+let tracks=[];
+const DAY_COLORS=["#ff3b30","#ff9500","#34c759","#af52de","#ff2d92","#007aff","#a2845e","#00c7be"];
+/* 色の決め方：{mode:"day"（日ごとに8色から）|"fixed"（いつも同じ色）, fixed, palette:[8色]} */
+function trkColorCfg(){
+  let c={}; try{ c=JSON.parse(localStorage.getItem("choka-trk-colorcfg")||"{}")||{}; }catch{}
+  const pal=Array.isArray(c.palette)&&c.palette.length===8?c.palette:DAY_COLORS;
+  return {mode:c.mode==="fixed"?"fixed":"day", fixed:c.fixed||"#ff3b30", palette:pal};
+}
+function dayColor(date){
+  const c=trkColorCfg(); if(c.mode==="fixed") return c.fixed;
+  let h=0; for(const ch of date) h=(h*31+ch.charCodeAt(0))>>>0; return c.palette[h%8];
+}
+/* 線の色（その日の色。選び直すとその日のこれからの線に使う）と太さ */
+function trkPrefColor(){ try{ const v=JSON.parse(localStorage.getItem("choka-trk-color")||"null"); if(v&&v.date===todayStr()) return v.color; }catch{} return dayColor(todayStr()); }
+function trkWeight(){ try{ const w=+localStorage.getItem("choka-trk-weight"); if(w) return w; }catch{} return 5; }
+/* 航跡の色の履歴：t.color が最初の色、t.colorAt=[[点の番号, 色], …] で途中から色が変わる */
+function colorAtIdx(t,i){ let c=t.color; for(const [k,col] of (t.colorAt||[])) if(i>=k) c=col; return c; }
+const trkColors = t => [...new Set([t.color,...(t.colorAt||[]).map(x=>x[1])])];
+const GAP_MS = 120000;   // 2分以上あいた区間は「途切れ」として点線
+function haversine(a,b){                         // m
+  const R=6371000, toR=Math.PI/180, dLa=(b[0]-a[0])*toR, dLo=(b[1]-a[1])*toR;
+  const s=Math.sin(dLa/2)**2+Math.cos(a[0]*toR)*Math.cos(b[0]*toR)*Math.sin(dLo/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+const trackLen=t=>{ let d=0; for(let i=1;i<t.points.length;i++) d+=haversine(t.points[i-1],t.points[i]); return d; };
+const hm=ms=>{ const d=new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const todayStr=()=>nowLocal().slice(0,10);
+
+function drawTracks(){
+  trackLayer.clearLayers();
+  const w=trkWeight();
+  for(const t of tracks){
+    if(!t.visible || t.points.length<2) continue;
+    const tip=`${t.date.slice(5).replace("-","/")} ${hm(t.points[0][2])}〜${hm(t.points.at(-1)[2])}`;
+    // 同じ色・同じ線種が続く区間ごとに1本の線にする
+    let run=null;
+    const flush=()=>{ if(run&&run.pts.length>1){
+      L.polyline(run.pts,{color:run.col,weight:run.gap?Math.max(2,w*.7):w,opacity:run.gap?.75:.9,lineJoin:"round",lineCap:"round",dashArray:run.gap?`${Math.round(w*1.6)} ${Math.round(w*2.2)}`:null})
+        .bindTooltip(run.gap?`${tip}（記録が途切れた区間）`:tip,{sticky:true}).addTo(trackLayer); } };
+    for(let i=1;i<t.points.length;i++){
+      const a=t.points[i-1], b=t.points[i], col=colorAtIdx(t,i), gap=(b[2]-a[2])>GAP_MS;
+      if(!run||run.col!==col||run.gap!==gap){ flush(); run={col,gap,pts:[[a[0],a[1]]]}; }
+      run.pts.push([b[0],b[1]]);
+    }
+    flush();
+  }
+  if(rec && rec.track.points.length){
+    const p=rec.track.points.at(-1);
+    L.circleMarker([p[0],p[1]],{radius:7,color:"#fff",weight:2,fillColor:colorAtIdx(rec.track,rec.track.points.length),fillOpacity:1}).addTo(trackLayer);
+  }
+}
+
+/* 一覧：日ごとにまとめて、色・表示・削除 */
+function drawTrackList(){
+  const box=$("trkList");
+  if(!tracks.length){ box.innerHTML=`<div class="empty">まだ航跡がありません。<br>出港したら「記録を開始」を押してください。</div>`; return; }
+  const days=[...new Set(tracks.map(t=>t.date))].sort().reverse();
+  box.innerHTML=days.map(day=>{
+    const ts=tracks.filter(t=>t.date===day).sort((a,b)=>a.start.localeCompare(b.start));
+    const km=ts.reduce((s,t)=>s+trackLen(t),0)/1000, vis=ts.some(t=>t.visible), cols=[...new Set(ts.flatMap(trkColors))];
+    return `<div class="trk-day" data-day="${day}">
+      <div class="trk-h">
+        <span class="trk-sw" aria-hidden="true">${cols.slice(0,6).map(c=>`<i style="background:${c}"></i>`).join("")}</span>
+        <label class="trk-vis"><input type="checkbox" class="trk-show" ${vis?"checked":""}> ${day.replace(/-/g,"/")}</label>
+        <span class="trk-km mono">${km.toFixed(1)} km</span>
+      </div>
+      <div class="trk-ops">
+        <button type="button" class="btn sm" data-a="fit">地図で見る</button>
+        <button type="button" class="btn sm" data-a="gpx">GPX出力</button>
+        <button type="button" class="btn sm danger" data-a="del">この日を削除</button>
+      </div>
+      <ul class="trk-segs">${ts.map(t=>`<li data-id="${t.id}"><input type="color" class="trk-col" value="${t.colorAt?.length?t.colorAt.at(-1)[1]:t.color}" title="この区間の色をまとめて変える" aria-label="この区間の色"><span class="mono">${t.points.length?hm(t.points[0][2])+"〜"+hm(t.points.at(-1)[2]):"（点なし）"}</span>
+        <span class="mono">${(trackLen(t)/1000).toFixed(1)} km</span>${rec&&rec.track.id===t.id?'<span class="tag">記録中</span>':`<button type="button" class="btn sm danger" data-a="delone">削除</button>`}</li>`).join("")}</ul>
+    </div>`;
+  }).join("");
+}
+$("trkList").addEventListener("input",async e=>{
+  const day=e.target.closest(".trk-day")?.dataset.day; if(!day) return;
+  if(e.target.classList.contains("trk-col")){
+    // 区間の色をまとめて変える（記録中の区間は、ここから先の色だけ変える）
+    const t=tracks.find(x=>x.id===e.target.closest("li")?.dataset.id); if(!t) return;
+    if(rec&&rec.track.id===t.id) trkSetRecColor(e.target.value,false);
+    else { t.color=e.target.value; delete t.colorAt; await saveTrk(t); drawTracks(); }
+  }
+});
+$("trkList").addEventListener("change",async e=>{
+  const day=e.target.closest(".trk-day")?.dataset.day; if(!day) return;
+  if(e.target.classList.contains("trk-col")){ drawTrackList(); return; }
+  if(e.target.classList.contains("trk-show")){
+    for(const t of tracks.filter(t=>t.date===day)){ t.visible=e.target.checked; await saveTrk(t,true); }
+    drawTracks();
+  }
+});
+$("trkList").addEventListener("click",async e=>{
+  const b=e.target.closest("button[data-a]"); if(!b) return;
+  const day=b.closest(".trk-day").dataset.day, ts=tracks.filter(t=>t.date===day);
+  const a=b.dataset.a;
+  if(a==="fit"){
+    const pts=ts.flatMap(t=>t.points.map(p=>[p[0],p[1]])); if(!pts.length) return;
+    for(const t of ts){ if(!t.visible){ t.visible=true; await saveTrk(t,true);} }
+    drawTracks(); drawTrackList(); map.fitBounds(L.latLngBounds(pts).pad(0.15));
+    return;
+  }
+  if(a==="gpx"){ download(`航跡_${day}.gpx`,toGpx(ts,day),"application/gpx+xml"); return; }
+  if(a==="del"||a==="delone"){
+    if(!b.dataset.armed){ b.dataset.armed="1"; const t0=b.textContent; b.textContent="もう一度押すと削除"; setTimeout(()=>{ if(b.isConnected){ b.textContent=t0; delete b.dataset.armed; } },3000); return; }
+    const targets = a==="del" ? ts.filter(t=>!(rec&&rec.track.id===t.id)) : ts.filter(t=>t.id===b.closest("li").dataset.id);
+    for(const t of targets) await delTrk(t.id);
+    const ids=new Set(targets.map(t=>t.id)); tracks=tracks.filter(t=>!ids.has(t.id));
+    drawTracks(); drawTrackList();
+  }
+});
+$("trkShowAll").onclick=async()=>{ for(const t of tracks){ if(!t.visible){ t.visible=true; await saveTrk(t,true);} } drawTracks(); drawTrackList(); };
+$("trkHideAll").onclick=async()=>{ for(const t of tracks){ if(t.visible){ t.visible=false; await saveTrk(t,true);} } drawTracks(); drawTrackList(); };
+
+function toGpx(ts,day){
+  const segs=ts.map(t=>`<trkseg>${t.points.map(p=>`<trkpt lat="${p[0].toFixed(6)}" lon="${p[1].toFixed(6)}"><time>${new Date(p[2]).toISOString()}</time></trkpt>`).join("")}</trkseg>`).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="釣果海図ログ" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>${day}</name>${segs}</trk></gpx>`;
+}
+
+/* 記録：位置を受け取るたびに、10m以上動いたか30秒たったら1点追加。精度が悪い点は捨てる */
+let rec=null;
+async function startRec(resumeId){
+  if(!memberGate("航跡の記録")) return;
+  if(!navigator.geolocation){ trkMsg("この端末では位置情報を使えません。","err"); return; }
+  let t = resumeId ? tracks.find(x=>x.id===resumeId) : null;
+  if(!t){
+    const date=todayStr();
+    t={id:"t"+Date.now().toString(36),date,start:new Date().toISOString(),points:[],color:trkPrefColor(),visible:true};
+    tracks.push(t); await saveTrk(t);
+  }
+  rec={track:t,watch:null,wake:null,lastSave:0,lastFix:0};
+  rec.watch=navigator.geolocation.watchPosition(onFix,err=>trkMsg(err.code===1?"位置情報の利用が許可されていません。ブラウザの設定で許可してください。":"位置を取得できません（電波・GPSの状態を確認してください）","err"),
+    {enableHighAccuracy:true,maximumAge:0,timeout:30000});
+  await keepAwake();
+  try{ localStorage.setItem("choka-rec",t.id); }catch{}
+  trkMsg("記録中です。画面を点けたまま、このアプリを開いておいてください。","ok");
+  updateRecUi(); drawTrackList(); drawTracks();
+}
+async function stopRec(){
+  if(!rec) return;
+  navigator.geolocation.clearWatch(rec.watch);
+  try{ await rec.wake?.release(); }catch{}
+  rec.track.end=new Date().toISOString();
+  const t=rec.track; rec=null;
+  if(t.points.length<2){ await delTrk(t.id); tracks=tracks.filter(x=>x.id!==t.id); trkMsg("動いた記録がなかったので保存しませんでした。"); }
+  else { await saveTrk(t); trkMsg(`保存しました（${(trackLen(t)/1000).toFixed(1)} km）`,"ok"); cloudSoon(); }
+  try{ localStorage.removeItem("choka-rec"); }catch{}
+  updateRecUi(); drawTrackList(); drawTracks();
+}
+async function onFix(pos){
+  if(!rec) return;
+  const c=pos.coords, now=pos.timestamp||Date.now();
+  rec.lastFix=now; lastGps={lat:c.latitude,lon:c.longitude,t:now};
+  if(c.accuracy>60) { updateRecUi(c.accuracy); return; }
+  const pt=[+c.latitude.toFixed(6),+c.longitude.toFixed(6),now];
+  const last=rec.track.points.at(-1);
+  if(last){ const d=haversine(last,pt), dt=(now-last[2])/1000; if(d<10 && dt<30) { updateRecUi(c.accuracy); return; } }
+  rec.track.points.push(pt);
+  if(now-rec.lastSave>5000 || rec.track.points.length<=2){ rec.lastSave=now; await saveTrk(rec.track); }
+  drawTracks(); updateRecUi(c.accuracy);
+  if(!$("viewTrack").hidden) drawTrackList();
+}
+async function keepAwake(){
+  try{ if(rec && "wakeLock" in navigator) rec.wake=await navigator.wakeLock.request("screen"); }catch{}
+}
+document.addEventListener("visibilitychange",()=>{
+  if(!rec) return;
+  if(document.visibilityState==="visible") keepAwake(); else saveTrk(rec.track);   // 裏に回る前に保存
+});
+
+function trkMsg(m,cls){ const s=$("trkMsg"); s.textContent=m||""; s.className="status "+(cls||""); }
+function updateRecUi(acc){
+  const on=!!rec;
+  $("btnTrk").textContent= on ? "記録を止める" : "記録を開始";
+  $("btnTrk").classList.toggle("danger-fill",on);
+  $("trkState").textContent= on ? "記録中" : "停止中";
+  $("trkState").classList.toggle("on",on);
+  let stats="";
+  if(on){
+    const t=rec.track, km=(trackLen(t)/1000).toFixed(2);
+    const mins=t.points.length?Math.round((Date.now()-t.points[0][2])/60000):0;
+    stats=`${km} km ・ ${mins} 分 ・ ${t.points.length} 点${acc?` ・ 精度 ${Math.round(acc)} m`:""}`;
+  }
+  $("trkStats").textContent=stats;
+  $("recPill").hidden=!on && !resumeId;
+  $("recPill").textContent= on ? `● 航跡記録中 ${(trackLen(rec.track)/1000).toFixed(1)} km` : "航跡の記録が止まっています";
+  $("recPill").classList.toggle("paused",!on);
+  $("btnResume").hidden=!resumeId || on;
+}
+/* これから記録する色 */
+async function trkSetRecColor(col,relist=true){
+  try{ localStorage.setItem("choka-trk-color",JSON.stringify({date:todayStr(),color:col})); }catch{}
+  $("trkColor").value=col;
+  const t=rec?.track || (resumeId && tracks.find(x=>x.id===resumeId));
+  if(t){
+    const n=t.points.length;
+    if(!n){ t.color=col; delete t.colorAt; }
+    else if(colorAtIdx(t,n)!==col){
+      t.colorAt=(t.colorAt||[]).filter(x=>x[0]<n); if(colorAtIdx(t,n)!==col) t.colorAt.push([n,col]);
+      if(!t.colorAt.length) delete t.colorAt;
+    }
+    await saveTrk(t);
+  }
+  drawTracks(); if(relist) drawTrackList();
+}
+$("trkColor").addEventListener("input",e=>trkSetRecColor(e.target.value));
+$("trkColorSet").onclick=()=>{
+  const c=trkColorCfg();
+  const b=openDlg("線の色の決め方",`<div class="checks" style="flex-direction:column;align-items:flex-start">
+      <label><input type="radio" name="tcm" value="day" ${c.mode==="day"?"checked":""}>日ごとに自動で変える（下の8色から日付で選ぶ）</label>
+      <label><input type="radio" name="tcm" value="fixed" ${c.mode==="fixed"?"checked":""}>いつも同じ色</label></div>
+    <div id="tcFixed" ${c.mode==="fixed"?"":"hidden"} style="margin:8px 0"><label class="trk-opt">いつもの色<input type="color" class="trk-col" id="tcFix" value="${c.fixed}"></label></div>
+    <div id="tcDay" ${c.mode==="day"?"":"hidden"} style="margin:8px 0"><div class="trk-opt" style="flex-wrap:wrap">${c.palette.map((x,i)=>`<input type="color" class="trk-col tc-pal" data-i="${i}" value="${x}" aria-label="${i+1}番目の色">`).join("")}</div>
+      <button type="button" class="btn sm" id="tcReset" style="margin-top:6px">最初の8色に戻す</button></div>
+    <p class="hint">ここで変えても、記録済みの航跡の色は変わりません。今日の色を「線の色」で選んでいる場合は、今日はその色のままです。</p>
+    <div class="actions"><button type="button" class="btn" id="tcCancel">やめる</button><button type="button" class="btn primary" id="tcSave">保存</button></div>`);
+  const mode=()=>b.querySelector("input[name=tcm]:checked").value;
+  b.querySelectorAll("input[name=tcm]").forEach(r=>r.onchange=()=>{ $("tcFixed").hidden=mode()!=="fixed"; $("tcDay").hidden=mode()!=="day"; });
+  b.querySelector("#tcReset").onclick=()=>b.querySelectorAll(".tc-pal").forEach((x,i)=>x.value=DAY_COLORS[i]);
+  b.querySelector("#tcCancel").onclick=()=>$("dlg").close();
+  b.querySelector("#tcSave").onclick=()=>{
+    const cfg={mode:mode(),fixed:$("tcFix").value,palette:[...b.querySelectorAll(".tc-pal")].map(x=>x.value)};
+    try{ localStorage.setItem("choka-trk-colorcfg",JSON.stringify(cfg)); }catch{}
+    $("dlg").close(); $("trkColor").value=trkPrefColor();
+    if(rec && !rec.track.points.length){ rec.track.color=trkPrefColor(); saveTrk(rec.track); }
+    drawTracks();
+  };
+};
+$("trkWeight").addEventListener("change",e=>{ try{ localStorage.setItem("choka-trk-weight",e.target.value); }catch{} drawTracks(); });
+let resumeId=null;
+$("btnTrk").onclick=()=> rec ? stopRec() : startRec();
+$("btnResume").onclick=()=>{ const id=resumeId; resumeId=null; startRec(id); };
+$("recPill").onclick=()=>showTab("track");
+
+async function initTracks(){
+  tracks=await loadTrks();
+  $("trkColor").value=trkPrefColor(); $("trkWeight").value=String(trkWeight());
+  let rid=null; try{ rid=localStorage.getItem("choka-rec"); }catch{}
+  if(rid && tracks.some(t=>t.id===rid)){ resumeId=rid; trkMsg("前回の記録が途中で止まっています（アプリが閉じられたため）。「続きを記録」で同じ航跡に追加できます。","err"); }
+  else { try{ localStorage.removeItem("choka-rec"); }catch{} }
+  drawTracks(); drawTrackList(); updateRecUi();
+}
+window.addEventListener("pagehide",()=>{ if(rec) saveTrk(rec.track); });
+
+/* ========== 出力・入力 ========== */
+function download(name,text,type){
+  const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([text],{type})); a.download=name;
+  document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},500);
+}
+const stamp=()=>{const d=new Date();return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`;};
+$("btnCsv").onclick=()=>{
+  const cols=[["datetime","日時"],["lat","緯度"],["lon","経度"],["spot","ポイント"],["species","魚種"],["count","匹数"],["length","全長cm"],["weight","重量g"],
+    ["method","釣法"],["bait","エサ・ルアー"],["tana","棚m"],["tanaRef","棚基準"],["depth","水深m"],["bottom","底質"],["echo","反応"],["drift","船の流れ"],
+    ["shime","締め"],["treat","処理"],["shimeAt","締め時刻"],["cooling","保冷"],
+    ["weather","天気"],["temp","気温℃"],["press","気圧hPa"],["windDir","風向"],["wind","風速m/s"],["gust","最大瞬間m/s"],["sst","水温℃"],
+    ["wave","波高m"],["wavePer","周期s"],["waveDir","波向"],["color","潮色"],["tideName","潮名"],["moon","月齢"],["tideMove","潮の動き"],["tideLv","潮位cm"],["high","満潮"],["low","干潮"],["memo","メモ"]];
+  const q=v=>{v=v??"";v=String(v);return /[",\n]/.test(v)?`"${v.replace(/"/g,'""')}"`:v;};
+  const rows=[cols.map(c=>c[1]).join(",")].concat(records.filter(r=>!r.sample).sort((a,b)=>a.datetime.localeCompare(b.datetime)).map(r=>cols.map(([k])=>q(k==="datetime"?fmtDT(r[k]):k==="treat"&&r[k]?String(r[k]).replace(/,/g,"・"):r[k])).join(",")));
+  download(`釣果_${stamp()}.csv`,"﻿"+rows.join("\r\n"),"text/csv");
+};
+$("btnJson").onclick=()=>download(`釣果バックアップ_${stamp()}.json`,JSON.stringify({app:"choka-kaizu",version:2,records:records.filter(r=>!r.sample),tracks}),"application/json");
+$("fileImport").addEventListener("change",async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  try{ const d=JSON.parse(await f.text()); const list=Array.isArray(d)?d:d.records;
+    const now=new Date().toISOString(); let nNew=0, nSkip=0;
+    for(const r0 of list){ if(!(r0&&r0.id&&r0.lat!=null&&r0.lon!=null) || r0.sample) continue;
+      const loc=records.find(x=>x.id===r0.id);
+      if(loc && (loc.updatedAt||"")>=(r0.updatedAt||"")){ nSkip++; continue; }        // この端末の方が新しい記録はそのまま
+      const r={...r0}; if(!loc){ r.updatedAt=now; nNew++; }                             // 消えていた記録は、新しい変更として戻す（ほかの端末・新着にも戻る）
+      delete r.feedPost; delete r.feedDirty;
+      await saveRec(r); records=records.filter(x=>x.id!==r.id).concat(r); await trashDel(r.id);
+      if(r.feed) feedPush(r); }
+    let nt=0; for(const t of (d.tracks||[])){ if(t&&t.id&&Array.isArray(t.points)){ await saveTrk(t); tracks=tracks.filter(x=>x.id!==t.id).concat(t); nt++; } }
+    render(); drawTracks(); drawTrackList(); shMsg("cloudStat",`釣果を復元しました（消えていた釣果${nNew}件を戻しました${nSkip?`。この端末の方が新しい${nSkip}件はそのままです`:""}）`,"ok"); alertStatus(`釣果を復元しました（消えていた釣果${nNew}件を戻しました${nSkip?`。この端末の方が新しい${nSkip}件はそのままです`:""}）${nt?`。航跡${nt}本`:""}`);
+    shSyncAll(); if(SH.user) lsSet(clKey("push"),null); cloudSoon();
+  }catch{ alertStatus("ファイルを読み込めませんでした。このアプリで出力したJSONを選んでください。"); }
+  e.target.value="";
+});
+function alertStatus(msg){ $("summary").textContent=msg; }
+/* 釣果を消す前の確認（ほかの端末と新着からも消える。30日以内なら戻せる） */
+function delConfirm(r){
+  const b=openDlg("釣果を削除",`<p><b>${esc(r.species)}</b>（${esc(fmtDT(r.datetime))}${r.count?`・${r.count}匹`:""}${r.length?`・${r.length}cm`:""}）を削除しますか？</p>
+    <p class="hint">ほかの端末と「みんな」の新着からも消えます。消したあとも「釣果一覧」の下の「削除した釣果を戻す」から戻せます（この端末には写真つきで30日、会員はサーバーからいつでも）。</p>
+    <div class="actions"><button type="button" class="btn" id="dcNo">やめる</button><button type="button" class="btn danger" id="dcYes">削除する</button></div>`);
+  b.querySelector("#dcNo").onclick=()=>$("dlg").close();
+  const yes=b.querySelector("#dcYes"); yes.disabled=true; setTimeout(()=>{ yes.disabled=false; },600);   // 開いた直後の触り間違いを防ぐ
+  yes.onclick=async()=>{
+    $("dlg").close();
+    if(MV.r?.id===r.id) moveEnd();
+    await trashPut(r); await delRec(r.id); records=records.filter(x=>x.id!==r.id); render(); shSyncDel(r.id);
+    if(!r.sample) feedRemove(r);                                   // 新着に載っていれば必ず外す（ほかの端末で載せた分も）
+    alertStatus(`${r.species}を削除しました（「削除した釣果を戻す」から戻せます）`);
+  };
+}
+/* 削除した釣果を戻す：この端末にとってある分（写真つき・30日）と、サーバーにとってある分（会員の同期・期限なし）。
+   削除をとっておく前の版で消えた釣果も、「提供された釣果」に残っていればそこから戻す */
+$("btnTrash").onclick=async()=>{
+  const b=openDlg("削除した釣果を戻す",`<div id="trList"><div class="empty">読み込み中…</div></div><div class="status" id="trStat"></div>`);
+  const items=new Map();
+  for(const o of await trashAll()) if(!records.some(r=>r.id===o.id)) items.set(o.id,{rec:o,at:o.deletedAt,where:"この端末にとってある分"});
+  if(SH.sb && hasProfile() && !SH.foreign){
+    try{
+      const {data}=await SH.sb.from("cloud_items").select("id,trash,deleted_at").eq("kind","catch").eq("deleted",true).not("trash","is",null).order("deleted_at",{ascending:false}).limit(300);
+      for(const x of data||[]) if(!items.has(x.id) && !records.some(r=>r.id===x.id))
+        items.set(x.id,{rec:{...x.trash,id:x.id,photos:[]},at:x.deleted_at,where:"サーバー（写真は「別の端末の写真を取り込む」で戻せることがあります）"});
+    }catch{}
+    try{
+      const {data}=await SH.sb.rpc("my_lost_catches");
+      for(const x of data||[]) if(!items.has(x.id) && !records.some(r=>r.id===x.id))
+        items.set(x.id,{rec:{...x.data,id:x.id,photos:[]},at:x.deleted_at,where:"サーバーの提供された釣果から（写真は「別の端末の写真を取り込む」で戻せることがあります）"});
+    }catch{}
+  }
+  const list=[...items.values()].sort((a,b)=>(b.at||"").localeCompare(a.at||""));
+  const box=$("trList"); if(!box) return;
+  box.innerHTML = list.length ? list.map((x,i)=>`<div class="card" style="grid-template-columns:1fr auto;cursor:default"><div>
+      <div class="t"><span class="sp">${esc(x.rec.species||"")}</span><span>${x.rec.count||1}匹${x.rec.length?` ・${x.rec.length}cm`:""}</span><span class="when">${esc(fmtDT(x.rec.datetime||""))}</span></div>
+      <div class="facts"><span>${fmtJ(x.at)}に削除</span><span>${esc(x.where)}</span>${(x.rec.photos||[]).length?`<span>写真${x.rec.photos.length}枚</span>`:""}</div></div>
+      <button type="button" class="btn sm primary" data-i="${i}" style="align-self:center">元に戻す</button></div>`).join("")
+    : `<div class="empty">戻せる釣果はありません。${cloudOn()?"":"<br>（会員がログインすると、ほかの端末で削除した釣果も表示されます）"}</div>`;
+  box.querySelectorAll("button[data-i]").forEach(btn=>btn.onclick=async()=>{
+    const x=list[+btn.dataset.i]; setBusy(btn,true,"戻しています…");
+    try{
+      const r={...x.rec, updatedAt:new Date().toISOString()};
+      delete r.deletedAt; delete r.feedPost; delete r.feedDirty; delete r.feedLog;
+      await saveRec(r); records=records.filter(q=>q.id!==r.id).concat(r); await trashDel(r.id);
+      render(); shSyncRec(r); cloudSoon(); if(r.feed) feedPush(r);
+      btn.textContent="戻しました"; shMsg("trStat",`${r.species}を戻しました。${r.feed?"新着にも載せ直します。":""}`,"ok");
+    }catch(err){ setBusy(btn,false); shMsg("trStat",shErr(err),"err"); }
+  });
+};
+
+/* 変更を戻す：この端末の履歴（写真つき・10回分）と、サーバーの履歴（会員の同期・ほかの端末での変更も）から前の状態に戻す */
+const HL={species:"魚種",count:"匹数",length:"大きさ",weight:"重さ",method:"釣法",bait:"エサ・仕掛け",tana:"棚",tanaRef:"棚",depth:"水深",bottom:"底質",
+  echo:"反応",drift:"船の流れ",shime:"締め方",treat:"締め方",cooling:"締め方",shimeAt:"締めた日時",weather:"気象",temp:"気象",press:"気象",windDir:"気象",
+  wind:"気象",gust:"気象",sst:"水温",wave:"波",wavePer:"波",waveDir:"波",color:"潮色",tideName:"潮",moon:"潮",tideMove:"潮の動き",tideLv:"潮",high:"潮",low:"潮",
+  spot:"ポイント名",memo:"メモ",datetime:"釣った日時",lat:"位置",lon:"位置",feed:"新着に載せる",pref:"県",prefManual:"県"};
+const PH4=["photoSig","photoAt","cloudPhotos","cloudSig"];
+const histFk = r => { const o=histFields(r); delete o.photoSig; return JSON.stringify(o); };
+function histDiff(a,cur,withPh){
+  const A=histFields(a), C=histFields(cur), d=new Set();
+  for(const k of new Set([...Object.keys(A),...Object.keys(C)])) if(k!=="photoSig" && JSON.stringify(A[k])!==JSON.stringify(C[k])) d.add(HL[k]||k);
+  if(withPh && photoSig(a.photos||[])!==photoSig(localPh(cur))) d.add("写真");
+  return [...d];
+}
+async function histDlg(id){
+  const cur=records.find(x=>x.id===id); if(!cur) return;
+  openDlg("変更を戻す",`<p class="hint">戻したい時の状態を選んで「この状態に戻す」を押します。戻したあとも、ここからもう一度戻せます（戻す前の状態も履歴に残ります）。</p>
+    <div id="hiList"><div class="empty">読み込み中…</div></div><div class="status" id="hiStat"></div>`);
+  const loc=await histGet(id);
+  const vers=loc.map((e,i)=>({at:e.at, rec:{...e.rec,...histPhotos(loc,i,cur)}, where:"この端末", ph:true}));
+  if(cloudOn()){
+    try{ const {data}=await SH.sb.from("cloud_items").select("history").eq("kind","catch").eq("id",String(id)).maybeSingle();
+      for(const h of data?.history||[]) if(h?.data) vers.push({at:h.at, rec:{...h.data,id}, where:"サーバー（ほかの端末での変更も含む・写真は今のまま）", ph:false}); }catch{}
+  }
+  // 今と同じ中身は出さない。同じ中身が両方にあれば、この端末の分（写真つき）を出す
+  const seen=new Set(), list=[];
+  for(const v of vers.sort((a,b)=>(a.ph===b.ph?0:a.ph?-1:1))){
+    const k=histFk(v.rec)+(v.ph?"#"+photoSig(v.rec.photos||[]):"");
+    if(!histDiff(v.rec,cur,v.ph).length || seen.has(k) || (!v.ph && seen.has("f:"+histFk(v.rec)))) continue;
+    seen.add(k); seen.add("f:"+histFk(v.rec)); list.push(v);
+  }
+  list.sort((a,b)=>String(b.at||"").localeCompare(String(a.at||"")));
+  const box=$("hiList"); if(!box) return;
+  box.innerHTML = list.length ? list.map((v,i)=>{ const x=v.rec, ph=v.ph?(x.photos||[]):[];
+    return `<div class="card" style="grid-template-columns:1fr auto;cursor:default"><div>
+      <div class="t"><span class="sp">${esc(x.species||"")}</span><span>${x.count||1}匹${x.length?` ・${x.length}cm`:""}</span><span class="when">${esc(fmtDT(x.datetime||""))}</span></div>
+      <div class="facts"><span>${fmtJ(v.at)}の状態</span><span>${esc(v.where)}</span></div>
+      <div class="facts"><span>今と違うところ：${esc(histDiff(x,cur,v.ph).join("・"))}</span></div>
+      ${ph.length?`<div style="display:flex;gap:4px;margin-top:4px">${ph.slice(0,4).map(p=>`<img src="${p}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px">`).join("")}</div>`:""}</div>
+      <button type="button" class="btn sm primary" data-i="${i}" style="align-self:center">この状態に戻す</button></div>`; }).join("")
+    : `<div class="empty">戻せる前の状態はありません（この機能を入れる前の変更は残っていません）。</div>`;
+  box.querySelectorAll("button[data-i]").forEach(btn=>btn.onclick=async()=>{
+    const v=list[+btn.dataset.i], now=new Date().toISOString(), c=records.find(x=>x.id===id)||cur;
+    setBusy(btn,true,"戻しています…");
+    try{
+      const r={...v.rec, id:c.id, updatedAt:now};
+      for(const k of ["feedPost","feedLog","feedDirty"]){ if(c[k]!==undefined) r[k]=c[k]; else delete r[k]; }
+      const phChange = v.ph && photoSig(r.photos||[])!==photoSig(localPh(c));
+      if(phChange){                                               // 写真も前の写真に戻す（ほかの端末と新着にも）
+        r.photoSig=photoSig(r.photos||[]); r.photoAt=now; delete r.cloudPhotos; delete r.cloudSig;
+        if(c.cloudPhotos?.length && cloudOn()) SH.sb.storage.from("cloud").remove(c.cloudPhotos).then(()=>{},()=>{});
+      } else {                                                    // 写真は今のまま
+        r.photos=c.photos; r.photoDates=c.photoDates;
+        for(const k of PH4){ if(c[k]!==undefined) r[k]=c[k]; else delete r[k]; }
+      }
+      await saveRec(r); records=records.filter(q=>q.id!==r.id).concat(r);
+      render(); shSyncRec(r); cloudSoon(); if(r.feed||r.feedPost||c.feed) feedPush(r);
+      $("dlg").close();
+      if(!$("viewForm").hidden && FM.id===r.id) openForm(r); else { showTab("list"); openRecPopup(r); }
+      alertStatus(`${r.species}を${fmtJ(v.at)}の状態に戻しました（「変更を戻す」でもう一度戻せます）`);
+    }catch(err){ setBusy(btn,false); shMsg("hiStat",shErr(err),"err"); }
+  });
+}
+$("btnUndo").onclick=()=>{ if(FM.id!=null) histDlg(FM.id); };
+
+$("btnDelSamples").onclick=async()=>{ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); try{localStorage.setItem("choka-seeded","1")}catch{} render(); };
+$("filter").addEventListener("input",render);
+
+/* テーマ切替 */
+$("btnTheme").onclick=()=>{
+  const cur=document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");
+  const next=cur==="dark"?"light":"dark"; document.documentElement.dataset.theme=next; try{localStorage.setItem("choka-theme",next)}catch{}
+};
+try{ const t=localStorage.getItem("choka-theme"); if(t) document.documentElement.dataset.theme=t; }catch{}
+
+/* =====================================================================
+   おすそわけ・お店（Supabase）
+   ・ログイン：メールのリンクか6桁コード（パスワードなし）
+   ・出品は24時間以内の自分の釣果から。釣った位置は本人と管理者だけ、受け渡し場所は約1km単位で公開
+   ・チェック（禁止種・期限・富山県内・件数）はサーバー側でも必ず行う
+   ===================================================================== */
+// ↓ Supabase の「Project Settings → API」にある Project URL と anon public key を入れてください（anon key は公開して大丈夫な鍵です）
+const SB_URL = "https://uhnilnjgydbmpfwesdpg.supabase.co";
+const SB_KEY = "sb_publishable_SGlNQiHuXiaLfpLzHe4iVw_paSfX9eo";
+
+const SH = {sb:null, started:false, user:null, profile:null, shop:null, blocked:[], sub:"find", filter:"all",
+  urls:new Map(), cache:new Map(), deals:new Map(), pick:false, post:null, pickMarker:null, pollT:null, threadT:null};
+const TOYAMA_AREAS = ["富山市","高岡市","魚津市","氷見市","滑川市","黒部市","砺波市","小矢部市","南砺市","射水市","舟橋村","上市町","立山町","入善町","朝日町"];
+const HEALTH_CENTERS = ["富山市保健所","新川厚生センター","新川厚生センター魚津支所","中部厚生センター","高岡厚生センター","高岡厚生センター射水支所","高岡厚生センター氷見支所","砺波厚生センター","砺波厚生センター小矢部支所"];
+const REPORT_REASONS = ["禁止されている種類","サイズ・数量が不自然","他人の写真・うその内容","おすそわけなのにお金を求められた","受け渡しのトラブル","その他"];
+// サーバーから読めなかったときの予備（正式な一覧はサーバーの blocked_terms）
+const FALLBACK_BLOCK = [["アワビ","特定水産動植物"],["ナマコ","特定水産動植物"],["シラスウナギ","特定水産動植物"],["サザエ","漁業権の対象"],["トコブシ","漁業権の対象"],
+  ["イセエビ","漁業権の対象"],["ウニ","漁業権の対象"],["貝","漁業権の対象（貝類）"],["ワカメ","漁業権の対象（海藻）"],["エビ","エビ類"],["カニ","カニ類"],["ガニ","カニ類"],
+  ["ホタルイカ","富山湾の漁業の対象"],["タコ","漁業権の対象（要確認）"],["ダコ","漁業権の対象（要確認）"],["フグ","毒のおそれ"],["ソウシハギ","毒のおそれ"],["アオブダイ","毒のおそれ"]];
+const toKata = s => (s||"").normalize("NFKC").replace(/[ぁ-ゖ]/g,c=>String.fromCharCode(c.charCodeAt(0)+0x60));
+function blockedReason(sp){
+  const k=toKata(sp); let best=null;
+  for(const [t,r] of (SH.blocked.length?SH.blocked:FALLBACK_BLOCK)){ const kt=toKata(t); if(kt && k.includes(kt) && (!best||kt.length>best[0].length)) best=[kt,r]; }
+  return best?best[1]:null;
+}
+const inToyama = p => p && p.lat>=36.25 && p.lat<=37.05 && p.lon>=136.75 && p.lon<=137.80;
+const KIND_JA = {gift:"おすそわけ", shop:"お店向け"};
+const L_STATUS = {open:"受付中",reserved:"相手が決まりました",done:"受け渡し済み",cancelled:"取り下げ",removed:"管理者が削除",expired:"受付終了"};
+
+function shErr(e){
+  const m=(e&&(e.message||e.error_description||e.msg))||String(e||"");
+  if(/row-level security|permission denied/i.test(m)) return "権限がありません（ログインし直すか、管理者に連絡してください）";
+  if(/duplicate key/i.test(m)) return "すでに登録済みです";
+  if(/Failed to fetch|NetworkError|Load failed/i.test(m)) return "通信できませんでした。電波の良い所でもう一度お試しください";
+  if(/rate limit|security purposes/i.test(m)) return "短い時間に送りすぎました。少し待ってからもう一度お試しください";
+  if(/Token has expired|otp_expired|invalid.*(token|otp)|otp.*invalid/i.test(m)) return "コードが違うか、期限が切れています。メールをもう一度送ってください";
+  return m;
+}
+function shMsg(id,msg,cls){ const s=$(id); if(!s) return; s.textContent=msg||""; s.className="status "+(cls||""); }
+const fmtJ = iso => { if(!iso) return ""; const d=new Date(iso); return `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+function leftText(iso){ const ms=new Date(iso)-Date.now(); if(ms<=0) return "受付終了"; const h=Math.floor(ms/3600000), m=Math.floor(ms%3600000/60000); return h?`あと${h}時間${m}分`:`あと${m}分`; }
+const yen = v => v==null?"":`${Number(v).toLocaleString("ja-JP")}円`;
+const recTime = r => new Date(r.datetime+":00+09:00").getTime();
+async function dataUrlToBlob(u){ return (await fetch(u)).blob(); }
+function setBusy(btn,on,text){ if(!btn) return; if(on){ btn.dataset.t=btn.textContent; btn.textContent=text||"処理中…"; btn.disabled=true; } else { btn.textContent=btn.dataset.t||btn.textContent; btn.disabled=false; } }
+
+/* ---------- 起動・ログイン ---------- */
+function shShow(which){ for(const id of ["shNoConf","shLogin","shProfile","shBanned","shNotMember","shMain"]) $(id).hidden = id!==which; updateAccountBtn();
+  if(which==="shLogin" && !$("shEmail").value){ try{ $("shEmail").value=localStorage.getItem("choka-email")||""; }catch{} } }
+/* 会員か（決済を入れるまでは、管理者が会員の期限を設定する。サーバーの設定がない手元の試用では制限しない） */
+function isMember(){
+  if(!SB_URL||!SB_KEY) return true;
+  const p=SH.profile; if(!p||p.banned) return false;
+  return p.role==="admin" || (p.member_until && p.member_until>=todayStr());
+}
+const hasProfile = () => !!(SH.user && !SH.user.is_anonymous && SH.profile && !SH.profile.banned);
+function updateAccountBtn(){
+  const b=$("btnAccount"); if(!b) return;
+  if(!SB_URL||!SB_KEY){ b.hidden=true; return; }
+  b.textContent = hasProfile() ? `${SH.profile.nickname}${isMember()?"":"（無料）"}` : "ログイン";
+  applyLocks();
+}
+$("nmJoin").onclick=()=>billingDlg();
+$("btnAccount").onclick=()=>{ if(hasProfile()) profileDlg(); else showTab("share"); };
+/* 会員の機能を使おうとしたとき */
+const MEMBER_FEATURES=[
+  ["釣果の記録","地図に釣った位置・魚種・棚・締め方を記録。写真の撮影日時・位置、気象・波・潮も自動で入ります"],
+  ["航跡の記録","船の走った線を記録して、あとから地図で見返せます"],
+  ["PCとスマホの同期","釣果と航跡が、PCとスマホで自動でそろいます"],
+  ["みんなの新着に載せる・投稿","釣果や、写真・ブログをみんなに見てもらえます"],
+  ["釣った位置とくわしい記録を見る","ほかの人の釣果の、釣った位置・棚・水深・仕掛け・ポイント名・気象・潮・メモまで見られます"],
+  ["釣れた場所の地図","魚の名前・地域・期間・時期で探した釣果を、地図に出せます。地図に見えている範囲でも探せます"],
+  ["お気に入り","気になる釣果を保存して、あとから見返せます"],
+  ["おすそわけ","釣りすぎた魚を無料で譲ったり、許可のあるお店に買い取ってもらえます"],
+];
+function memberGate(what){
+  if(isMember()) return true;
+  const logged=hasProfile();
+  const b=openDlg(`${what}は会員の機能です`,`<p>会員になると、次の機能が使えます。</p>
+    <ul class="mfeat">${MEMBER_FEATURES.map(([t,d])=>`<li${what&&(t.includes(what)||what.includes(t.slice(0,4)))?' class="hit"':""}><b>${t}</b><span>${d}</span></li>`).join("")}</ul>
+    <p class="hint">${logged?"会員でなくても、新着の釣果と投稿を見る・いいね・コメント・メッセージは使えます。":"ログイン（無料）すると、いいね・コメント・メッセージが使えます。"}</p>
+    <p class="hint">${logged?`会員は月${esc(BILL.price)}円です。はじめて申し込むときは、最初の2か月が無料です（カードの登録が必要。プリペイド式のカードなどを除く）。`:"会員になるには、ログイン（無料）してから申し込みます。会員の方は、ログインしてください。"}</p>
+    <p class="hint">これまでの釣果と航跡は、会員でなくても（支払いが止まっても）「釣果一覧」「航跡」で見られ、バックアップもできます。</p><p class="hint">${legalLinks()}</p>
+    <div class="actions">${logged?`<button type="button" class="btn primary" id="gtJoin">会員になる・くわしく</button>`:`<button type="button" class="btn primary" id="gtLogin">ログインする</button>`}<button type="button" class="btn" id="gtClose">閉じる</button></div>`);
+  b.querySelector("#gtJoin")?.addEventListener("click",()=>billingDlg());
+  b.querySelector("#gtClose").onclick=()=>$("dlg").close();
+  b.querySelector("#gtLogin")?.addEventListener("click",()=>{ $("dlg").close(); showTab("share"); });
+  return false;
+}
+/* 会員だけの機能は、会員でない人には薄く🔒付きで見せる（押すと会員の機能の説明が出る） */
+function applyLocks(){
+  const lock=!isMember();
+  for(const id of ["tabForm","tabTrack","tabShare","btnNew","btnPost","nwFavBtn"]) $(id)?.classList.toggle("locked",lock);
+  document.querySelector('.mode-ctl button[data-mm="add"]')?.classList.toggle("locked",lock);
+  $("nwBoxL")?.classList.toggle("locked",lock || !hasProfile());
+  for(const b of document.querySelectorAll("#pdFav")) b.classList.toggle("locked",lock || !hasProfile());
+}
+document.addEventListener("click",e=>{                  // 説明の枠（🔒）を押したとき
+  const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
+});
+/* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
+const APP_VER="2026.11.08.3";
+const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
+/* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
+async function publishedVer(){
+  try{ const t=await (await fetch(location.pathname+"?vercheck="+Date.now(),{cache:"no-store"})).text();
+    return (/const APP_VER="([^"]+)"/.exec(t)||[])[1]||null; }catch{ return null; }
+}
+async function checkVer(){
+  let need=null;
+  try{ const {data}=SH.sb ? await SH.sb.from("app_settings").select("v").eq("k","min_app_ver").maybeSingle() : {data:null};
+    if(data?.v && verOlder(APP_VER,data.v)) need=data.v; }catch{}
+  const pub=await publishedVer(); if(pub && verOlder(APP_VER,pub)) need=pub;
+  $("verBanner").hidden=!need;
+  if(need) $("verBanner").firstChild.textContent=`新しい版（${need}）があります。いま開いているのは ${APP_VER} です。読み込み直してください。 `;
+}
+/* 読み込み直す：ブラウザが覚えている古いページを捨ててから開き直す */
+async function hardReload(){
+  try{ await fetch(location.pathname,{cache:"reload"}); }catch{}
+  location.reload();
+}
+$("btnReload").onclick=()=>hardReload();
+setTimeout(()=>{ if(!SH.started) checkVer(); },3000);
+setInterval(()=>{ if(document.visibilityState==="visible") checkVer(); },600000);   // 開いたままでも10分ごとに確かめる   // サーバーの設定がない画面でも、公開されている版を調べる
+/* 更新ボタン：メールアプリの中のブラウザなど、再読み込みのボタンがない画面のため。送れていない分を送ってから開き直す */
+$("btnRefresh").onclick=async e=>{
+  setBusy(e.target,true,"更新中…");
+  const work=(async()=>{ try{ if(cloudOn()) await cloudSync(true); await feedSweep(); await cloudPushDeletes(); }catch{} })();
+  await Promise.race([work,new Promise(r=>setTimeout(r,5000))]);
+  hardReload();
+};
+async function shStart(){
+  if(SH.started) return; SH.started=true;
+  if(!SB_URL||!SB_KEY){ shShow("shNoConf"); return; }
+  if(!window.supabase){ shShow("shNoConf"); $("shNoConfMsg").textContent="通信用の部品を読み込めませんでした。電波の良い所でアプリを開き直してください。"; SH.started=false; return; }
+  SH.sb = window.supabase.createClient(SB_URL,SB_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+  SH.sb.auth.onAuthStateChange(ev=>{ if(ev==="SIGNED_IN"||ev==="SIGNED_OUT") setTimeout(shRefreshMe,0); });
+  checkVer(); document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible") checkVer(); });
+  loadBlocked();
+  await shRefreshMe();
+}
+async function loadBlocked(){
+  try{ const {data}=await SH.sb.from("blocked_terms").select("term,reason"); if(data&&data.length) SH.blocked=data.map(x=>[x.term,x.reason]); }catch{}
+}
+async function shRefreshMe(){
+  const {data:{session}} = await SH.sb.auth.getSession();
+  SH.user = session?.user || null;
+  if(!SH.user || SH.user.is_anonymous){ SH.profile=null; SH.shop=null; cloudUi(); shShow("shLogin"); setBadge(0); shPollStop(); feedPollStop(); shareLayer.clearLayers(); return; }
+  let {data:p,error} = await SH.sb.from("profiles").select("*").eq("id",SH.user.id).maybeSingle();
+  if(error){                                       // 海の上など電波がないときは、前回の内容で続ける
+    try{ const c=JSON.parse(lsGet("choka-profile")||"null"); if(c&&c.id===SH.user.id){ p=c; error=null; } }catch{}
+    if(error){ shShow("shLogin"); shMsg("loginMsg",shErr(error),"err"); return; }
+  } else lsSet("choka-profile", p?JSON.stringify(p):null);
+  SH.profile=p;
+  if(!p){ shShow("shProfile"); return; }
+  if(p.banned){ shShow("shBanned"); shPollStop(); return; }
+  if(!BILL.started){ BILL.started=true; setTimeout(()=>refAuto().then(billReturn),0); }   // 紹介のリンク・支払いの画面から戻ったとき
+  feedPollStart();
+  SH.foreign=false;
+  cloudUi(); if(isMember() && ownerCheck()){ cloudSync(); shSyncAll(); feedSweep().then(feedBackfill); loadMyPhotos(); }
+  else if(!isMember()){ feedSweep(); cloudPushDeletes(); if(p.member_until && ownerCheck()) cloudSync(true); }   // 会員でなくても、消した釣果は新着とほかの端末から消す。前に会員だった人は、記録の取り込み（見るだけ）を続ける
+  newPoll();
+  if(!isMember()){ shShow("shNotMember"); $("nmWho").textContent=`ログイン中：${p.nickname}（無料）`; shPollStop(); return; }
+  const {data:s} = await SH.sb.from("shops").select("*").eq("owner",SH.user.id).maybeSingle();
+  SH.shop=s||null;
+  await loadSettings(); shShow("shMain"); identUi();
+  $("shWho").textContent = `ログイン中：${p.nickname}${p.role==="admin"?"（管理者）":""}${SH.shop?.status==="approved"?`・${SH.shop.name}`:""}`;
+  $("subAdminBtn").hidden = p.role!=="admin";
+  $("fltShop").hidden = !(SH.shop?.status==="approved" || p.role==="admin");
+  if(!$("viewShare").hidden) shSub(SH.sub);
+  shPollStart();
+}
+function shOpen(){ if(!SH.started) shStart(); else if(hasProfile() && isMember()) shSub(SH.sub); }
+
+$("btnMail").onclick=async()=>{
+  const email=$("shEmail").value.trim();
+  try{ if(email) localStorage.setItem("choka-email",email); }catch{}
+  if(!/^\S+@\S+\.\S+$/.test(email)){ shMsg("loginMsg","メールアドレスを確認してください","err"); return; }
+  setBusy($("btnMail"),true,"送信中…");
+  const {error}=await SH.sb.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin+location.pathname,shouldCreateUser:true}});
+  setBusy($("btnMail"),false);
+  if(error){ shMsg("loginMsg",shErr(error),"err"); return; }
+  $("codeRow").hidden=false;
+  shMsg("loginMsg","メールを送りました。メールのリンクを開くか、6桁のコードを入れてください（迷惑メールに入ることがあります）","ok");
+};
+$("btnCode").onclick=async()=>{
+  const email=$("shEmail").value.trim(), token=$("shCode").value.replace(/\D/g,"");
+  if(!token){ shMsg("loginMsg","コードを入れてください","err"); return; }
+  setBusy($("btnCode"),true,"確認中…");
+  const {error}=await SH.sb.auth.verifyOtp({email,token,type:"email"});
+  setBusy($("btnCode"),false);
+  if(error){ shMsg("loginMsg",shErr(error),"err"); return; }
+  await shRefreshMe();
+};
+$("shPref").innerHTML=prefOptions("選ばない");
+$("btnProfile").onclick=async()=>{
+  const nick=$("shNick").value.trim();
+  if(!nick){ shMsg("profMsg","表示名を入れてください","err"); return; }
+  if([...document.querySelectorAll("#shProfile .checks input")].some(c=>!c.checked)){ shMsg("profMsg","必須の項目すべてに同意すると使えます","err"); return; }
+  const {error}=await SH.sb.from("profiles").insert({id:SH.user.id,nickname:nick,home_pref:$("shPref").value||null});
+  if(error){ shMsg("profMsg",shErr(error),"err"); return; }
+  await shRefreshMe();
+};
+document.addEventListener("click",async e=>{
+  if(!e.target.closest("[data-logout]")) return;
+  await SH.sb?.auth.signOut(); SH.cache.clear(); SH.deals.clear(); lsSet("choka-profile",null); await shRefreshMe();
+});
+
+/* ---------- サブ画面の切り替え ---------- */
+$("shSubs").addEventListener("click",e=>{ const b=e.target.closest("button[data-sub]"); if(b) shSub(b.dataset.sub); });
+function shSub(name){
+  if(name==="admin" && SH.profile?.role!=="admin") name="find";
+  SH.sub=name;
+  document.querySelectorAll("#shSubs button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.sub===name)));
+  for(const s of ["find","post","deals","shop","admin"]) $("sub_"+s).hidden = s!==name;
+  if(name!=="post"){ shPickEnd(); clearPickup(); }
+  if(name!=="find") shareLayer.clearLayers();
+  ({find:shFind,post:shPost,deals:shDeals,shop:shShop,admin:shAdmin})[name]();
+}
+
+/* ---------- 写真（署名付きURLは1時間有効。50分で取り直す） ---------- */
+async function signed(paths,bucket="photos"){
+  const now=Date.now(), key=p=>bucket+":"+p;
+  const need=[...new Set(paths.filter(p=>{ const c=SH.urls.get(key(p)); return p && (!c||now-c.t>50*60000); }))];
+  if(need.length){
+    const {data}=await SH.sb.storage.from(bucket).createSignedUrls(need,3600);
+    (data||[]).forEach(d=>{ if(d.signedUrl) SH.urls.set(key(d.path),{u:d.signedUrl,t:now}); });
+  }
+  return paths.map(p=>SH.urls.get(key(p))?.u||"");
+}
+
+/* ---------- 共通：評価・理由 ---------- */
+function ratingText(r){
+  if(!r||!r.n) return "評価なし";
+  return r.avg!=null ? `★${Number(r.avg).toFixed(1)}（${r.n}件）` : `評価${r.n}件（3件以上で平均を表示）`;
+}
+const REASONS = {
+  request:["魚の状態が説明と違う","サイズ・数が違う","時間が合わなくなった","相手と連絡がつかない","ほかで手に入った","その他"],
+  listing:["自分で食べることにした","ほかの人に譲った","時間が合わなくなった","魚の状態が悪くなった","その他"]};
+function reasonDlg(title,note,list,okText){
+  return new Promise(res=>{
+    const b=openDlg(title,`<p class="hint">${note}</p>
+      <div class="reasons">${list.map((r,i)=>`<label><input type="radio" name="rsn" value="${esc(r)}" ${i===0?"checked":""}>${esc(r)}</label>`).join("")}</div>
+      <label>くわしく（任意・相手に伝わります）<input id="rsnMore" maxlength="60"></label>
+      <div class="actions"><button type="button" class="btn" id="rsnBack">やめる</button><button type="button" class="btn danger" id="rsnOk">${okText}</button></div>`);
+    b.querySelector("#rsnBack").onclick=()=>{ $("dlg").close(); res(null); };
+    b.querySelector("#rsnOk").onclick=()=>{
+      const r=b.querySelector("input[name=rsn]:checked").value, m=$("rsnMore").value.trim();
+      res(m?`${r}：${m}`.slice(0,100):r);
+    };
+  });
+}
+
+/* ---------- 探す ---------- */
+$("fltKinds").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return; SH.filter=b.dataset.k; shFind(); });
+$("btnFindReload").onclick=()=>shFind();
+function shimeText(l){ return [l.shime, ...(l.treat||[]), l.cooling?`保冷：${l.cooling}`:""].filter(Boolean).join("・"); }
+function listingCard(l,u){
+  const stat = l.status==="open" ? leftText(l.expires_at) : `<span class="st">${L_STATUS[l.status]||l.status}</span>`;
+  return `<div class="card" data-lid="${l.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
+    <div><div class="t"><span class="kind ${l.kind}">${KIND_JA[l.kind]}</span><span class="sp">${esc(l.species)}</span><span>${l.count}匹${l.length_cm?` ・${l.length_cm}cm`:""}</span>${l.matches_my_want?'<span class="tag ok">希望に合う</span>':""}</div>
+    <div class="facts"><span>${esc(l.pickup_area)}</span><span>${esc(shimeText(l))}</span>${l.kind==="shop"&&l.price_yen!=null?`<span>希望 ${yen(l.price_yen)}</span>`:""}</div>
+    <div class="facts"><span>釣った ${fmtJ(l.caught_at)}</span><span>${stat}</span><span>${esc(l.owner_name)}${l.owner_verified?VB:""}</span>${l.kind==="shop"&&l.owner_rating?.n?`<span>${esc(ratingText(l.owner_rating))}</span>`:""}</div></div></div>`;
+}
+async function drawListings(boxId,list,empty){
+  const box=$(boxId);
+  if(!list.length){ box.innerHTML=`<div class="empty">${empty}</div>`; return; }
+  list.forEach(l=>SH.cache.set(l.id,l));
+  const urls=await signed(list.map(l=>l.photos?.[0]||""));
+  box.innerHTML=list.map((l,i)=>listingCard(l,urls[i])).join("");
+}
+async function shFind(){
+  $("fltKinds").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.k===SH.filter)));
+  const box=$("findList"); box.innerHTML=`<div class="empty">読み込み中…</div>`;
+  let q=SH.sb.from("listing_cards").select("*").eq("status","open").eq("mine",false).order("created_at",{ascending:false}).limit(100);
+  if(SH.filter!=="all") q=q.eq("kind",SH.filter);
+  const {data,error}=await q;
+  if(error){ box.innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  data.sort((a,b)=>(b.matches_my_want?1:0)-(a.matches_my_want?1:0));
+  drawShareMarkers(data);
+  shWants();
+  await drawListings("findList",data,"いま受付中の出品はありません。");
+}
+function wantLine(w){
+  const size=w.min_len||w.max_len?`${w.min_len?w.min_len+"cm":""}〜${w.max_len?w.max_len+"cm":""}`:"サイズ問わず";
+  const sh=w.shime?.length?w.shime.join("か"):"締め方問わず";
+  const tr=w.treat?.length?`（${w.treat.join("・")}あり）`:"";
+  return {size, cond:sh+tr, price:w.price_yen!=null?`${yen(w.price_yen)}／${w.price_unit}`:"価格は相談"};
+}
+function wantCard(w,own){
+  const t=wantLine(w);
+  return `<div class="card want" data-want="${w.id}"><div>
+    <div class="t"><span class="sp">${esc(w.species)}</span><span>${esc(t.size)}</span>${own?`<span class="st ${w.active?"good":""}">${w.active?"受付中":"終了"}</span>`:`<span class="st">${esc(w.shop_name)}</span>`}</div>
+    <div class="facts"><span>${esc(t.cond)}</span><span>${esc(t.price)}</span><span>${esc(w.area||w.shop_area)}</span><span>${w.until.slice(5).replace("-","/")}まで</span></div>
+    ${w.memo?`<div class="facts"><span>「${esc(w.memo)}」</span></div>`:""}
+    <div class="ops">${own?(w.active?`<button type="button" class="btn sm" data-a="wclose">締め切る</button>`:""):`<button type="button" class="btn sm primary" data-a="wpost">この希望に合う釣果を出品する</button>`}</div></div></div>`;
+}
+async function shWants(){
+  const {data}=await SH.sb.from("want_cards").select("*").eq("active",true).eq("mine",false).order("created_at",{ascending:false}).limit(50);
+  const list=data||[];
+  $("wantBox").hidden=!list.length; $("wantN").textContent=list.length||"";
+  $("wantList").innerHTML=list.map(w=>wantCard(w,false)).join("");
+}
+$("wantList").addEventListener("click",e=>{ if(e.target.closest("button[data-a=wpost]")) shSub("post"); });
+function drawShareMarkers(list){
+  shareLayer.clearLayers();
+  for(const l of list){
+    const icon=L.divIcon({className:"",iconSize:[0,0],html:`<div class="share-pin ${l.kind}">${l.kind==="gift"?"贈":"¥"}</div>`});
+    L.marker([l.lat,l.lon],{icon,keyboard:false}).bindTooltip(`${esc(l.species)} ${l.count}匹・${esc(l.pickup_area)}`,{direction:"top",offset:[0,-12]})
+      .on("click",()=>shDetail(l.id)).addTo(shareLayer);
+  }
+}
+for(const id of ["findList","mineList"]) $(id).addEventListener("click",e=>{ const c=e.target.closest(".card[data-lid]"); if(c) shDetail(c.dataset.lid); });
+for(const id of ["findList","mineList"]) $(id).addEventListener("keydown",e=>{ if(e.key==="Enter"){ const c=e.target.closest(".card[data-lid]"); if(c) shDetail(c.dataset.lid); } });
+
+/* ---------- ダイアログ ---------- */
+function openDlg(title,html){ $("dlgTitle").textContent=title; $("dlgBody").innerHTML=html; const d=$("dlg"); if(!d.open) d.showModal(); $("dlgBody").scrollTop=0; return $("dlgBody"); }
+$("dlgClose").onclick=()=>$("dlg").close();
+$("dlg").addEventListener("close",()=>{ clearInterval(SH.threadT); SH.threadT=null; });
+
+async function shDetail(id){
+  let l=SH.cache.get(id);
+  const {data}=await SH.sb.from("listing_cards").select("*").eq("id",id).maybeSingle();
+  if(data){ l=data; SH.cache.set(id,l); }
+  if(!l){ openDlg("出品","<p>この出品は見られなくなりました。</p>"); return; }
+  const urls=await signed(l.photos||[]);
+  const isAdmin=SH.profile?.role==="admin";
+  const rows=[
+    ["出し方", KIND_JA[l.kind]+(l.kind==="shop"&&l.price_yen!=null?`（希望 ${yen(l.price_yen)}）`:"")],
+    ["数・大きさ", [`${l.count}匹`, l.length_cm?`最大${l.length_cm}cm`:"", l.weight_g?`${l.weight_g}g`:""].filter(Boolean).join("・")],
+    ["釣った時刻", fmtJ(l.caught_at)],
+    ["締め方", shimeText(l)+(l.shime_at?`（${fmtJ(l.shime_at)}）`:"")],
+    ["受け渡し", `${l.pickup_area}・${l.handoff}`],
+    ["受付", l.status==="open"?`${leftText(l.expires_at)}（${fmtJ(l.expires_at)}まで）`:(L_STATUS[l.status]||l.status)],
+    ["出品者", `${l.owner_name}（${ratingText(l.owner_rating)}${l.owner_verified?"・カード登録済み":""}）`],
+    ["取り下げの理由", l.status==="cancelled"?(l.cancel_reason||""):""],
+    ["写真の日時", l.photo_checked?"釣った時刻と一致":"確認できず（撮影日時の情報なし）"],
+    ["ひとこと", l.memo||""],
+  ].filter(x=>x[1]);
+  let act="";
+  if(l.mine){
+    act = ["open","reserved"].includes(l.status) ? `<button type="button" class="btn" id="dtEdit">出品内容を編集</button><button type="button" class="btn danger" id="dtCancel">出品を取り下げる</button>` : "";
+    act = `<span class="hint" style="flex:1">自分の出品です。申し込みは「やり取り」に届きます。</span>${act}`;
+  } else if(l.my_request){
+    act = `<span class="hint" style="flex:1">申し込み済みです。</span><button type="button" class="btn primary" id="dtDeals">やり取りを見る</button>`;
+  } else if(l.status==="open"){
+    if(l.kind==="gift") act=`<button type="button" class="btn primary" id="dtReq">欲しい（申し込む）</button>`;
+    else if(SH.shop?.status==="approved") act=`<button type="button" class="btn primary" id="dtReq">買いたい（申し込む）</button>`;
+    else act=`<span class="hint">お店向けの出品に申し込めるのは、承認済みのお店だけです。</span>`;
+  }
+  const report = (!l.mine && !isAdmin) ? `<button type="button" class="btn sm danger" id="dtReport">通報する</button>` : "";
+  const admin = isAdmin ? `<div class="sec-h">管理者だけに表示</div>
+     <p class="hint">釣った位置：${l.catch_lat!=null?fmtPos(l.catch_lat,l.catch_lon):"—"}</p>
+     <div class="toolbar">${l.catch_lat!=null?`<button type="button" class="btn sm" id="dtWhere">釣った位置を地図で見る</button>`:""}
+     ${l.status!=="removed"?`<button type="button" class="btn sm danger" id="dtRemove">出品を削除する</button>`:""}
+     ${l.owner_id?`<button type="button" class="btn sm danger" id="dtBan">出品者の利用を停止</button>`:""}</div>` : "";
+  const b=openDlg(`${l.species} ${l.count}匹`,
+    `${urls.filter(Boolean).length?`<div class="gal">${urls.filter(Boolean).map(u=>`<img src="${esc(u)}" alt="${esc(l.species)}の写真">`).join("")}</div>`:""}
+     <table class="kv">${rows.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>
+     <p class="hint">${l.kind==="gift"?"おすそわけは無料です。受け渡しは人目のある場所で。クーラーボックスと氷を持参してください。":"支払いは受け渡しのときに当事者間で行います（アプリでは決済しません）。"}</p>
+     <div class="actions">${act}</div>${report?`<div class="toolbar" style="justify-content:flex-end">${report}</div>`:""}${admin}
+     <div class="status" id="dtStat"></div>`);
+  b.querySelector("#dtReq")?.addEventListener("click",()=>reqForm(l));
+  b.querySelector("#dtDeals")?.addEventListener("click",()=>{ $("dlg").close(); shSub("deals"); });
+  b.querySelector("#dtReport")?.addEventListener("click",()=>reportForm(l));
+  b.querySelector("#dtEdit")?.addEventListener("click",()=>editListing(l));
+  b.querySelector("#dtCancel")?.addEventListener("click",async()=>{
+    const reason=await reasonDlg("出品を取り下げる","取り下げると、申し込んでいる人に理由つきでお知らせが届きます。",REASONS.listing,"取り下げる");
+    if(reason==null){ shDetail(l.id); return; }
+    const {error}=await SH.sb.rpc("cancel_listing",{p_listing:l.id,p_reason:reason});
+    if(error){ shDetail(l.id); setTimeout(()=>shMsg("dtStat",shErr(error),"err"),300); return; }
+    $("dlg").close(); shSub(SH.sub);
+  });
+  b.querySelector("#dtWhere")?.addEventListener("click",()=>{
+    $("dlg").close(); map.flyTo([l.catch_lat,l.catch_lon],13,{duration:.6});
+    L.popup().setLatLng([l.catch_lat,l.catch_lon]).setContent(`<div class="pop"><b>${esc(l.species)}</b> を釣った位置<br><span class="coord">${fmtPos(l.catch_lat,l.catch_lon)}</span></div>`).openOn(map);
+  });
+  b.querySelector("#dtRemove")?.addEventListener("click",async()=>{
+    const {error}=await SH.sb.from("listings").update({status:"removed"}).eq("id",l.id);
+    if(error) shMsg("dtStat",shErr(error),"err"); else { shMsg("dtStat","削除しました","ok"); if(SH.sub==="admin") shAdmin(); }
+  });
+  b.querySelector("#dtBan")?.addEventListener("click",async e=>{
+    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと停止"; return; }
+    const {error}=await SH.sb.from("profiles").update({banned:true}).eq("id",l.owner_id);
+    if(error) shMsg("dtStat",shErr(error),"err"); else shMsg("dtStat","利用を停止しました","ok");
+  });
+}
+
+function editListing(l){
+  const caughtL=toLocalInput(new Date(l.caught_at).getTime()), shL=l.shime_at?toLocalInput(new Date(l.shime_at).getTime()):"";
+  const opt=(list,v)=>list.map(x=>`<option ${x===v?"selected":""}>${x}</option>`).join("");
+  const b=openDlg(`${l.species}の出品を編集`,`<p class="hint">釣った日時（${mdhm(caughtL)}）・魚種・写真・位置は変えられません。変えたいときは取り下げて出し直してください。申し込んでいる人には、変更のお知らせが届きます。</p>
+    <div class="grid">
+      <label>匹数<div class="unit"><input id="ed_count" type="number" min="1" value="${l.count}" inputmode="numeric"><span>匹</span></div></label>
+      <label>最大全長<div class="unit"><input id="ed_len" type="number" step="0.5" min="0" value="${l.length_cm??""}" inputmode="decimal"><span>cm</span></div></label>
+      <label>締め方（1つ選ぶ）<select id="ed_shime">${opt(["活魚","脳締め","氷締め","野締め"],l.shime)}</select></label>
+      <label>締めた日時<input id="ed_shimeAt" type="datetime-local" value="${shL}"></label>
+      <p class="sub-h full">締めたあとの処理（いくつでも）</p>
+      <div class="checks inline full" id="ed_treat">${["血抜き","神経締め","内臓除去"].map(v=>`<label><input type="checkbox" value="${v}" ${(l.treat||[]).includes(v)?"checked":""}>${v}</label>`).join("")}</div>
+      <label>保冷<select id="ed_cool"><option value=""></option>${opt(["氷","潮氷","クーラーのみ"],l.cooling)}</select></label>
+      <label>受け渡し場所の名前<input id="ed_area" maxlength="40" value="${esc(l.pickup_area)}"></label>
+      ${l.kind==="shop"?`<label>受け渡し方法<select id="ed_hand">${opt(["どちらでも","店に持ち込む","取りに来てもらう"],l.handoff)}</select></label>
+      <label>希望価格<div class="unit"><input id="ed_price" type="number" min="0" step="100" value="${l.price_yen??""}" inputmode="numeric"><span>円</span></div></label>`:""}
+      <label class="full">ひとこと<textarea id="ed_memo" maxlength="400">${esc(l.memo||"")}</textarea></label>
+    </div>
+    <div class="actions"><button type="button" class="btn" id="edBack">戻る</button><button type="button" class="btn primary" id="edSave">変更を保存</button></div>
+    <div class="status" id="edStat"></div>`);
+  b.querySelector("#edBack").onclick=()=>shDetail(l.id);
+  b.querySelector("#edSave").onclick=async e=>{
+    const sh=$("ed_shimeAt").value, tp=timeProblem(caughtL,sh);
+    if(tp) return shMsg("edStat",tp.msg,"err");
+    const count=num($("ed_count").value); if(!count||count<1) return shMsg("edStat","匹数を入れてください","err");
+    const area=$("ed_area").value.trim(); if(!area) return shMsg("edStat","受け渡し場所の名前を入れてください","err");
+    const patch={count,length_cm:num($("ed_len").value),shime:$("ed_shime").value,shime_at:sh?new Date(localMs(sh)).toISOString():null,
+      treat:[...$("ed_treat").querySelectorAll("input:checked")].map(i=>i.value),cooling:$("ed_cool").value||null,pickup_area:area,
+      handoff:l.kind==="shop"?$("ed_hand").value:null,price_yen:l.kind==="shop"?num($("ed_price").value):null,memo:$("ed_memo").value.trim()||null};
+    setBusy(e.target,true,"保存中…");
+    const {error}=await SH.sb.rpc("update_listing",{p_listing:l.id,p_patch:patch});
+    setBusy(e.target,false);
+    if(error) return shMsg("edStat",shErr(error),"err");
+    SH.cache.delete(l.id); await shDetail(l.id); shMsg("dtStat","変更を保存しました","ok");
+    if(SH.sub==="post") shMine();
+  };
+}
+function reqForm(l){
+  if(!identGate()) return;
+  const b=openDlg(`${l.species}に申し込む`,
+    `<p class="hint">${l.kind==="gift"?"おすそわけは無料です。お礼としてお金や物を渡す約束はしないでください。":"価格はここで提示し、支払いは受け渡しのときに当事者間で行います。"}</p>
+     <label>ひとこと（取りに行ける時間など）<textarea id="rqMsg" maxlength="400" placeholder="例：今日17時以降なら${esc(l.pickup_area)}まで取りに行けます"></textarea></label>
+     ${l.kind==="shop"?`<label style="margin-top:8px">提示価格<div class="unit"><input id="rqOffer" type="number" min="0" step="100" inputmode="numeric" value="${l.price_yen??""}"><span>円</span></div></label>`:""}
+     <div class="actions"><button type="button" class="btn" id="rqBack">戻る</button><button type="button" class="btn primary" id="rqSend">申し込む</button></div>
+     <div class="status" id="rqStat"></div>`);
+  b.querySelector("#rqBack").onclick=()=>{ if(SH.sub==="deals") $("dlg").close(); else shDetail(l.id); };
+  b.querySelector("#rqSend").onclick=async e=>{
+    const msg=$("rqMsg").value.trim();
+    if(!msg){ shMsg("rqStat","ひとこと入れてください","err"); return; }
+    const offer=l.kind==="shop"?num($("rqOffer").value):null;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.rpc("make_request",{p_listing:l.id,p_message:msg,p_offer:offer});
+    setBusy(e.target,false);
+    if(error){ shMsg("rqStat",shErr(error),"err"); return; }
+    $("dlg").close(); shSub("deals");
+  };
+}
+function reportForm(l){
+  const b=openDlg(`${l.species}の出品を通報`,
+    `<label>理由<select id="rpReason">${REPORT_REASONS.map(r=>`<option>${r}</option>`).join("")}</select></label>
+     <label style="margin-top:8px">くわしく（任意）<textarea id="rpDetail" maxlength="400"></textarea></label>
+     <p class="hint">通報は管理者だけが見ます。出品者には知らされません。</p>
+     <div class="actions"><button type="button" class="btn" id="rpBack">戻る</button><button type="button" class="btn primary" id="rpSend">通報する</button></div>
+     <div class="status" id="rpStat"></div>`);
+  b.querySelector("#rpBack").onclick=()=>shDetail(l.id);
+  b.querySelector("#rpSend").onclick=async()=>{
+    const {error}=await SH.sb.from("reports").insert({listing_id:l.id,reason:$("rpReason").value,detail:$("rpDetail").value.trim()||null});
+    if(error){ shMsg("rpStat",/duplicate/i.test(error.message)?"この出品はすでに通報済みです":shErr(error),"err"); return; }
+    shMsg("rpStat","通報しました。ご協力ありがとうございます","ok");
+  };
+}
+
+/* ---------- 出品する ---------- */
+function photoChecked(r){                        // 写真の撮影日時が釣った日時の前後3時間以内か
+  const t=recTime(r);
+  return (r.photoDates||[]).some(d=>d && Math.abs(new Date(d+":00+09:00").getTime()-t)<=3*3600000);
+}
+function shPost(){
+  const box=$("postCatches"), since=Date.now()-24*3600000;
+  const cands=records.filter(r=>!r.sample && recTime(r)>since).sort((a,b)=>b.datetime.localeCompare(a.datetime));
+  if(!cands.length) box.innerHTML=`<div class="empty">24時間以内に記録した釣果がありません。<br>先に「釣果を登録」で、写真をつけて記録してください。</div>`;
+  else box.innerHTML=cands.map(r=>{
+    const local=localPh(r).length>0, remote=!local && (MYP.has(String(r.id)) || (r.cloudPhotos||[]).length>0);
+    const why = blockedReason(r.species) ? `この種類は出品できません（${blockedReason(r.species)}）` : !local && !remote ? "写真がないため出品できません（釣果を編集して写真を追加）" : "";
+    const img = local ? r.photos[0] : feedPhotoUrls(r,true)[0];
+    return `<button type="button" class="card${why?" dis":""}${SH.post?.rec.id===r.id?" sel":""}" data-rid="${r.id}" ${why?'aria-disabled="true"':""} ${remote?'data-remote="1"':""}>
+      ${img?`<img src="${esc(img)}" alt="">`:`<div class="noimg">${remote?"☁":""}</div>`}
+      <div><div class="t"><span class="sp">${esc(r.species)}</span><span>${r.count||1}匹${r.length?` ・${r.length}cm`:""}</span></div>
+      <div class="facts"><span>${fmtDT(r.datetime)}</span>${r.spot?`<span>${esc(r.spot)}</span>`:""}${r.shime?`<span>${esc(shimeLine(r))}</span>`:""}</div>
+      ${why?`<div class="why">${esc(why)}</div>`:remote?`<div class="hint" style="margin:0">写真はほかの端末で撮ったものです。選ぶと、サーバーからこの端末に取り込みます</div>`:""}</div></button>`;
+  }).join("");
+  if(!mypLoaded && cands.some(r=>!localPh(r).length)) loadMyPhotos().then(()=>{ if(mypLoaded && !$("sub_post").hidden) shPost(); });
+  $("postForm").hidden=!SH.post;
+  if(SH.post?.pickup && !SH.pickMarker) setPickup(SH.post.pickup.lat,SH.post.pickup.lon);
+  shMine();
+}
+$("postCatches").addEventListener("click",async e=>{
+  const c=e.target.closest(".card[data-rid]"); if(!c||c.getAttribute("aria-disabled")) return;
+  const r=records.find(x=>x.id===c.dataset.rid); if(!r) return;
+  if(c.dataset.remote){                                // ほかの端末で撮った写真を取り込んでから出品へ
+    const w=c.querySelector(".hint"); if(w) w.textContent="写真を取り込んでいます…";
+    try{ if(!(await pullPhotos(r))) throw new Error("写真が見つかりませんでした"); render(); shPost(); }
+    catch(err){ if(w){ w.textContent="写真を取り込めませんでした："+shErr(err); w.className="why"; } return; }
+  }
+  shPostStart(r);
+});
+function shPostStart(r){
+  SH.post={rec:r, kind:null, pickup:null};
+  $("pf_count").value=r.count||1; $("pf_len").value=r.length??"";
+  $("pf_shime").value=r.shime||""; $("pf_shimeAt").value=fullShime(r); $("pf_cooling").value=r.cooling||"";
+  const tr=r.treat?String(r.treat).split(","):[];
+  $("pfTreat").querySelectorAll("input").forEach(i=>i.checked=tr.includes(i.value));
+  $("pf_area").value=""; $("pf_price").value=""; $("pf_memo").value=""; $("pf_handoff").value="どちらでも";
+  $("pfChecks").querySelectorAll("input").forEach(i=>i.checked=false);
+  shMsg("pfStat","");
+  setKind(null);
+  if(lastGps && Date.now()-lastGps.t<10*60000) setPickup(lastGps.lat,lastGps.lon);
+  else { clearPickup(); $("pfPickText").textContent="受け渡し場所の位置：未指定（「現在地」か「地図で指定」）"; }
+  shPost();
+  $("postForm").scrollIntoView({block:"start",behavior:"smooth"});
+}
+function setKind(k){
+  if(SH.post) SH.post.kind=k;
+  $("pfKind").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.k===k)));
+  document.querySelectorAll("#postForm .shop-only").forEach(el=>el.hidden=k!=="shop");
+  document.querySelectorAll("#postForm .gift-only").forEach(el=>el.hidden=k!=="gift");
+}
+$("pfKind").addEventListener("click",e=>{ const c=e.target.closest(".chip"); if(c) setKind(c.dataset.k); });
+const pickIcon = L.divIcon({className:"",html:'<div class="draft-pin pickup"></div>',iconSize:[0,0]});
+function setPickup(lat,lon){
+  if(!SH.post) return;
+  SH.post.pickup={lat,lon};
+  if(!SH.pickMarker) SH.pickMarker=L.marker([lat,lon],{icon:pickIcon,draggable:true}).addTo(map).on("dragend",e=>{ const p=e.target.getLatLng(); setPickup(p.lat,p.lng); });
+  else SH.pickMarker.setLatLng([lat,lon]);
+  $("pfPickText").textContent=`受け渡し場所の位置：${fmtPos(lat,lon)}${inToyama({lat,lon})?"":"（富山県外です）"}`;
+}
+function clearPickup(){ if(SH.pickMarker){ map.removeLayer(SH.pickMarker); SH.pickMarker=null; } }
+function shPickEnd(done){
+  if(!SH.pick) return; SH.pick=false; $("mapmode").hidden=true;
+  if(done && matchMedia("(max-width:820px)").matches) $("postForm").scrollIntoView({block:"center"});
+}
+$("pfMap").onclick=()=>{
+  SH.pick=true; $("mapmode").textContent="地図をタップして受け渡し場所を指定"; $("mapmode").className="mapmode"; $("mapmode").hidden=false;
+  if(SH.post?.pickup) map.panTo([SH.post.pickup.lat,SH.post.pickup.lon]);
+  if(matchMedia("(max-width:820px)").matches) $("map").scrollIntoView({block:"start"});
+};
+$("pfGps").onclick=()=>{
+  if(!navigator.geolocation){ shMsg("pfStat","この端末では現在地を取得できません。「地図で指定」を使ってください","err"); return; }
+  setBusy($("pfGps"),true,"取得中…");
+  navigator.geolocation.getCurrentPosition(p=>{ setBusy($("pfGps"),false); lastGps={lat:p.coords.latitude,lon:p.coords.longitude,t:Date.now()}; setPickup(p.coords.latitude,p.coords.longitude); map.panTo([p.coords.latitude,p.coords.longitude]); },
+    ()=>{ setBusy($("pfGps"),false); shMsg("pfStat","現在地を取得できませんでした。「地図で指定」を使ってください","err"); },
+    {enableHighAccuracy:true,timeout:15000,maximumAge:60000});
+};
+$("pfCancel").onclick=()=>{ SH.post=null; shPickEnd(); clearPickup(); shPost(); };
+$("pfSubmit").onclick=async()=>{
+  if(!identGate()) return;
+  const P=SH.post; if(!P) return; const r=P.rec;
+  const err=m=>{ shMsg("pfStat",m,"err"); };
+  if(!P.kind) return err("「おすそわけ」か「お店向け」かを選んでください");
+  const br=blockedReason(r.species); if(br) return err(`この種類は出品できません（${br}）`);
+  const count=num($("pf_count").value); if(!count||count<1) return err("匹数を入れてください");
+  const shime=$("pf_shime").value; if(!shime) return err("締め方を選んでください");
+  const area=$("pf_area").value.trim(); if(!area) return err("受け渡し場所の名前を入れてください（例：水橋漁港の駐車場）");
+  if(!P.pickup) return err("受け渡し場所の位置を「現在地」か「地図で指定」で決めてください");
+  if(!inToyama(P.pickup)) return err("受け渡し場所が富山県内ではありません");
+  if([...$("pfChecks").querySelectorAll("label")].filter(l=>!l.hidden).some(l=>!l.querySelector("input").checked)) return err("確認事項すべてにチェックしてください");
+  const caught=recTime(r);
+  if(Date.now()-caught>24*3600000) return err("出品できるのは24時間以内に釣った魚だけです");
+  const t=$("pf_shimeAt").value, tp=timeProblem(r.datetime,t);
+  if(tp) return err(tp.msg+(tp.fix?"締めた日時を直すか、「釣果一覧」でこの釣果の釣った日時を直してください。":""));
+  const shimeAt=t?new Date(localMs(t)).toISOString():null;
+  const src=(r.photos||[]).slice(0,4); if(!src.length) return err("写真がない釣果は出品できません");
+  const btn=$("pfSubmit"); setBusy(btn,true,"写真を送信中…");
+  const base=`${SH.user.id}/${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, paths=[];
+  try{
+    for(let i=0;i<src.length;i++){
+      const path=`${base}-${i}.jpg`;
+      const {error}=await SH.sb.storage.from("photos").upload(path,await dataUrlToBlob(src[i]),{contentType:"image/jpeg",upsert:false});
+      if(error) throw error; paths.push(path);
+    }
+    btn.textContent="出品を登録中…";
+    const row={kind:P.kind,species:r.species,count,length_cm:num($("pf_len").value),weight_g:r.weight||null,
+      caught_at:new Date(caught).toISOString(),catch_lat:r.lat,catch_lon:r.lon,pickup_lat:P.pickup.lat,pickup_lon:P.pickup.lon,pickup_area:area,
+      shime,treat:[...$("pfTreat").querySelectorAll("input:checked")].map(i=>i.value),shime_at:shimeAt,cooling:$("pf_cooling").value||null,
+      handoff:P.kind==="gift"?"取りに来てもらう":$("pf_handoff").value, price_yen:P.kind==="shop"?num($("pf_price").value):null,
+      memo:$("pf_memo").value.trim()||null, photos:paths, photo_checked:photoChecked(r)};
+    const {error}=await SH.sb.from("listings").insert(row);
+    if(error) throw error;
+    SH.post=null; clearPickup(); shPost();
+    shMsg("pfStat","");
+    $("mineList").scrollIntoView({block:"start",behavior:"smooth"});
+  }catch(e){
+    if(paths.length) SH.sb.storage.from("photos").remove(paths);
+    err(shErr(e));
+  }finally{ setBusy(btn,false); }
+};
+async function shMine(){
+  const {data,error}=await SH.sb.from("listing_cards").select("*").eq("mine",true).order("created_at",{ascending:false}).limit(30);
+  if(error){ $("mineList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  await drawListings("mineList",data,"まだ出品していません。");
+}
+
+/* ---------- やり取り ---------- */
+$("btnDealsReload").onclick=()=>shDeals();
+function seenMap(){ try{ return JSON.parse(localStorage.getItem("choka-seen")||"{}"); }catch{ return {}; } }
+function markSeen(rid,iso){ if(!iso) return; const m=seenMap(); if(!m[rid]||m[rid]<iso){ m[rid]=iso; try{ localStorage.setItem("choka-seen",JSON.stringify(m)); }catch{} } }
+const isUnread = (d,seen) => d.last_msg_at && ["pending","accepted"].includes(d.status) && (!seen[d.id] || seen[d.id] < d.last_msg_at);
+function dealStatus(d){
+  const own=d.i_am_owner;
+  const map={pending: own?["返事をしてください","hot"]:["返事待ち",""],
+    accepted: own?["受けました・受け渡し待ち","good"]:["決まりました・受け渡し待ち","good"],
+    done:["受け渡し済み",""], declined: own?(d.auto_declined?["ほかの方に決めました",""]:["お断りしました",""]):(d.can_reapply?["受付中に戻りました","hot"]:["今回は見送りになりました",""]),
+    cancelled: d.can_reapply?["取り消し（申し込み直せます）",""]:["取り消し",""]};
+  const [t,c]=map[d.status]||[d.status,""]; return `<span class="st ${c}">${t}</span>`;
+}
+function dealCard(d,seen){
+  const who = d.i_am_owner ? (d.shop_name?`${d.shop_name}（${d.shop_area}）・${d.requester_name}`:d.requester_name) : d.owner_name;
+  const ops=[];
+  ops.push(`<button type="button" class="btn sm${isUnread(d,seen)?" primary":""}" data-a="thread">メッセージ${d.msg_count?`（${d.msg_count}）`:""}${isUnread(d,seen)?" 新着":""}</button>`);
+  if(d.i_am_owner && d.status==="pending") ops.push(`<button type="button" class="btn sm primary" data-a="accept">受ける</button><button type="button" class="btn sm" data-a="decline">断る</button>`);
+  if(d.i_am_owner && d.status==="accepted") ops.push(`<button type="button" class="btn sm primary" data-a="finish">受け渡し完了</button>`);
+  if(!d.i_am_owner && ["pending","accepted"].includes(d.status)) ops.push(`<button type="button" class="btn sm danger" data-a="cancel">申し込みを取り消す</button>`);
+  if(d.can_reapply) ops.push(`<button type="button" class="btn sm primary" data-a="reapply">もう一度申し込む</button>`);
+  if(d.status==="done" && d.can_rate && !d.my_rated) ops.push(`<button type="button" class="btn sm primary" data-a="rate">相手を評価する</button>`);
+  if(d.status==="done" && d.my_rated) ops.push(`<span class="hint" style="margin:0">評価済み</span>`);
+  return `<div class="card deal" data-rqid="${d.id}"><div>
+    <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span>${dealStatus(d)}</div>
+    <div class="facts"><span>${d.i_am_owner?"申込者":"出品者"}：${esc(who)}${d.other_verified?VB:""}（${esc(ratingText(d.other_rating))}）</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.created_at)}</span></div>
+    <div class="facts"><span>「${esc(d.message)}」</span></div>
+    ${d.cancel_reason?`<div class="facts"><span>理由：${esc(d.cancel_reason)}</span></div>`:""}
+    <div class="ops">${ops.join("")}</div></div></div>`;
+}
+async function shDeals(){
+  const box=$("dealsList"); box.innerHTML=`<div class="empty">読み込み中…</div>`;
+  loadMyCard();
+  const {data,error}=await SH.sb.from("request_cards").select("*").eq("i_am_party",true).order("updated_at",{ascending:false}).limit(100);
+  if(error){ box.innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  data.forEach(d=>SH.deals.set(d.id,d));
+  const seen=seenMap(), inc=data.filter(d=>d.i_am_owner), out=data.filter(d=>d.i_am_requester);
+  box.innerHTML=`<div class="sec-h">自分の出品への申し込み</div>${inc.length?inc.map(d=>dealCard(d,seen)).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">自分の申し込み</div>${out.length?out.map(d=>dealCard(d,seen)).join(""):`<div class="empty">まだありません。</div>`}`;
+  updateBadge(data);
+}
+$("dealsList").addEventListener("click",async e=>{
+  const b=e.target.closest("button[data-a]"); if(!b) return;
+  const id=b.closest("[data-rqid]").dataset.rqid, a=b.dataset.a;
+  if(a==="thread"){ shThread(id); return; }
+  if(a==="rate"){ rateDlg(SH.deals.get(id)); return; }
+  if(a==="reapply"){ const d=SH.deals.get(id); reqForm({id:d.listing_id,kind:d.kind,species:d.species,pickup_area:d.pickup_area,price_yen:d.price_yen}); return; }
+  let reason=null;
+  if(a==="cancel"){
+    reason=await reasonDlg("申し込みを取り消す","取り消すと、出品者に理由つきでお知らせが届きます。受け渡しの場で魚を見てやめる場合も、ここから取り消してください。",REASONS.request,"取り消す");
+    if(reason==null) return;
+    $("dlg").close();
+  }
+  if(a==="decline" && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
+  if(a==="finish" && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="受け渡しが済んだら、もう一度押す"; return; }
+  const call={accept:["respond_request",{p_request:id,p_accept:true}],decline:["respond_request",{p_request:id,p_accept:false}],
+    finish:["finish_request",{p_request:id}],cancel:["cancel_request",{p_request:id,p_reason:reason}]}[a];
+  setBusy(b,true);
+  const {error}=await SH.sb.rpc(call[0],call[1]);
+  if(error){ setBusy(b,false); alert(shErr(error)); return; }
+  await shDeals();
+  if(a==="accept") shThread(id);
+});
+function rateDlg(d){
+  if(!d) return;
+  const items = d.i_am_owner ? ["時間を守った","やり取りが丁寧だった","また取引したい"] : ["説明どおりだった","鮮度・扱いがよかった","時間を守った"];
+  const who=d.i_am_owner?(d.shop_name||d.requester_name):d.owner_name;
+  const v=[0,0,0];
+  const b=openDlg(`${who}さんを評価`,`<p class="hint">${esc(d.species)} ${d.count}匹の取引について、5段階で評価してください。評価は1回だけで、相手には平均（3件以上たまってから）だけが表示されます。</p>
+    ${items.map((t,i)=>`<div class="rate-row"><span>${t}</span><div class="stars" data-i="${i}">${[1,2,3,4,5].map(n=>`<button type="button" data-n="${n}" aria-label="${t} ${n}">★</button>`).join("")}</div></div>`).join("")}
+    <label style="margin-top:8px">ひとこと（任意・管理者だけが見ます）<input id="rtCom" maxlength="200"></label>
+    <div class="actions"><button type="button" class="btn" id="rtBack">あとで</button><button type="button" class="btn primary" id="rtSend">評価する</button></div>
+    <div class="status" id="rtStat"></div>`);
+  b.querySelectorAll(".stars").forEach(g=>g.addEventListener("click",e=>{
+    const x=e.target.closest("button"); if(!x) return; const i=+g.dataset.i; v[i]=+x.dataset.n;
+    g.querySelectorAll("button").forEach(y=>y.classList.toggle("on",+y.dataset.n<=v[i]));
+  }));
+  b.querySelector("#rtBack").onclick=()=>$("dlg").close();
+  b.querySelector("#rtSend").onclick=async e=>{
+    if(v.some(n=>!n)) return shMsg("rtStat","3つとも星を選んでください","err");
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.rpc("rate_deal",{p_request:d.id,p_s1:v[0],p_s2:v[1],p_s3:v[2],p_comment:$("rtCom").value.trim()||null});
+    setBusy(e.target,false);
+    if(error) return shMsg("rtStat",shErr(error),"err");
+    $("dlg").close(); shDeals();
+  };
+}
+
+/* 連絡先カード */
+async function loadMyCard(){
+  const {data}=await SH.sb.from("contact_cards").select("*").eq("owner",SH.user.id).maybeSingle();
+  const c=data||{};
+  $("cc_phone").value=c.phone||""; $("cc_line").value=c.line_id||""; $("cc_addr").value=c.address||""; $("cc_hours").value=c.hours||""; $("cc_note").value=c.note||"";
+  $("cardSum").textContent = (c.phone||c.line_id||c.address) ? "（保存済み）" : "（まだ作っていません）";
+  return c;
+}
+$("cc_save").onclick=async e=>{
+  const row={owner:SH.user.id,phone:$("cc_phone").value.trim()||null,line_id:$("cc_line").value.trim()||null,address:$("cc_addr").value.trim()||null,hours:$("cc_hours").value.trim()||null,note:$("cc_note").value.trim()||null};
+  setBusy(e.target,true,"保存中…");
+  const {error}=await SH.sb.from("contact_cards").upsert(row);
+  setBusy(e.target,false);
+  if(error) return shMsg("ccStat",shErr(error),"err");
+  shMsg("ccStat","保存しました。決まった相手のやり取りで「連絡先カードを送る」を押すと渡せます","ok");
+  $("cardSum").textContent="（保存済み）";
+};
+const CARD_LABELS=[["phone","電話"],["line_id","LINE"],["address","住所"],["hours","時間帯"],["note","ひとこと"]];
+function cardHtml(c,name){
+  const d=c.data||{};
+  return `<div class="ccard"><h5>${esc(name)}さんの連絡先カード</h5><dl>${CARD_LABELS.filter(([k])=>d[k]).map(([k,t])=>`<dt>${t}</dt><dd>${k==="phone"?`<a href="tel:${esc(String(d[k]).replace(/[^0-9+]/g,""))}">${esc(d[k])}</a>`:esc(d[k])}</dd>`).join("")}</dl></div>`;
+}
+
+async function shThread(rid){
+  const d=SH.deals.get(rid); if(!d) return;
+  const party=d.i_am_party!==false;
+  const open=party && ["pending","accepted"].includes(d.status);
+  const who=d.i_am_owner?(d.shop_name||d.requester_name):d.owner_name;
+  const b=openDlg(party?`${d.species}：${who}さんとのやり取り`:`${d.species}：${d.owner_name} ⇔ ${d.shop_name||d.requester_name}（閲覧のみ）`,
+    `<p class="hint">受け渡しの場所と時間を決めてください。電話番号などはメッセージに書かず、申し込みが決まったら「連絡先カードを送る」で渡しましょう。受け渡しは港の駐車場など人目のある場所で。魚を見てやめるときは「申し込みを取り消す」から理由を選べます。</p>
+     <div class="thread" id="thr"></div>
+     ${party&&d.status==="accepted"?`<div class="toolbar"><button type="button" class="btn sm" id="thrCard">連絡先カードを送る</button><span class="hint" style="margin:0">電話番号などを安全に渡せます</span></div>`:""}
+     ${!party?`<p class="hint">管理者として閲覧しています。書き込みはできません。</p>`:open?`<div class="row"><label>メッセージ<textarea id="thrIn" maxlength="1000" rows="2" placeholder="例：17時に水橋漁港の駐車場でどうですか"></textarea></label><button type="button" class="btn primary" id="thrSend">送る</button></div>`:`<p class="hint">このやり取りは終わっています。</p>`}
+     <div class="status" id="thrStat"></div>`);
+  const first=`<div class="msg ${d.i_am_requester?"me":""}">${esc(d.message)}${d.offer_yen!=null?`\n（提示 ${yen(d.offer_yen)}）`:""}<small>申し込み ${fmtJ(d.created_at)}</small></div>`;
+  const load=async()=>{
+    const [{data,error},{data:cards}]=await Promise.all([
+      SH.sb.from("messages").select("*").eq("request_id",rid).order("id"),
+      SH.sb.from("deal_cards").select("*").eq("request_id",rid)]);
+    const box=$("thr"); if(!box||error) return;
+    const atEnd=box.scrollHeight-box.scrollTop-box.clientHeight<40;
+    const nameOf=uid=>uid===SH.user.id?"あなた":(d.i_am_owner?(d.shop_name||d.requester_name):(d.i_am_requester?d.owner_name:"相手"));
+    box.innerHTML=first+data.map(m=>m.kind==="system"
+        ? `<div class="msg sys">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`
+        : `<div class="msg ${m.sender===SH.user.id?"me":""}">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`).join("")
+      + (cards||[]).map(c=>cardHtml(c,nameOf(c.sender))).join("");
+    if(atEnd||!box.dataset.init){ box.scrollTop=box.scrollHeight; box.dataset.init="1"; }
+    if(party) markSeen(rid,data.at(-1)?.created_at);
+  };
+  await load(); clearInterval(SH.threadT); SH.threadT=setInterval(load,10000);
+  b.querySelector("#thrCard")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.rpc("send_card",{p_request:rid});
+    setBusy(e.target,false);
+    if(error){
+      shMsg("thrStat",shErr(error)+(/先に/.test(error.message)?"（「やり取り」の上の「自分の連絡先カード」で作れます）":""),"err");
+      return;
+    }
+    shMsg("thrStat","連絡先カードを送りました","ok"); await load(); $("thr").scrollTop=$("thr").scrollHeight;
+  });
+  b.querySelector("#thrSend")?.addEventListener("click",async e=>{
+    const body=$("thrIn").value.trim(); if(!body) return;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("messages").insert({request_id:rid,body});
+    setBusy(e.target,false);
+    if(error){ shMsg("thrStat",shErr(error),"err"); return; }
+    $("thrIn").value=""; shMsg("thrStat",""); await load(); $("thr").scrollTop=$("thr").scrollHeight;
+  });
+}
+function setBadge(n){
+  for(const id of ["shareBadge","dealsBadge"]){ $(id).hidden=!n; $(id).textContent=n||""; }
+}
+function updateBadge(list){
+  const seen=seenMap();
+  setBadge(list.filter(d=>(d.i_am_owner&&d.status==="pending")||isUnread(d,seen)).length);
+}
+async function shPoll(){
+  if(!SH.user||document.visibilityState!=="visible") return;
+  const {data}=await SH.sb.from("request_cards").select("id,status,i_am_owner,i_am_party,last_msg_at").eq("i_am_party",true).limit(200);
+  if(data) updateBadge(data);
+}
+function shPollStart(){ shPollStop(); shPoll(); SH.pollT=setInterval(shPoll,60000); }
+function shPollStop(){ clearInterval(SH.pollT); SH.pollT=null; }
+
+/* ---------- 釣果の提供（はじめの確認事項に同意した会員の釣果を、ログイン中に送る。写真は送らない） ---------- */
+const SYNC_KEY="choka-synced2";
+function lsGet(k){ try{ return localStorage.getItem(k); }catch{ return null; } }
+function lsSet(k,v){ try{ v==null?localStorage.removeItem(k):localStorage.setItem(k,v); }catch{} }
+function deviceId(){
+  let d=lsGet("choka-device");
+  if(!d){ d=(crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)); lsSet("choka-device",d); }
+  return d;
+}
+const sharingOn = () => !!(SH.sb && hasProfile() && isMember() && !SH.foreign);   // 確認事項に同意して表示名を登録した会員の釣果を送る
+function catchRow(r){
+  const {id,lat,lon,datetime,species,count,photos,photoDates,sample,feedPost,feedDirty,feedLog,...rest}=r;
+  if(rest.memo) rest.memo=String(rest.memo).slice(0,1000);
+  return {local_id:String(id).slice(0,40), caught_at:new Date(datetime+":00+09:00").toISOString(),
+    species:String(species||"不明").slice(0,40), count:count??null, lat, lon, data:rest};
+}
+const sendable = r => !r.sample && r.lat!=null && r.lon!=null && r.datetime && !isNaN(new Date(r.datetime+":00+09:00"));
+function shSyncRec(r){                          // 保存のたびに1件送る（失敗しても次回の起動時にまとめて送り直す）
+  if(!sharingOn()||!sendable(r)) return;
+  SH.sb.rpc("push_catches",{p_device:deviceId(),p_rows:[catchRow(r)]}).then(()=>{},()=>{});
+}
+function shSyncDel(id){
+  if(!sharingOn()) return;
+  SH.sb.rpc("forget_catch",{p_device:deviceId(),p_local:String(id)}).then(()=>{},()=>{});
+}
+let syncing=false;
+async function shSyncAll(){                     // 前回送ったあとに変わった記録をまとめて送る
+  if(!sharingOn()||syncing) return 0; syncing=true;
+  try{
+    const last=lsGet(SYNC_KEY), started=new Date().toISOString();
+    const recs=records.filter(r=>sendable(r) && (!last || (r.updatedAt||"")>last));
+    for(let i=0;i<recs.length;i+=200){
+      const {error}=await SH.sb.rpc("push_catches",{p_device:deviceId(),p_rows:recs.slice(i,i+200).map(catchRow)});
+      if(error) throw error;
+    }
+    lsSet(SYNC_KEY,started);
+    return recs.length;
+  }catch(e){ return 0; }                         // 送れなかった分は次に開いたときに送り直す
+  finally{ syncing=false; }
+}
+/* ---------- おすそわけの本人の確かめ：会員の申し込みで登録したカード ----------
+   電話番号は預からない。カードの「指紋」（同じカードかどうかだけが分かる番号）を Stripe から受け取ってサーバーで確かめる。
+   管理者の設定（require_card）がオンのときだけ、出品・申し込みの前に求める */
+const identOk = () => SH.profile?.role==="admin" || !SH.requireCard || !!SH.cardOk;
+async function loadSettings(){
+  const {data}=await SH.sb.from("app_settings").select("k,v");
+  if(data) SH.requireCard = data.some(x=>x.k==="require_card"&&x.v==="on");
+  SH.cardOk=false;
+  if(SH.requireCard && hasProfile()){ try{ const me=await billMe(); SH.cardOk=!!me?.card_ok; }catch{} }
+}
+const VB = '<span class="vbadge" title="会員の申し込みでカードを登録した人">カード登録済み</span>';
+function identGate(){
+  if(identOk()) return true;
+  const b=openDlg("おすそわけを使う前に",`<p>おすそわけを安心して使えるように、出品・申し込みは、会員の申し込みでカードを登録した人だけが使えます。</p>
+    <p class="hint">カードの番号はこのアプリには残りません。Stripe から「同じカードかどうか」だけが分かる番号を受け取り、利用を停止した人がアカウントを作り直して戻ってくるのを防ぎます。</p>
+    <div class="actions"><button type="button" class="btn primary" id="igJoin">会員・お支払い…</button><button type="button" class="btn" id="igClose">閉じる</button></div>`);
+  b.querySelector("#igJoin").onclick=()=>billingDlg();
+  b.querySelector("#igClose").onclick=()=>$("dlg").close();
+  return false;
+}
+function identUi(){ $("identNote").hidden = !hasProfile() || identOk(); }
+$("btnIdent").onclick=()=>billingDlg();
+
+/* ---------- PCとスマホの同期（会員）：釣果（写真は除く）と航跡。新しく変えた方を残す ----------
+   ・cloud_items に kind/id ごとに1行。消したら deleted=true を送って、ほかの端末でも消す
+   ・写真は「写真を同期」を押したときだけ cloud バケットへ（r.cloudPhotos にパスを残す） */
+const CL={busy:false, last:0};
+const clKey = k => `choka-cloud-${k}-${SH.user?.id||""}`;
+const cloudOn = () => !!(SH.sb && hasProfile() && isMember() && !SH.foreign);
+function cloudUi(){
+  const on=cloudOn();
+  $("cloudOps").hidden=!on;
+  if(SH.foreign){
+    $("cloudInfo").innerHTML=`<b style="color:var(--magenta)">この端末には別のアカウントの記録が入っているため、同期と新着への掲載を止めています。</b> <button type="button" class="btn sm" id="btnForeign">どうするか選ぶ</button>`;
+    $("btnForeign").onclick=()=>foreignDlg();
+    return;
+  }
+  $("cloudInfo").textContent = on ? `ログイン中は、釣果（写真は除く）と航跡を自動で同期します。${lsGet(clKey("at"))?`最後に同期：${fmtJ(lsGet(clKey("at")))}`:""}`
+    : cloudReadOn() ? "会員の期限が切れているため、サーバーの記録を取り込んで見ることだけできます（記録の追加・変更と送信は止めています）。「会員・お支払い・紹介」から再開できます。"
+    : (hasProfile() ? "同期は会員の機能です。会員になると、釣果と航跡がPCとスマホで自動でそろいます。" : "会員がログインすると、釣果（写真は除く）と航跡が自動でPCとスマホにそろいます。");
+}
+function cloudForget(kind,id){            // 消したことを覚えておき、次の同期で送る
+  if(!SH.user) return;
+  let q=[]; try{ q=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+  q.push({kind,id:String(id),at:new Date().toISOString()}); lsSet(clKey("del"),JSON.stringify(q.slice(-2000)));
+  if(cloudOn()) cloudSoon(); else cloudPushDeletes();
+}
+/* 会員でなくなっても「消した」印だけは送る。ほかの端末の同じ記録も消え、サーバーが新着からも消す */
+async function cloudPushDeletes(){
+  if(!(SH.sb && hasProfile() && !SH.foreign) || cloudOn()) return;
+  let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+  if(!dels.length) return;
+  const rows=dels.map(d=>({kind:d.kind,id:d.id,data:null,deleted:true,updated_at:d.at}));
+  for(let i=0;i<rows.length;i+=50){ const {error}=await SH.sb.from("cloud_items").upsert(rows.slice(i,i+50),{onConflict:"owner,kind,id"}); if(error) return; }
+  lsSet(clKey("del"),null);
+}
+const catchData = r => { const {photos,sample,feedPost,feedDirty,feedLog,...d}=r; return d; };
+/* 写真の目印は、記録全体とは別に「写真を変えた日時」が新しい方を残す */
+const PHK=["photoSig","photoAt","cloudPhotos","cloudSig"];
+const phNewer=(a,b)=>(a?.photoAt||"") > (b?.photoAt||"");
+/* 会員の期限が切れた人（支払いが止まった・解約した）：サーバーの記録を取り込んで見ることだけできる */
+const cloudReadOn = () => !!(SH.sb && hasProfile() && !SH.foreign && SH.profile?.member_until && !isMember());
+async function cloudSync(force){
+  if(!(cloudOn()||cloudReadOn())||CL.busy) return;
+  const readOnly=!cloudOn();
+  if(!force && Date.now()-CL.last<20000) return;
+  CL.busy=true; CL.last=Date.now();
+  let got=0, sent=0; const pulled=new Map();   // 取り込んだばかりのものは送り返さない
+  try{
+    // 1) ほかの端末で変わった分を取り込む
+    let since=lsGet(clKey("pull"))||"1970-01-01T00:00:00Z";
+    for(;;){
+      const {data,error}=await SH.sb.from("cloud_items").select("kind,id,data,deleted,updated_at,synced_at").gt("synced_at",since).order("synced_at").limit(500);
+      if(error) throw error;
+      for(const x of data){
+        const iso=new Date(x.updated_at).toISOString();
+        if(x.kind==="catch"){
+          const loc=records.find(r=>r.id===x.id);
+          if(x.deleted){ if(loc && !((loc.updatedAt||"")>iso)){ await trashPut(loc); await delRec(x.id,true); records=records.filter(r=>r.id!==x.id); got++; } continue; }
+          if(loc && (loc.updatedAt||"")>=iso){                       // 記録はこの端末の方が新しい：写真の目印だけ、新しければ取り込む
+            if(phNewer(x.data,loc)){ for(const k of PHK) if(x.data[k]!==undefined) loc[k]=x.data[k]; await saveRec(loc); got++; }
+            continue;
+          }
+          const r={...x.data, id:x.id, photos:loc?.photos||[], updatedAt:iso};
+          if(loc?.feedPost) r.feedPost=loc.feedPost;                  // この端末が新着に送った写真の目印は残す
+          if(loc && phNewer(loc,x.data)) for(const k of PHK) r[k]=loc[k];   // 写真の目印は、この端末の方が新しければそのまま
+          await saveRec(r); records=records.filter(q=>q.id!==x.id).concat(r); got++;
+        }else{
+          if(rec && rec.track.id===x.id) continue;                 // 記録中の航跡はこの端末を優先
+          const loc=tracks.find(t=>t.id===x.id);
+          if(loc && (loc.updatedAt||"")>iso) continue;
+          if(x.deleted){ if(loc){ await delTrk(x.id,true); tracks=tracks.filter(t=>t.id!==x.id); got++; } continue; }
+          if(loc && (loc.updatedAt||"")===iso) continue;
+          const t={...x.data, id:x.id, updatedAt:iso, visible:loc?loc.visible:true};
+          await saveTrk(t,true); tracks=tracks.filter(q=>q.id!==x.id).concat(t); got++;
+        }
+        pulled.set(x.kind+":"+x.id,iso); since=x.synced_at;
+      }
+      lsSet(clKey("pull"),since);
+      if(data.length<500) break;
+    }
+    // 2) この端末で変えた分を送る（会員だけ）
+    if(readOnly){
+      if(got){ render(); drawTracks(); drawTrackList(); }
+      lsSet(clKey("at"),new Date().toISOString()); cloudUi();
+      shMsg("cloudStat",`記録を取り込みました（${hm(Date.now())}${got?`・${got}件`:""}。会員の期限が切れているため、見るだけです）`,"ok");
+      return;
+    }
+    const pushedAt=lsGet(clKey("push"))||"", started=new Date().toISOString();
+    const rePh=!lsGet(clKey("phfix1"));                            // 一度だけ：写真の目印を送り直す（前の版で捨てられた分を直す）
+    let dels=[]; try{ dels=JSON.parse(lsGet(clKey("del"))||"[]"); }catch{}
+    const rows=[
+      ...records.filter(r=>!r.sample && (((r.updatedAt||"1970")>pushedAt && pulled.get("catch:"+r.id)!==r.updatedAt) || (rePh && r.photoAt))).map(r=>({kind:"catch",id:String(r.id),data:catchData(r),deleted:false,updated_at:r.updatedAt||"2000-01-01T00:00:00Z"})),
+      ...tracks.filter(t=>(t.updatedAt||"1970")>pushedAt && pulled.get("track:"+t.id)!==t.updatedAt).map(t=>{ const {visible,...d}=t; return {kind:"track",id:String(t.id),data:d,deleted:false,updated_at:t.updatedAt||"2000-01-01T00:00:00Z"}; }),
+      ...dels.map(d=>({kind:d.kind,id:d.id,data:null,deleted:true,updated_at:d.at}))];
+    for(let i=0;i<rows.length;i+=50){
+      const {error}=await SH.sb.from("cloud_items").upsert(rows.slice(i,i+50),{onConflict:"owner,kind,id"});
+      if(error) throw error;
+      sent+=Math.min(50,rows.length-i);
+    }
+    lsSet(clKey("push"),started); lsSet(clKey("del"),null); lsSet(clKey("phfix1"),"1");
+    if(got){ render(); drawTracks(); drawTrackList(); }
+    lsSet(clKey("at"),new Date().toISOString()); cloudUi();
+    shMsg("cloudStat",`同期しました（${hm(Date.now())}${got?`・取り込み${got}件`:""}${sent?`・送信${sent}件`:""}）`,"ok");
+  }catch(e){ shMsg("cloudStat","同期できませんでした（電波のよいところで「記録を今すぐ同期」を押してください）："+shErr(e),"err"); }
+  finally{ CL.busy=false; }
+}
+let clT=null; function cloudSoon(){ clearTimeout(clT); clT=setTimeout(()=>cloudSync(true),1500); }
+$("btnCloudFull").onclick=async e=>{                          // 取り込みの位置を最初に戻して、サーバーの記録をすべて読み直す
+  setBusy(e.target,true,"取り込み中…"); const n=records.length;
+  lsSet(clKey("pull"),null); await cloudSync(true);
+  setBusy(e.target,false);
+  shMsg("cloudStat",`サーバーから取り込み直しました（釣果 ${n}件 → ${records.length}件）`,"ok");
+};
+$("btnCloudSync").onclick=async e=>{ setBusy(e.target,true,"同期中…"); await cloudSync(true); setBusy(e.target,false); };
+document.addEventListener("visibilitychange",()=>{ if(cloudOn()||cloudReadOn()) cloudSync(); });   // 開いたとき・裏に回るとき
+
+/* 写真の同期（手動）：この端末の写真を送り、ほかの端末で送った写真を取り込む */
+$("btnCloudPhotos").onclick=async e=>{
+  if(!cloudOn()) return;
+  // 送るのは、この端末の写真が最新で、まだ送っていないもの。取り込むのは、最新の写真が写真の同期にだけあるもの
+  const up=records.filter(r=>!r.sample && localPh(r).length && (!(r.cloudPhotos||[]).length || r.cloudSig!==(r.photoSig ?? photoSig(r.photos))));
+  const down=records.filter(r=>photoState(r).kind==="cloud");
+  const bytes=up.reduce((s,r)=>s+r.photos.reduce((a,p)=>a+Math.round(p.length*0.75),0),0);
+  const {data:u}=await SH.sb.rpc("cloud_usage");
+  const MB=n=>(n/1048576).toFixed(1);
+  const b=openDlg("写真を同期",`<table class="kv">
+      <tr><td>送る写真</td><td>${up.reduce((s,r)=>s+r.photos.length,0)}枚（約${MB(bytes)}MB・${up.length}件の釣果）</td></tr>
+      <tr><td>取り込む写真</td><td>${down.reduce((s,r)=>s+r.cloudPhotos.length,0)}枚（${down.length}件の釣果）</td></tr>
+      ${u?`<tr><td>保存済み</td><td>写真 約${MB(u.photo_bytes||0)}MB／記録 約${MB(u.bytes||0)}MB（釣果${u.catches}件・航跡${u.tracks}本）</td></tr>`:""}</table>
+    <p class="hint">写真は通信量が多いので、Wi-Fiのときにおすすめします。送った写真は本人だけが見られます。</p>
+    <div class="actions"><button type="button" class="btn" id="cpNo">やめる</button><button type="button" class="btn primary" id="cpGo" ${up.length||down.length?"":"disabled"}>${up.length&&down.length?"写真を送る・取り込む":up.length?"写真を送る":down.length?"写真を取り込む":"同期する写真はありません"}</button></div>
+    <div class="status" id="cpStat"></div>`);
+  b.querySelector("#cpNo").onclick=()=>$("dlg").close();
+  b.querySelector("#cpGo").onclick=async ev=>{
+    setBusy(ev.target,true,"同期中…"); let n=0, fail=0;
+    for(const r of up){
+      try{
+        const paths=[];
+        for(let i=0;i<r.photos.length;i++){
+          const path=`${SH.user.id}/${String(r.id).replace(/[^\w-]/g,"")}-${i}-${Date.now().toString(36)}.jpg`;
+          const {error}=await SH.sb.storage.from("cloud").upload(path,await dataUrlToBlob(r.photos[i]),{contentType:"image/jpeg",upsert:false});
+          if(error) throw error; paths.push(path); n++;
+          shMsg("cpStat",`送信中… ${n}枚`);
+        }
+        const old=r.cloudPhotos||[]; r.cloudPhotos=paths; r.cloudSig=r.photoSig ?? photoSig(r.photos); r.updatedAt=new Date().toISOString(); await saveRec(r);
+        if(old.length) SH.sb.storage.from("cloud").remove(old);
+      }catch{ fail++; }
+    }
+    for(const r of down){
+      try{
+        const {data,error}=await SH.sb.storage.from("cloud").createSignedUrls(r.cloudPhotos,600); if(error) throw error;
+        const ph=[]; for(const x of data){ const bl=await (await fetch(x.signedUrl)).blob(); ph.push(await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.readAsDataURL(bl); })); n++; shMsg("cpStat",`取り込み中… ${n}枚`); }
+        r.photos=ph; r.photoDates=ph.map((_,i)=>r.photoDates?.[i]??null); await saveRec(r);
+      }catch{ fail++; }
+    }
+    setBusy(ev.target,false); render(); await cloudSync(true);
+    shMsg("cpStat",fail?`${n}枚を同期しました。${fail}件は失敗しました（もう一度押すと続きから同期します）`:`${n}枚の写真を同期しました`,fail?"err":"ok");
+  };
+};
+
+/* ---------- 釣果を「みんな」の新着に載せる（会員） ----------
+   ・「釣果を登録」で「みんなの新着に載せる」を選んだ記録を、保存・位置の修正のたびにサーバーへ送る（同じ記録は1件にまとめて上書き）
+   ・写真は変わったときだけ公開の posts バケットへ送り直す（縮小済みで、撮影場所などの情報は入っていない）
+   ・電波がなくて送れなかった分は feedDirty を付けておき、次にログインしたときに送り直す */
+function feedDefaults(){ try{ return {on:true,...JSON.parse(lsGet("choka-feed-def")||"{}")}; }catch{ return {on:true}; } }
+/* 会員に見せるくわしい記録（写真・番号・同期用の印などは除く） */
+const DETAIL_KEYS=["weight","tana","tanaRef","depth","bait","spot","bottom","echo","drift","treat","cooling","shimeAt",
+  "weather","temp","press","windDir","wind","gust","sst","wave","wavePer","waveDir","color","tideName","moon","tideMove","tideLv","high","low","memo"];
+function feedDetail(r){
+  const d={}; for(const k of DETAIL_KEYS){ const v=k==="shimeAt"?fullShime(r):r[k]; if(v!=null && v!=="") d[k]=typeof v==="string"?v.slice(0,k==="memo"?1000:80):v; }
+  return d;
+}
+/* 一覧用の小さい写真（320px）。元の写真の名前に -t を付けて置く */
+const thumbOf = p => p ? p.replace(/\.jpg$/,"-t.jpg") : "";
+function thumbBlob(dataUrl){ return new Promise((res,rej)=>{ const img=new Image(); img.onload=()=>{ const s=Math.min(1,320/Math.max(img.width,img.height)), c=document.createElement("canvas");
+  c.width=Math.round(img.width*s); c.height=Math.round(img.height*s); c.getContext("2d").drawImage(img,0,0,c.width,c.height); c.toBlob(b=>b?res(b):rej(),"image/jpeg",0.75); }; img.onerror=rej; img.src=dataUrl; }); }
+const withThumbs = list => list.flatMap(p=>[p,thumbOf(p)]);
+const feedOnline = () => !!(SH.sb && hasProfile() && isMember() && !SH.foreign);
+/* 写真の目印（中身から作る）。前の版の目印とも比べられるようにしておく */
+const photoSig = ph => (ph||[]).map(p=>{ let h=2166136261; for(let i=0;i<p.length;i+=89) h=Math.imul(h^p.charCodeAt(i),16777619)>>>0; return p.length+":"+h.toString(36)+":"+p.slice(-12); }).join("|");
+const oldPhotoSig = ph => (ph||[]).map(p=>p.length+":"+p.slice(-24)).join("|");
+const sigEq = (s,ph) => s===photoSig(ph) || s===oldPhotoSig(ph);
+const feedAgain = new Set();
+const feedBusy = new Set();
+async function feedPush(r,backfill){
+  if(r.sample) return;
+  if(!feedOnline()){                                            // 今は送れない：あとで送り直す印を付ける
+    if(r.feed!==undefined && hasProfile() && records.some(x=>x.id===r.id)){ r.feedDirty=true; await saveRec(r); }
+    return;
+  }
+  if(feedBusy.has(r.id)){ feedAgain.add(r.id); return; }        // 送っている途中に直したら、終わってからもう一度
+  if(!r.feed) return feedRemove(r);
+  feedBusy.add(r.id);
+  let uploaded=[];
+  try{
+    const sig=photoSig(r.photos), had=r.feedPost?.sig, f=MYP.get(String(r.id));
+    // 写真を送るのは、この端末の写真が最新のときだけ（古い写真で上書きしない。サーバーでも写真を変えた日時で確かめる）
+    const known=r.photoSig!==undefined, current=photosCurrent(r);
+    const wantSig=known ? r.photoSig : sig;
+    // 新着と同じ写真か：サーバーの新着の状態（MYP）が分かればそれで決める。分からないときだけ、この端末が前に送った目印で決める
+    const fks=knownFeedSig(f);
+    const same = f && fks!=null
+      ? (f.photos.length ? (fks===wantSig || sigEq(fks,r.photos)) : !(r.photos||[]).length)
+      : (had!==undefined && sigEq(had,r.photos));
+    let photos=null;                                              // null＝サーバーの写真をそのまま使う
+    // 前の版の記録（目印なし）は、新着にまだ写真がないときだけ写真を送る（どの端末の写真が新しいか分からないため）
+    const legacyBlock = !known && (!mypLoaded || (f?.photos?.length > 0));
+    if(current && (r.photos||[]).length && !same && !legacyBlock){
+      const base=`${SH.user.id}/c${String(r.id).replace(/[^\w-]/g,"").slice(0,20)}-${Date.now().toString(36)}`;
+      for(let i=0;i<Math.min(6,r.photos.length);i++){
+        const path=`${base}-${i}.jpg`;
+        const {error}=await SH.sb.storage.from("posts").upload(path,await dataUrlToBlob(r.photos[i]),{contentType:"image/jpeg",upsert:false});
+        if(error) throw error; uploaded.push(path);
+        try{ const t=await SH.sb.storage.from("posts").upload(thumbOf(path),await thumbBlob(r.photos[i]),{contentType:"image/jpeg",upsert:false}); if(!t.error) uploaded.push(thumbOf(path)); }catch{}
+      }
+      photos=uploaded.filter(x=>!/-t\.jpg$/.test(x));
+    } else if(current && known && r.photoSig==="" && !same) photos=[];   // 写真を全部外した（目印のある記録だけ）
+    const {data,error}=await SH.sb.rpc("upsert_catch_post",{p:{               // 位置とくわしい記録は、サーバー側で会員にだけ見せる
+      catch_id:String(r.id), species:r.species, size_cm:r.length||null, count:r.count||null,
+      method:r.method||null, shime:r.shime||null, caught_at:new Date(r.datetime+":00+09:00").toISOString(),
+      pref:r.pref||null, lat:r.lat, lon:r.lon, detail:feedDetail(r), photos, backfill:!!backfill,
+      photo_sig:wantSig, photo_at: photos ? (r.photoAt || (known ? new Date().toISOString() : null)) : null}});
+    if(error) throw error;
+    const sentN=photos?photos.length:null;
+    if(data?.stale){                                              // サーバーにもっと新しい写真がある：送った写真は捨てる
+      if(uploaded.length) SH.sb.storage.from("posts").remove(uploaded);
+      uploaded=[]; photos=null; loadMyPhotos();
+    }
+    const log=`${fmtJ(new Date().toISOString())} ${data?.stale?"送信しました（写真は、サーバーにもっと新しく変えた写真があるため送りませんでした）":sentN==null?"送信しました（写真はそのまま）":`送信しました（写真${sentN}枚）`}`;
+    if(data?.old_photos?.length) SH.sb.storage.from("posts").remove(withThumbs(data.old_photos));
+    if(photos) MYP.set(String(r.id),{photos,sig:wantSig});
+    // 送っている間に記録が直されていることがあるので、結果は今の記録に書き込む（古い記録で上書きしない）
+    const cur=records.find(x=>x.id===r.id);
+    for(const o of new Set([r,cur].filter(Boolean))){ o.feedPost={id:data.id, sig: photos ? sig : had}; if(o.feedPost.sig===undefined) delete o.feedPost.sig; delete o.feedDirty; o.feedLog=log; }
+    if(cur) await saveRec(cur);
+    if(!$("viewFeed").hidden && FD.fsub==="new" && NW.mode==="feed") nwLoad(true);
+  }catch(e){
+    if(uploaded.length) SH.sb.storage.from("posts").remove(uploaded);
+    const cur=records.find(x=>x.id===r.id);
+    const log=`${fmtJ(new Date().toISOString())} 送れませんでした：${shErr(e)}`;
+    for(const o of new Set([r,cur].filter(Boolean))){ o.feedDirty=true; o.feedLog=log; }
+    if(cur) await saveRec(cur);
+    shMsg("cloudStat","新着への反映ができませんでした。電波のよいところで、自動で送り直します","err");
+  }finally{
+    feedBusy.delete(r.id);
+    if(feedAgain.delete(r.id)){ const cur=records.find(x=>x.id===r.id); if(cur) feedPush(cur); }
+  }
+}
+/* 送れていない分を、開いている間もときどき送り直す */
+setInterval(()=>{ if(document.visibilityState==="visible") feedSweep(); },120000);
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible") feedSweep(); });
+const FEED_DEL="choka-feed-del";                                  // 消した記録で、まだ新着から外せていないもの
+async function feedDelete(id){
+  const {data,error}=await SH.sb.from("posts").delete().eq("owner",SH.user.id).eq("catch_id",String(id)).select("photos");
+  if(error) throw error;
+  const ph=(data||[]).flatMap(x=>x.photos||[]); if(ph.length) SH.sb.storage.from("posts").remove(withThumbs(ph));
+  return (data||[]).length;
+}
+/* 新着から外した釣果を、開いている一覧と地図からもすぐ消す */
+function feedForget(id){
+  const n=NW.list.length; NW.list=NW.list.filter(p=>!(p.mine && p.catch_id===String(id)));
+  if(NW.list.length!==n){ document.querySelectorAll("#nwList .card[data-pid]").forEach(c=>{ if(!NW.list.some(p=>p.id===c.dataset.pid)) c.remove(); }); drawPostMarkers(NW.list, NW.mode!=="feed"); }
+}
+/* 自分の釣果を新着から外すのは、会員でなくなっても本人ならできる（ログインしていれば） */
+const feedOwnerOn = () => !!(SH.sb && hasProfile() && !SH.foreign);
+function feedDelQueue(){ let q=[]; try{ q=JSON.parse(lsGet(FEED_DEL)||"[]"); }catch{}
+  return q.map(x=>typeof x==="string"?{id:x,owner:null,at:Date.now()}:x); }   // 前の版は番号だけ
+async function feedRemove(r){                                     // 記録を消した・載せるのをやめたとき
+  const alive=records.some(x=>x.id===r.id);
+  try{
+    if(!feedOwnerOn()) throw 0;
+    await feedDelete(r.id); MYP.delete(String(r.id));
+    r.feedPost=null; delete r.feedDirty;
+    feedForget(r.id);
+  }catch{
+    if(alive) r.feedDirty=true;
+    else { const q=feedDelQueue(); if(!q.some(x=>x.id===String(r.id))) q.push({id:String(r.id), owner:SH.user?.id||null, at:Date.now()}); lsSet(FEED_DEL,JSON.stringify(q.slice(-500))); }
+  }
+  const cur=records.find(x=>x.id===r.id);
+  if(cur && cur!==r){ cur.feedPost=r.feedPost; if(r.feedDirty) cur.feedDirty=true; else delete cur.feedDirty; }
+  if(cur) await saveRec(cur);
+}
+/* これまでに登録した釣果を、一度だけまとめて新着に載せる（会員・端末ごとに1回）。
+   1日以上前の釣果は、新着の先頭に並ばないよう釣った日時の順で載せる。すでに載せている分も、位置とくわしい記録を付けて送り直す */
+let backfilling=false;
+async function feedBackfill(){
+  if(!feedOnline() || backfilling) return;
+  const key=`choka-feed-backfill1-${SH.user.id}`;
+  if(lsGet(key)==="done") return;
+  const todo=records.filter(r=>!r.sample && r.feed!==false && r.lat!=null && r.lon!=null && r.datetime);
+  if(!todo.length){ lsSet(key,"done"); return; }
+  backfilling=true; let n=0, fail=0;
+  try{
+    for(const r of todo){
+      if(!feedOnline()) return;                                  // 途中でやめたら、次に開いたときに続きから
+      if(r.feed===undefined){
+        r.feed=true; if(!r.pref) r.pref=(await guessPref(r.lat,r.lon))||null;
+        r.updatedAt=new Date().toISOString(); await saveRec(r);
+      }
+      await feedPush(r, localMs(r.datetime) < Date.now()-86400000);
+      r.feedDirty ? fail++ : n++;
+      shMsg("cloudStat",`これまでの釣果を「みんな」の新着に載せています… ${n+fail}/${todo.length}件`);
+    }
+    lsSet(key,"done"); cloudSoon();
+    shMsg("cloudStat",`これまでの釣果${n}件を「みんな」の新着に載せました${fail?`（${fail}件は電波のよいときに送り直します）`:""}`, fail?"err":"ok");
+    if(!$("viewFeed").hidden && FD.fsub==="new" && NW.mode==="feed") nwLoad(true);
+  }finally{ backfilling=false; }
+}
+async function feedSweep(){                                       // 送れていない分を送り直す（1回に20件まで）
+  if(!feedOwnerOn()) return;
+  // 消した釣果で、まだ新着から外せていないもの（会員でなくても本人なら外せる）。ほかのアカウントの分は残しておく
+  const left=[];
+  for(const x of feedDelQueue()){
+    if(x.owner && x.owner!==SH.user.id){ left.push(x); continue; }
+    try{ const n=await feedDelete(x.id); feedForget(x.id); if(!x.owner && !n && Date.now()-x.at<30*86400000) left.push(x); }
+    catch{ left.push(x); }
+  }
+  lsSet(FEED_DEL,left.length?JSON.stringify(left):null);
+  if(!feedOnline()) return;                                       // ここから先（載せる・直す）は会員だけ
+  // 新着の写真が最新でなければ、最新の写真を持っているこの端末から直す
+  const heal=r=>{ if(!(mypLoaded && r.feed && r.photoSig!==undefined && photosCurrent(r))) return false;
+    const f=MYP.get(String(r.id)); if(!f) return false;
+    return r.photoSig==="" ? f.photos.length>0 : f.sig!==r.photoSig; };
+  const todo=records.filter(r=>!r.sample && ((r.feed && (!r.feedPost || r.feedDirty)) || (!r.feed && (r.feedPost || r.feedDirty)) || heal(r))).slice(0,20);
+  for(const r of todo) await feedPush(r);
+}
+
+/* ---------- 釣果の写真：この端末にあればそれを使い、なければサーバー（新着に載せた写真・写真の同期）から見る ----------
+   写真はふだん端末の中だけにあり、ほかの端末には「写真の同期」を押したときだけ届く。
+   新着に載せた写真はサーバーにもあるので、ほかの端末ではそれを表示し、出品のときは端末に取り込んで使う */
+const MYP=new Map();                 // 釣果の番号 → {photos：新着に載っている写真のパス, sig：その目印}（自分の分）
+let mypLoaded=false;
+async function loadMyPhotos(){
+  if(!(SH.sb && hasProfile())) return;
+  const {data,error}=await SH.sb.from("post_cards").select("catch_id,photos,photo_sig").eq("mine",true).eq("kind","catch").limit(5000);
+  if(error||!data) return;
+  MYP.clear(); for(const x of data) if(x.catch_id) MYP.set(x.catch_id,{photos:x.photos||[],sig:x.photo_sig??null});
+  mypLoaded=true;
+  render();
+}
+const feedPhotoUrls = (r,thumb) => { const st=photoState(r); return st.kind==="feed" ? st.paths.map(x=>postUrl(thumb?thumbOf(x):x)) : []; };
+async function remotePhotoUrls(r){
+  const st=photoState(r);
+  if(st.kind==="feed") return st.paths.map(x=>postUrl(x));
+  if(st.kind==="cloud" && SH.sb && hasProfile()){
+    const {data}=await SH.sb.storage.from("cloud").createSignedUrls(st.paths,600);
+    return (data||[]).map(x=>x.signedUrl).filter(Boolean);
+  }
+  return [];
+}
+const blobToDataUrl = b => new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.readAsDataURL(b); });
+async function pullPhotos(r){                       // サーバーの写真を、この端末の記録に取り込む
+  const urls=await remotePhotoUrls(r); if(!urls.length) return false;
+  const ph=[]; for(const u of urls){ const res=await fetch(u); if(!res.ok) throw new Error("写真を取り込めませんでした"); ph.push(await blobToDataUrl(await res.blob())); }
+  r.photos=ph; r.photoDates=ph.map((_,i)=>r.photoDates?.[i]??null);
+  if(MYP.has(String(r.id))) r.feedPost={...(r.feedPost||{}), sig:photoSig(ph)};   // 同じ写真を新着へ送り直さない
+  await saveRec(r);
+  return true;
+}
+/* 釣果一覧の小さい写真。端末の写真は表示する直前に小さく作り直す（サーバーは使わない） */
+const THUMBS=new Map();
+function recThumbHtml(r){
+  const st=photoState(r);
+  if(st.kind==="local") return (r.photos||[]).length ? `<img class="rthumb" data-lt="${esc(r.id)}" alt="${esc(r.species)}の写真">` : "";
+  if(st.kind==="feed"){ const f=feedPhotoUrls(r,true)[0];
+    return `<img class="rthumb" src="${esc(f)}" data-full="${esc(feedPhotoUrls(r,false)[0])}" onerror="if(this.dataset.full&&this.src!==this.dataset.full)this.src=this.dataset.full" loading="lazy" alt="${esc(r.species)}の写真" title="新着に載せた写真（サーバー）">`; }
+  if(st.kind==="cloud") return `<span class="rthumb" title="写真はサーバーにあります（写真の同期で取り込めます）">☁<br>写真${st.paths.length}枚</span>`;
+  if(st.kind==="missing") return `<span class="rthumb" title="最新の写真は、写真を変えた端末にだけあります">写真は<br>ほかの端末</span>`;
+  return "";
+}
+const thumbIO = "IntersectionObserver" in window ? new IntersectionObserver(es=>{
+  for(const e of es) if(e.isIntersecting){ thumbIO.unobserve(e.target); fillThumb(e.target); }
+},{rootMargin:"200px"}) : null;
+async function fillThumb(img){
+  const r=records.find(x=>String(x.id)===img.dataset.lt); if(!r?.photos?.[0]) return;
+  const k=r.photos[0].length+":"+r.photos[0].slice(-24);
+  let t=THUMBS.get(r.id);
+  if(!t || t.k!==k){ try{ t={k, u:URL.createObjectURL(await thumbBlob(r.photos[0]))}; const o=THUMBS.get(r.id); if(o) URL.revokeObjectURL(o.u); THUMBS.set(r.id,t); }catch{ return; } }
+  img.src=t.u;
+}
+function observeThumbs(){ document.querySelectorAll("#list img[data-lt]").forEach(i=>thumbIO?thumbIO.observe(i):fillThumb(i)); }
+
+/* ---------- 1つのブラウザで別のアカウントにログインしたとき ----------
+   釣果と航跡はブラウザの中に保存されていて、アカウントごとに分かれていない。
+   ほかのアカウントの記録がある端末では、同期・提供・新着への掲載を止めて、切り替えるか聞く */
+const OWN_KEY="choka-data-owner";
+function ownerCheck(){
+  const uid=SH.user.id, own=lsGet(OWN_KEY), mine=records.some(r=>!r.sample) || tracks.length>0;
+  if(!own || own===uid || !mine){ lsSet(OWN_KEY,uid); SH.foreign=false; return true; }
+  SH.foreign=true; cloudUi(); foreignDlg();
+  return false;
+}
+function foreignDlg(){
+  const n=records.filter(r=>!r.sample).length;
+  const b=openDlg("この端末には、別のアカウントの記録があります",`<p>この端末（ブラウザ）には、前にログインしていたアカウントの釣果${n}件・航跡${tracks.length}本が入っています。釣果と航跡はブラウザの中に保存されていて、アカウントごとに分かれていません。</p>
+    <p>このまま使うと、前のアカウントの釣果がこのアカウント（${esc(SH.profile.nickname)}）に同期されたり、新着に載ったりするため、<b>同期と新着への掲載を止めています</b>。</p>
+    <div class="actions" style="flex-wrap:wrap">
+      <button type="button" class="btn" id="fgKeep">このまま（見るだけ）</button>
+      <button type="button" class="btn" id="fgOut">ログアウトする</button>
+      <button type="button" class="btn primary" id="fgSwitch">このアカウントの記録に切り替える</button></div>
+    <p class="hint">「切り替える」と、今の記録をバックアップ（JSON）に保存してから端末から消し、このアカウントの記録をサーバーから取り込みます。前のアカウントでログインし直せば、そのアカウントの記録も同じようにサーバーから戻ります（同期していない写真は、バックアップにだけ残ります）。</p>
+    <p class="hint">2つのアカウントを同時に使うときは、シークレットウィンドウ（プライベートブラウズ）か、別のブラウザで開いてください。保存場所が別になります。</p>
+    <div class="status" id="fgStat"></div>`);
+  b.querySelector("#fgKeep").onclick=()=>$("dlg").close();
+  b.querySelector("#fgOut").onclick=async()=>{ $("dlg").close(); await SH.sb.auth.signOut(); SH.cache.clear(); SH.deals.clear(); lsSet("choka-profile",null); SH.foreign=false; await shRefreshMe(); };
+  b.querySelector("#fgSwitch").onclick=async e=>{
+    if(rec){ shMsg("fgStat","航跡の記録中は切り替えられません。記録を止めてからにしてください","err"); return; }
+    setBusy(e.target,true,"切り替え中…");
+    try{
+      $("btnJson").click();                                       // 今の記録をバックアップに保存
+      for(const r of records.filter(r=>!r.sample)) await delRec(r.id,true);
+      for(const t of tracks) await delTrk(t.id,true);
+      records=records.filter(r=>r.sample); tracks=[]; THUMBS.clear();
+      lsSet(OWN_KEY,SH.user.id); SH.foreign=false;
+      for(const k of ["pull","push","del","at"]) lsSet(clKey(k),null);
+      lsSet(SYNC_KEY,null);
+      render(); drawTracks(); drawTrackList(); cloudUi();
+      await cloudSync(true); shSyncAll(); loadMyPhotos(); feedSweep();
+      $("dlg").close(); showTab("list");
+    }catch(err){ shMsg("fgStat",shErr(err),"err"); }
+    finally{ setBusy(e.target,false); }
+  };
+}
+
+/* ---------- お店の買い取り希望 ---------- */
+function wantFormHtml(s){
+  const d=new Date(Date.now()+14*86400000), dd=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const mx=new Date(Date.now()+60*86400000), mxs=`${mx.getFullYear()}-${pad(mx.getMonth()+1)}-${pad(mx.getDate())}`;
+  return `<div class="sec-h">買い取り希望を出す</div>
+  <p class="hint">ほしい魚の条件を出しておくと、釣り人が見て出品してくれます。条件に合う出品は「探す」で「希望に合う」と表示され、先頭に並びます。受付中は10件まで、期限は60日以内です。</p>
+  <div class="grid">
+    <label class="full">魚種<input id="wf_sp" maxlength="40" placeholder="例：ブリ"></label>
+    <label>サイズ（下限）<div class="unit"><input id="wf_min" type="number" min="0" step="1" inputmode="numeric"><span>cm</span></div></label>
+    <label>サイズ（上限）<div class="unit"><input id="wf_max" type="number" min="0" step="1" inputmode="numeric"><span>cm</span></div></label>
+    <p class="sub-h full">受け付ける締め方（選ばなければ問わない）</p>
+    <div class="checks inline full" id="wf_shime">${["活魚","脳締め","氷締め","野締め"].map(v=>`<label><input type="checkbox" value="${v}">${v}</label>`).join("")}</div>
+    <p class="sub-h full">必ずしてほしい処理</p>
+    <div class="checks inline full" id="wf_treat">${["血抜き","神経締め","内臓除去"].map(v=>`<label><input type="checkbox" value="${v}">${v}</label>`).join("")}</div>
+    <label>買い取り価格の目安<div class="unit"><input id="wf_price" type="number" min="0" step="100" inputmode="numeric"><span>円</span></div></label>
+    <label>単位<select id="wf_unit"><option>1匹</option><option>1kg</option></select></label>
+    <label>受け渡し地域<input id="wf_area" maxlength="40" value="${esc(s.area||"")}"></label>
+    <label>期限<input id="wf_until" type="date" value="${dd}" max="${mxs}"></label>
+    <label class="full">ひとこと<input id="wf_memo" maxlength="400" placeholder="例：神経締めなら高く買います"></label>
+  </div>
+  <div class="actions"><button type="button" class="btn primary" id="wf_send">希望を出す</button></div>
+  <div class="status" id="wfStat"></div>
+  <div class="sec-h">自分のお店の買い取り希望</div><div id="myWants"></div>`;
+}
+async function drawMyWants(){
+  const {data}=await SH.sb.from("want_cards").select("*").eq("mine",true).order("created_at",{ascending:false}).limit(30);
+  $("myWants").innerHTML=(data||[]).length?data.map(w=>wantCard(w,true)).join(""):`<div class="empty">まだ出していません。</div>`;
+}
+function wantFormInit(s){
+  drawMyWants();
+  $("wf_send").onclick=async e=>{
+    const sp=$("wf_sp").value.trim(); if(!sp) return shMsg("wfStat","魚種を入れてください","err");
+    const br=blockedReason(sp); if(br) return shMsg("wfStat",`この種類は扱えません（${br}）`,"err");
+    const row={owner:SH.user.id,shop_id:s.id,species:sp,min_len:num($("wf_min").value),max_len:num($("wf_max").value),
+      shime:[...$("wf_shime").querySelectorAll("input:checked")].map(i=>i.value),treat:[...$("wf_treat").querySelectorAll("input:checked")].map(i=>i.value),
+      price_yen:num($("wf_price").value),price_unit:$("wf_unit").value,area:$("wf_area").value.trim()||null,until:$("wf_until").value,memo:$("wf_memo").value.trim()||null};
+    if(!row.until) return shMsg("wfStat","期限を入れてください","err");
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("wants").insert(row);
+    setBusy(e.target,false);
+    if(error) return shMsg("wfStat",shErr(error),"err");
+    shMsg("wfStat","買い取り希望を出しました","ok"); $("wf_sp").value=""; $("wf_memo").value="";
+    drawMyWants();
+  };
+  $("myWants").onclick=async e=>{
+    const b=e.target.closest("button[data-a=wclose]"); if(!b) return;
+    if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと締め切る"; return; }
+    const {error}=await SH.sb.from("wants").update({status:"closed"}).eq("id",b.closest("[data-want]").dataset.want);
+    if(error) return shMsg("wfStat",shErr(error),"err");
+    drawMyWants();
+  };
+}
+
+/* ---------- お店の登録 ---------- */
+function shShop(){
+  const s=SH.shop, box=$("shopBox");
+  const intro=`<div class="rules">お店向けの出品を見て申し込めるのは、<b>魚介類販売業の許可を持つお店</b>だけです。許可番号と許可証の写真を送ってください。管理者が確認して承認します。<br>支払いはアプリを通さず、受け渡しのときに当事者間で行います。</div>`;
+  if(s?.status==="approved"){ box.innerHTML=intro+`<p class="status ok">承認済み：${esc(s.name)}（${esc(s.area)}）</p><p class="hint">「探す」でお店向けの出品が見られ、申し込めます。内容を変えるときは管理者に連絡してください。</p>`+wantFormHtml(s); wantFormInit(s); return; }
+  if(s?.status==="suspended"){ box.innerHTML=intro+`<p class="status err">このお店の登録は停止されています。管理者に連絡してください。</p>`; return; }
+  const head = s?.status==="pending" ? `<p class="status">審査待ちです。内容を直して送り直すこともできます。</p>`
+            : s?.status==="rejected" ? `<p class="status err">差し戻されました${s.admin_note?`：${esc(s.admin_note)}`:""}。直して送り直してください。</p>` : "";
+  box.innerHTML=intro+head+`<div class="grid">
+    <label class="full">お店の名前<input id="sp_name" maxlength="60" value="${esc(s?.name||"")}"></label>
+    <label>魚介類販売業の許可番号<input id="sp_no" maxlength="40" value="${esc(s?.license_no||"")}" placeholder="例：第◯◯◯号"></label>
+    <label>許可を出した保健所<select id="sp_hc">${HEALTH_CENTERS.map(h=>`<option ${s?.health_center===h?"selected":""}>${h}</option>`).join("")}</select></label>
+    <label>所在地（市町村）<select id="sp_area">${TOYAMA_AREAS.map(a=>`<option ${s?.area===a?"selected":""}>${a}</option>`).join("")}</select></label>
+    <label>許可証の写真<input id="sp_photo" type="file" accept="image/*"></label>
+  </div>
+  ${s?.license_photo?`<p class="hint">送信済みの写真があります。写真を変えるときだけ選び直してください。</p>`:""}
+  <div class="actions"><button type="button" class="btn primary" id="sp_send">${s?"送り直す":"申請する"}</button></div>
+  <div class="status" id="spStat"></div>`;
+  $("sp_send").onclick=async e=>{
+    const name=$("sp_name").value.trim(), no=$("sp_no").value.trim(), f=$("sp_photo").files[0];
+    if(!name||!no) return shMsg("spStat","お店の名前と許可番号を入れてください","err");
+    if(!f && !s?.license_photo) return shMsg("spStat","許可証の写真を選んでください","err");
+    setBusy(e.target,true,"送信中…");
+    try{
+      let photo=s?.license_photo||null;
+      if(f){
+        const path=`${SH.user.id}/license-${Date.now()}.jpg`;
+        const {error}=await SH.sb.storage.from("licenses").upload(path,await dataUrlToBlob(await shrink(f,1600)),{contentType:"image/jpeg"});
+        if(error) throw error; photo=path;
+      }
+      const row={name,license_no:no,health_center:$("sp_hc").value,area:$("sp_area").value,license_photo:photo};
+      const {error}= s ? await SH.sb.from("shops").update(row).eq("id",s.id) : await SH.sb.from("shops").insert({...row,owner:SH.user.id});
+      if(error) throw error;
+      await shRefreshMe(); shSub("shop"); shMsg("spStat","送信しました。承認されるとお知らせなしで使えるようになります","ok");
+    }catch(err){ shMsg("spStat",shErr(err),"err"); }
+    finally{ setBusy(e.target,false); }
+  };
+}
+
+/* =====================================================================
+   みんな：写真・ブログの投稿、いいね、コメント、メッセージ
+   ・見るだけならログイン不要（釣った位置は会員だけ）
+   ・投稿は会員、いいね・コメント・メッセージはログインして表示名を登録した人なら誰でも
+   ===================================================================== */
+const FD={filter:"all", page:0, list:[], fsub:"new", pollT:null, dmT:null, dmN:0, newN:0};
+const NW={list:[], page:0, q:"", seen:"", mode:"feed", searched:false};   // 新着の釣果（mode: feed＝新着 / search＝条件で探す / fav＝お気に入り / user＝この人の釣果）
+const POST_REASONS=["釣り場や個人の情報が書かれている","不適切な写真・言葉","他人の写真・うその内容","宣伝・迷惑行為","その他"];
+const postUrl = p => p ? SH.sb.storage.from("posts").getPublicUrl(p).data.publicUrl : "";
+const avUrl = p => p ? SH.sb.storage.from("avatars").getPublicUrl(p).data.publicUrl : "";
+/* アイコン：画像がなければ表示名の1文字目を色つきの丸で */
+const TSU_T="つ抜け会員（紹介した会員のうち、支払い中の人が10人以上）";
+const tsuMark = () => `<span class="tsu-i" title="${TSU_T}" aria-label="${TSU_T}">つ</span>`;
+function avatar(path,name,px=22,tsu=false){
+  const st=`width:${px}px;height:${px}px;font-size:${Math.round(px*.5)}px;--c:${spColor(name||"?")}`;
+  const a = path ? `<span class="av" style="${st}"><img src="${esc(avUrl(path))}" alt="" loading="lazy"></span>`
+              : `<span class="av" style="${st}" aria-hidden="true">${esc([...(name||"?")][0])}</span>`;
+  if(!tsu) return a;
+  const k=Math.max(11,Math.round(px*.45));                        // つ抜け会員の印（アイコンの右下）
+  return `<span class="av-w" title="${TSU_T}">${a}<span class="tsu" style="width:${k}px;height:${k}px;font-size:${Math.round(k*.7)}px" aria-label="${TSU_T}">つ</span></span>`;
+}
+const whoLine = (path,name,px,tsu) => `<span class="who-line">${avatar(path,name,px,tsu)}<span>${esc(name||"")}</span></span>`;
+/* 正方形に切り抜いて縮小 */
+function squareShrink(file,px){ return new Promise((res,rej)=>{
+  const img=new Image(), url=URL.createObjectURL(file);
+  img.onload=()=>{ const m=Math.min(img.width,img.height), c=document.createElement("canvas"); c.width=c.height=px;
+    c.getContext("2d").drawImage(img,(img.width-m)/2,(img.height-m)/2,m,m,0,0,px,px); URL.revokeObjectURL(url); res(c.toDataURL("image/jpeg",0.85)); };
+  img.onerror=rej; img.src=url; }); }
+/* プロフィール（アイコン・表示名） */
+/* =====================================================================
+   会員の申し込み・お支払い（Stripe）と紹介
+   ・月額。はじめての申し込みは最初の2か月が無料（カードの登録が必要）
+   ・紹介した人が無料期間のあと初めて支払うと、紹介者が1か月無料。支払い中の紹介が10人以上の間は無料（つ抜け会員）
+   ・支払いや解約の手続きは Stripe の画面。結果はサーバー（Edge Functions）が受け取って会員の期限を変える
+   ===================================================================== */
+const REF_KEY="choka-ref", BILL={me:null, started:false, price:"150"};
+try{ const r=new URLSearchParams(location.search).get("ref"); if(r) localStorage.setItem(REF_KEY, r.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,12)); }catch{}
+async function billFn(action,extra){
+  const {data,error}=await SH.sb.functions.invoke("billing",{body:{action,...(extra||{})}});
+  if(error){ let m=error.message; try{ const j=await error.context?.json(); if(j?.error) m=j.error; }catch{}
+    if(/Failed to send|FunctionsFetchError|not found|404/i.test(m)) m="お支払いの準備ができていません（管理者が Stripe の設定を終えると使えます）"; throw new Error(m); }
+  if(data?.error) throw new Error(data.error);
+  return data;
+}
+async function billMe(){ const {data,error}=await SH.sb.rpc("billing_me"); if(error) throw error; BILL.me=data; if(data?.price_month) BILL.price=data.price_month; return data; }
+/* 紹介のリンクから来た人：申し込みの前なら、紹介コードを自動で登録する（1回だけ） */
+async function refAuto(){
+  const code=lsGet(REF_KEY); if(!code || !hasProfile()) return;
+  try{
+    const me=await billMe();
+    if(me.can_set_referrer && me.ref_code!==code){
+      const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:code});
+      if(!error) alertStatus(`${data}さんの紹介で登録しました（会員に申し込むと、最初の2か月は無料です（プリペイド式のカードなどを除く））`);
+    }
+    lsSet(REF_KEY,null);
+  }catch{}
+}
+/* Stripe の画面から戻ってきたとき：状態を読み直して知らせる */
+async function billReturn(){
+  const q=new URLSearchParams(location.search), b=q.get("billing"); if(!b) return;
+  q.delete("billing"); history.replaceState(null,"",location.pathname+(q.toString()?"?"+q:"")+location.hash);
+  if(!hasProfile()) return;
+  if(b==="cancel"){ alertStatus("会員の申し込みをやめました"); return; }
+  for(let i=0;i<4;i++){
+    try{ await billFn("sync"); }catch{}
+    await shRefreshMe(); if(b!=="ok" || isMember()) break;
+    await new Promise(r=>setTimeout(r,2500));
+  }
+  billingDlg(b==="ok" ? (isMember() ? "申し込みを受け付けました。会員の機能が使えます" : "申し込みを確認しています。少したってから「状態を読み直す」を押してください") : "");
+}
+const BILL_ST={trialing:"無料期間中",active:"会員",past_due:"お支払いが確認できません",unpaid:"お支払いが確認できません",canceled:"解約済み",
+  incomplete:"申し込みの手続き中",incomplete_expired:"申し込みが完了しませんでした",paused:"一時停止中"};
+async function billingDlg(note){
+  if(!hasProfile()){ memberGate(""); return; }
+  openDlg("会員・お支払い・紹介",`<div id="blBox"><div class="empty">読み込み中…</div></div><div class="status" id="blStat"></div>`);
+  let me; try{ me=await billMe(); }
+  catch(e){ if($("blBox")) $("blBox").innerHTML=`<p class="status err">${esc(shErr(e))}（管理者：schema.sql を最新にして実行してください）</p>`; return; }
+  const box=$("blBox"); if(!box) return;
+  const P=SH.profile, adm=P.role==="admin", st=me.status, price=me.price_month||"150";
+  const day=d=>d?new Date(d).toLocaleDateString("ja-JP"):"";
+  const subOn=["trialing","active","past_due","unpaid","incomplete","paused"].includes(st);
+  const head = adm ? "管理者（料金はかかりません）"
+    : st==="trialing" ? `無料期間中です（${day(me.period_end)}まで）。そのあとは月${price}円です${me.cancel_at_end?"。期間の終わりで解約します":""}`
+    : st==="active" ? (me.tsunuke ? `つ抜け会員：料金は無料です（支払い中の紹介が${me.tsunuke_n}人以上の間）。次の更新日 ${day(me.period_end)}`
+                                  : `会員です（月${price}円）。${me.cancel_at_end?`${day(me.period_end)}に解約します`:`次のお支払い日 ${day(me.period_end)}`}`)
+    : (st==="past_due"||st==="unpaid") ? "お支払いが確認できないため、会員の機能を止めています。「支払い方法の変更・解約」でカードを直すと、すぐ戻ります。これまでの記録は見られます"
+    : isMember() ? `会員です（${(P.member_until||"").replace(/-/g,"/")}まで）`
+    : st==="canceled" ? "解約済みです。これまでの記録は見られます。もう一度申し込めます"
+    : "会員ではありません（無料）";
+  const need=Math.max(0,me.tsunuke_n-me.refs_paying);
+  const link=`${location.origin}${location.pathname}?ref=${me.ref_code}`;
+  box.innerHTML=`
+    <div class="sec-h">いまの状態</div>
+    <p>${me.tsunuke?tsuMark()+" ":""}${esc(head)}</p>
+    <div class="actions" style="justify-content:flex-start;flex-wrap:wrap">
+      ${!adm&&!subOn?`<button type="button" class="btn primary" id="blJoin">${me.trial_used?`会員になる（月${esc(price)}円）`:`会員になる（最初の2か月無料※・そのあと月${esc(price)}円）`}</button>`:""}
+      ${me.has_customer?`<button type="button" class="btn" id="blPortal">支払い方法の変更・解約</button>`:""}
+      <button type="button" class="btn" id="blSync">状態を読み直す</button></div>
+    ${!adm&&!subOn?`<p class="hint">申し込みにはカードの登録が必要です。${me.trial_used?"":"無料期間のあいだは請求されず、終わる前に解約すれば料金はかかりません。<b>※プリペイド式のカードや、ほかのアカウントですでに無料期間を使ったカードでは、無料期間は付かず、すぐお支払いが始まります</b>（支払いの画面には「無料」と出ますが、カードを登録したあとで切り替わります）。"}支払いが止まると会員の機能は止まりますが、これまでの記録は見られます。お支払いは Stripe の画面で行い、カードの番号はこのアプリには残りません。</p>`:""}
+    <div class="sec-h">紹介</div>
+    <p>あなたの紹介コード：<b class="mono" style="font-size:1.25em;letter-spacing:.08em">${esc(me.ref_code)}</b></p>
+    <div class="actions" style="justify-content:flex-start;flex-wrap:wrap"><button type="button" class="btn" id="blCopy">紹介のリンクをコピー</button>${navigator.share?`<button type="button" class="btn" id="blShare">紹介のリンクを送る</button>`:""}</div>
+    <ul class="hint" style="margin:6px 0;padding-left:1.2em">
+      <li>紹介した人が、無料期間のあと初めて支払うと、あなたの料金が1か月無料になります（1人につき1回）</li>
+      <li>紹介した人のうち、支払い中の会員が${me.tsunuke_n}人以上いる間は、あなたの料金は無料です（つ抜け会員 ${tsuMark()}・アイコンに印が付きます）。${me.tsunuke_n-1}人以下になると有料に戻ります</li>
+      <li>数えるのは、あなたが直接紹介した人だけです。特典はこのアプリの料金の割引だけで、お金の支払いはありません</li></ul>
+    <p>紹介した人 ${me.refs_total}人（うち支払い中 ${me.refs_paying}人）${me.tsunuke?"":`・つ抜けまで あと${need}人`}・紹介でもらった無料 ${me.credit_total}か月${me.credit_pending?`（${me.credit_pending}か月分は、申し込むと使われます）`:""}</p>
+    ${me.referred_by_name?`<p class="hint">あなたを紹介した人：${esc(me.referred_by_name)}</p>`:""}
+    ${me.can_set_referrer?`<label>紹介コードを入れる（申し込みの前だけ・1回だけ）<span style="display:flex;gap:6px"><input id="blCode" maxlength="12" autocapitalize="characters" autocomplete="off" style="flex:1"><button type="button" class="btn" id="blSet">登録</button></span></label>`:""}
+    <p class="hint" style="margin-top:10px">${legalLinks()}</p>`;
+  if(note) shMsg("blStat",note,"ok");
+  const go=async(btn,action)=>{ setBusy(btn,true,"開いています…"); try{ const d=await billFn(action); if(d.url) location.href=d.url; }catch(e){ setBusy(btn,false); shMsg("blStat",e.message,"err"); } };
+  box.querySelector("#blJoin")?.addEventListener("click",e=>go(e.target,"checkout"));
+  box.querySelector("#blPortal")?.addEventListener("click",e=>go(e.target,"portal"));
+  box.querySelector("#blSync").onclick=async e=>{ setBusy(e.target,true,"読み直しています…");
+    try{ await billFn("sync"); }catch(err){ if(!/準備ができていません/.test(err.message)) shMsg("blStat",err.message,"err"); }
+    await shRefreshMe(); billingDlg("読み直しました"); };
+  box.querySelector("#blCopy").onclick=async()=>{ try{ await navigator.clipboard.writeText(link); shMsg("blStat","紹介のリンクをコピーしました："+link,"ok"); }catch{ shMsg("blStat",link,"ok"); } };
+  box.querySelector("#blShare")?.addEventListener("click",()=>navigator.share({title:"釣果海図ログ",text:"釣った場所を海図に残せるアプリです。このリンクから会員になると、最初の2か月は無料です（プリペイド式のカードなどを除く）。",url:link}).catch(()=>{}));
+  box.querySelector("#blSet")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"登録中…");
+    const {data,error}=await SH.sb.rpc("billing_set_referrer",{p_code:$("blCode").value});
+    if(error){ setBusy(e.target,false); shMsg("blStat",shErr(error),"err"); return; }
+    billingDlg(`${data}さんを紹介した人として登録しました`);
+  });
+}
+/* 特定商取引法に基づく表記（管理者が画面で書く。だれでも見られる） */
+const TOKUSHO_TPL=`販売事業者：［氏名または屋号］
+運営責任者：［氏名］
+所在地：請求があれば遅滞なく開示します
+電話番号：請求があれば遅滞なく開示します
+メールアドレス：［メールアドレス］
+販売価格：月額150円（税込）
+商品代金以外の必要料金：インターネットの通信料はお客様のご負担です
+支払方法：クレジットカード（Stripe）
+支払時期：申し込みのときにカードを登録します。はじめての申し込みは2か月の無料期間のあと初回のお支払い、以後1か月ごとに自動で更新します
+提供時期：お申し込みの手続きが終わると、すぐに使えます
+解約：アプリの「会員・お支払い・紹介」→「支払い方法の変更・解約」から、いつでも解約できます。次の更新日からは請求しません
+返金：デジタルサービスの性質上、お支払い済みの料金は返金しません（無料期間中に解約すれば料金はかかりません）
+紹介の特典：紹介した方の料金の割引（1か月無料・つ抜け会員の無料）だけで、金銭の支払いはありません
+動作環境：最新のブラウザ（Chrome・Safari・Edge）`;
+/* 特定商取引法に基づく表記・利用規約・プライバシーポリシー（管理者が画面で書く。だれでも見られる） */
+const DOCS={tokusho:["特定商取引法に基づく表記",()=>TOKUSHO_TPL], terms:["利用規約",()=>""], privacy:["プライバシーポリシー",()=>""]};
+async function docDlg(k){
+  const [title,tpl]=DOCS[k]||DOCS.tokusho;
+  openDlg(title,`<div id="tkBox"><div class="empty">読み込み中…</div></div>`);
+  if(!SH.started) await shStart();
+  let t=""; try{ const {data}=await SH.sb.from("app_settings").select("v").eq("k",k).maybeSingle(); t=data?.v||""; }catch{}
+  const adm=SH.profile?.role==="admin", box=$("tkBox"); if(!box) return;
+  box.innerHTML=(t?`<div style="white-space:pre-wrap;line-height:1.8">${esc(t)}</div>`:`<p class="hint">準備中です。</p>`)
+    + `<p class="hint" style="margin-top:12px">${legalLinks(k)}</p>`
+    + (adm?`<label style="margin-top:12px">管理者：${esc(title)}を書く・直す<textarea id="tkEdit" rows="16">${esc(t||tpl())}</textarea></label>
+      <div class="actions"><button type="button" class="btn primary" id="tkSave">保存</button></div><div class="status" id="tkStat"></div>`:"");
+  box.querySelector("#tkSave")?.addEventListener("click",async e=>{
+    setBusy(e.target,true,"保存中…");
+    const {error}=await SH.sb.from("app_settings").update({v:$("tkEdit").value.trim(),updated_at:new Date().toISOString()}).eq("k",k);
+    setBusy(e.target,false); if(error) shMsg("tkStat",shErr(error),"err"); else docDlg(k);
+  });
+}
+const tokushoDlg=()=>docDlg("tokusho");
+/* 3つの文書へのリンク（今開いているものは除く）。data-doc を押すとどこでも開く */
+const legalLinks=(skip)=>Object.keys(DOCS).filter(k=>k!==skip).map(k=>`<a href="#" data-doc="${k}">${DOCS[k][0]}</a>`).join("　");
+document.addEventListener("click",e=>{ const a=e.target.closest?.("[data-doc]"); if(!a) return; e.preventDefault(); e.stopPropagation(); docDlg(a.dataset.doc); },true);
+/* 管理者：会員の支払いと紹介の一覧 */
+async function billAdminLoad(){
+  const box=$("billBox"); if(!box) return;
+  const {data,error}=await SH.sb.rpc("admin_billing");
+  const ST=s=>BILL_ST[s]||s||"―";
+  box.innerHTML=`<div class="sec-h">会員の支払いと紹介</div>
+    <div class="actions" style="justify-content:flex-start"><button type="button" class="btn sm" data-doc="tokusho">特定商取引法に基づく表記を書く</button><button type="button" class="btn sm" data-doc="terms">利用規約を書く</button><button type="button" class="btn sm" data-doc="privacy">プライバシーポリシーを書く</button></div>
+    ${error?`<p class="status err">${esc(shErr(error))}（schema.sql を最新のものにして実行し直してください）</p>`
+    : (data||[]).length?`<div style="overflow-x:auto"><table class="mini"><tr><th>表示名</th><th>状態</th><th>次の日付</th><th>会員の期限</th><th>紹介者</th><th>紹介</th><th>支払い中</th><th>特典</th><th>カード</th><th>同じカードの人</th></tr>
+      ${data.map(r=>`<tr><td>${r.tsunuke?tsuMark()+" ":""}${esc(r.nickname)}</td><td>${esc(ST(r.status))}</td><td>${r.period_end?fmtJ(r.period_end):""}</td><td>${esc(r.member_until||"")}</td><td>${esc(r.referred_by||"")}</td><td class="n">${r.refs_total}</td><td class="n">${r.refs_paying}</td><td class="n">${r.credit_total}か月</td><td>${esc(({credit:"クレジット",debit:"デビット",prepaid:"プリペイド"})[r.card_funding]||r.card_funding||"")}${r.card_banned?'<span class="st hot">停止のカード</span>':""}</td><td>${esc(r.same_card||"")}</td></tr>`).join("")}</table></div>`
+    : `<div class="empty">まだ申し込み・紹介はありません。</div>`}`;
+}
+function profileDlg(){
+  const P=SH.profile; let pick=null, clear=false;
+  const b=openDlg("プロフィール",`<div class="av-edit"><span id="avPrev">${avatar(P.avatar,P.nickname,72,P.tsunuke)}</span>
+      <div class="toolbar" style="margin:0"><label class="btn sm" style="flex-direction:row;color:var(--ink)">画像を選ぶ<input type="file" id="avFile" accept="image/*" hidden></label>
+      <button type="button" class="btn sm" id="avClear">アイコンを外す</button></div></div>
+    <label>表示名（20文字まで）<input id="avNick" maxlength="20" value="${esc(P.nickname)}"></label>
+    <label style="margin-top:8px">住んでいる県（「みんな」の新着で、この県の釣果を先に並べます。ほかの人には見えません）<select id="avPref">${prefOptions("選ばない")}</select></label>
+    <p class="hint">アイコンと表示名は、投稿・コメント・メッセージで誰でも見られます。正方形に切り抜いて小さくします。人の顔や他人の画像を使うときは許可を取ってください。</p>
+    <p class="hint">${isMember()?(P.role==="admin"?"管理者":`会員${P.tsunuke?"（つ抜け会員 "+tsuMark()+"）":""}`):"無料（コメント・いいね・メッセージができます）"} <button type="button" class="btn sm" id="avBill">会員・お支払い・紹介…</button></p>
+    <p class="hint">ログアウトやお店の登録は「おすそわけ」タブから。　アプリの版：${APP_VER}</p>
+    <p class="hint">${legalLinks()}</p>
+    <div class="actions"><button type="button" class="btn" id="avShare">おすそわけタブへ</button><button type="button" class="btn primary" id="avSave">保存</button></div>
+    <div class="status" id="avStat"></div>`);
+  $("avPref").value=P.home_pref||"";
+  b.querySelector("#avFile").onchange=async e=>{ const f=e.target.files[0]; if(!f) return;
+    try{ pick=await squareShrink(f,256); clear=false; $("avPrev").innerHTML=`<span class="av" style="width:72px;height:72px"><img src="${pick}" alt=""></span>`; }
+    catch{ shMsg("avStat","画像を読み込めませんでした（HEIC形式はJPEGに変換してください）","err"); } };
+  b.querySelector("#avClear").onclick=()=>{ pick=null; clear=true; $("avPrev").innerHTML=avatar(null,$("avNick").value||P.nickname,72); };
+  b.querySelector("#avShare").onclick=()=>{ $("dlg").close(); showTab("share"); };
+  b.querySelector("#avBill").onclick=()=>billingDlg();
+  b.querySelector("#avSave").onclick=async e=>{
+    const nick=$("avNick").value.trim(); if(!nick) return shMsg("avStat","表示名を入れてください","err");
+    const patch={nickname:nick,home_pref:$("avPref").value||null}, old=P.avatar;
+    setBusy(e.target,true,"保存中…");
+    try{
+      if(pick){ const path=`${SH.user.id}/avatar-${Date.now().toString(36)}.jpg`;
+        const {error}=await SH.sb.storage.from("avatars").upload(path,await dataUrlToBlob(pick),{contentType:"image/jpeg",upsert:false});
+        if(error) throw error; patch.avatar=path; }
+      else if(clear) patch.avatar=null;
+      const {error}=await SH.sb.from("profiles").update(patch).eq("id",SH.user.id);
+      if(error){ if(patch.avatar) SH.sb.storage.from("avatars").remove([patch.avatar]); throw error; }
+      if(old && "avatar" in patch && old!==patch.avatar) SH.sb.storage.from("avatars").remove([old]);
+      Object.assign(SH.profile,patch); try{ localStorage.setItem("choka-profile",JSON.stringify(SH.profile)); }catch{}
+      updateAccountBtn(); $("dlg").close(); newPoll(); if(!$("viewFeed").hidden) feedOpen();
+    }catch(err){ shMsg("avStat",shErr(err),"err"); }finally{ setBusy(e.target,false); }
+  };
+}
+function feedOpen(){
+  if(!SB_URL||!SB_KEY){ $("feedList").innerHTML=$("nwList").innerHTML=`<div class="empty">「みんな」を使うには、サーバー（Supabase）の設定が必要です。</div>`; $("btnPost").hidden=true; return; }
+  if(!SH.started){ shStart().then(feedOpen); return; }
+  $("fdMine").hidden=!hasProfile();
+  $("btnPost").hidden=false;
+  $("fdHint").textContent = hasProfile() ? "" : "見るだけならログインは不要です。いいね・コメント・メッセージは、ログインして表示名を登録すると使えます。釣った位置は会員だけに表示されます。";
+  feedSub(FD.fsub);
+}
+$("fdSubs").addEventListener("click",e=>{ const b=e.target.closest("button[data-fsub]"); if(b) feedSub(b.dataset.fsub); });
+function feedSub(n){
+  if(n==="dm" && !hasProfile()){ needProfile("メッセージ"); n="new"; }
+  FD.fsub=n;
+  document.querySelectorAll("#fdSubs button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.fsub===n)));
+  $("fsub_new").hidden=n!=="new"; $("fsub_posts").hidden=n!=="posts"; $("fsub_dm").hidden=n!=="dm";
+  postLayer.clearLayers();
+  if(n==="new") nwMode(NW.mode==="user"?"feed":NW.mode, true);
+  else if(n==="posts") feedLoad(true); else dmList();
+}
+
+/* ---------- 新着の釣果：指定した県（なければ住んでいる県）を先に、新しい順 ---------- */
+$("nwPref").innerHTML=prefOptions("全国（県で分けない）");
+function nwPref(){                                               // 指定した県 → 住んでいる県 → なし
+  const s=lsGet("choka-feed-pref");
+  if(s!=null) return s;
+  return SH.profile?.home_pref || "";
+}
+function nwPrefUi(){
+  $("nwPref").value=nwPref();
+  const home=SH.profile?.home_pref;
+  $("nwPref").title = home ? `住んでいる県：${home}` : "";
+}
+$("nwPref").onchange=()=>{
+  const v=$("nwPref").value, home=SH.profile?.home_pref||"";
+  lsSet("choka-feed-pref", v===home && home ? null : v);           // 住んでいる県に戻したら、指定を消す
+  NW.mode="feed"; nwLoad(true); newPoll();
+};
+$("nwReload").onclick=()=>nwLoad(true);
+$("nwMore").onclick=()=>NW.mode==="fav"?nwFavs(false):NW.mode==="user"?nwUser(NW.userPost,NW.userName,false):nwLoad(false);
+/* 新着／条件で探す／お気に入り の切り替え */
+$("nwModes").addEventListener("click",e=>{ const b=e.target.closest(".chip[data-m]"); if(b) nwMode(b.dataset.m); });
+function nwMode(m, load){
+  if(m==="fav" && !(isMember()&&hasProfile())){ memberGate("お気に入り"); return; }
+  NW.mode=m;
+  $("nwModes").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.m===m)));
+  $("nwFeedTools").hidden=m!=="feed"; $("nwFind").hidden=m!=="search";
+  $("nwMore").hidden=true;
+  if(m==="feed") nwLoad(true);
+  else if(m==="fav") nwFavs(true);
+  else if(m==="search"){
+    if(NW.searched) nwSearch();
+    else { $("nwList").innerHTML=""; postLayer.clearLayers();
+      $("nwHint").textContent="魚の名前・地域・期間・時期を選んで「探す」を押してください。新着に載ったすべての釣果から探します（何も入れなければ、全部の魚）。"; }
+  }
+}
+$("nwFPref").innerHTML=prefOptions("全国");
+$("nwGo").onclick=()=>nwSearch();
+$("nwClear").onclick=()=>{ for(const id of ["nwQ","nwFPref","nwDays","nwFrom","nwTo","nwMonth"]) $(id).value=""; $("nwBox").checked=false; nwRangeUi(); };
+$("nwQ").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); nwSearch(); } });
+function nwRangeUi(){ document.querySelectorAll(".nw-range").forEach(x=>x.hidden=$("nwDays").value!=="range"); }
+$("nwDays").onchange=nwRangeUi;
+$("nwBox").addEventListener("change",e=>{ if(e.target.checked && !(isMember()&&hasProfile())){ e.target.checked=false; memberGate("地図の範囲で探す"); } });
+function seenNew(){ return lsGet("choka-new-seen")||""; }
+async function nwLoad(reset){
+  if(!SH.sb) return;
+  NW.mode="feed"; nwPrefUi();
+  if(reset){ NW.page=0; NW.list=[]; NW.seen=seenNew(); $("nwList").innerHTML=`<div class="empty">読み込み中…</div>`; }
+  const N=20, pref=nwPref();
+  const {data,error}=await SH.sb.rpc("catch_feed",{p_pref:pref||null,p_offset:NW.page*N,p_limit:N});
+  if(error){ $("nwList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  NW.list=NW.list.concat(data||[]); NW.page++;
+  $("nwMore").hidden=(data||[]).length<N;
+  $("nwHint").textContent = isMember()&&hasProfile()
+    ? "会員が登録した釣果が、新しい順に並びます。地図の印を触ると記録が開きます。"
+    : "会員が登録した釣果が、新しい順に並びます。釣った位置と魚の検索の地図は、会員だけが見られます。";
+  if(!NW.list.length){ $("nwList").innerHTML=`<div class="empty">まだ釣果がありません。</div>`; postLayer.clearLayers(); return; }
+  let html="", sec=null;
+  for(const p of NW.list){
+    const s = pref ? (p.pref===pref ? `${pref}の新着` : "ほかの地域の新着") : null;
+    if(s && s!==sec){ html+=`<div class="nw-sec">${esc(s)}</div>`; sec=s; }
+    html+=catchCard(p);
+  }
+  if(pref && !NW.list.some(p=>p.pref===pref)) html=`<p class="hint">${esc(pref)}の釣果はまだありません。</p>`+html;
+  $("nwList").innerHTML=html;
+  drawPostMarkers(NW.list);
+  if(reset){                                                    // ここまで見たことにする（「新着」の印は今回の表示では残す）
+    const top=NW.list.reduce((m,p)=>p.created_at>m?p.created_at:m,"");
+    if(top && top>seenNew()) lsSet("choka-new-seen",top);
+    FD.newN=0; paintBadges();
+  }
+}
+function catchCard(p){
+  const u=p.photos?.[0] ? postUrl(thumbOf(p.photos[0])) : "", full=postUrl(p.photos?.[0]);
+  const title=[p.species,p.size_cm?`${p.size_cm}cm`:"",p.count?`${p.count}匹`:""].filter(Boolean).join(" ");
+  const isNew = NW.seen ? p.created_at>NW.seen : false;
+  return `<div class="card post catchcard" data-pid="${p.id}" tabindex="0" role="button">
+    ${u?`<img src="${esc(u)}" data-full="${esc(full)}" onerror="if(this.dataset.full&&this.src!==this.dataset.full)this.src=this.dataset.full" alt="${esc(p.species||"")}の写真" loading="lazy">`:`<div class="noimg" style="background:${spColor(p.species)}">${esc(p.species||"")}</div>`}
+    <div><div class="t"><span class="ttl">${esc(title)}</span>${isNew?'<span class="tag">新着</span>':""}${p.faved?'<span class="tag ok">★</span>':""}${p.kind!=="catch"?`<span class="kind ${(KIND_POST[p.kind]||KIND_POST.photo)[0]}">${(KIND_POST[p.kind]||KIND_POST.photo)[1]}</span>`:""}${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
+    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,22,p.owner_tsunuke)}${p.pref?`<span>${esc(p.pref)}</span>`:""}<span>${p.caught_at?`${fmtJ(p.caught_at)} 釣果`:fmtJ(p.created_at)}</span></div>
+    <div class="meta">${[p.method,p.shime].filter(Boolean).map(x=>`<span>${esc(x)}</span>`).join("")}${p.lat!=null?"<span>📍位置あり</span>":""}</div>
+    <div class="meta"><button type="button" class="qlike" data-like="${p.id}" aria-pressed="${p.liked}">♥ ${p.like_count}</button>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}</div></div></div>`;
+}
+$("nwList").addEventListener("click",async e=>{
+  const lb=e.target.closest("button[data-like]");
+  if(lb){ e.stopPropagation(); return quickLike(lb); }
+  if(e.target.closest("#nwBack")) return nwMode("feed");
+  if(e.target.closest("[data-lock]")) return memberGate(e.target.closest("[data-lock]").dataset.lock);
+  const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid);
+});
+$("nwList").addEventListener("keydown",e=>{ if(e.key==="Enter" && !e.target.closest("button")){ const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid); } });
+async function quickLike(btn){
+  if(!hasProfile()) return needProfile("いいね");
+  const id=btn.dataset.like, on=btn.getAttribute("aria-pressed")!=="true";
+  btn.disabled=true;
+  const {error}= on ? await SH.sb.from("post_likes").insert({post_id:id,user_id:SH.user.id})
+                    : await SH.sb.from("post_likes").delete().eq("post_id",id).eq("user_id",SH.user.id);
+  btn.disabled=false;
+  if(error && !/duplicate/i.test(error.message)) return openDlg("いいね",`<p>${esc(shErr(error))}</p>`);
+  const p=NW.list.find(x=>x.id===id); if(p){ p.liked=on; p.like_count=Math.max(0,p.like_count+(on?1:-1)); }
+  btn.setAttribute("aria-pressed",String(on)); btn.textContent=`♥ ${p?p.like_count:""}`;
+}
+
+/* ---------- 条件で探す：魚の名前・地域・期間・時期（毎年の何月）・地図の範囲（会員）。新着に載ったすべての釣果が対象 ---------- */
+function nwCond(){
+  const c={}, q=$("nwQ").value.trim().slice(0,40), d=$("nwDays").value;
+  if(q) c.q=q; if($("nwFPref").value) c.pref=$("nwFPref").value; if($("nwMonth").value) c.month=+$("nwMonth").value;
+  if(d==="range"){ if($("nwFrom").value) c.from=$("nwFrom").value; if($("nwTo").value) c.to=$("nwTo").value; }
+  else if(d) c.days=+d;
+  if($("nwBox").checked && isMember() && hasProfile()){ const b=map.getBounds(); Object.assign(c,{s:b.getSouth(),w:b.getWest(),n:b.getNorth(),e:b.getEast()}); }
+  return c;
+}
+function condText(c){
+  return [c.q?`「${c.q}」`:"すべての魚", c.pref||"", c.days?`${c.days}日以内`:"", c.from||c.to?`${(c.from||"").replace(/-/g,"/")}〜${(c.to||"").replace(/-/g,"/")}`:"",
+          c.month?`毎年${c.month}月`:"", c.s!=null?"地図の範囲":""].filter(Boolean).join("・");
+}
+const tally = (list,key) => { const o={}; for(const p of list){ const k=p[key]; if(k) o[k]=(o[k]||0)+(key==="species"?(p.count||1):1); } return Object.entries(o).sort((a,b)=>b[1]-a[1]); };
+async function nwSearch(){
+  if(!SH.sb) return;
+  const c=nwCond(); c.limit=500;
+  NW.searched=true; $("nwMore").hidden=true;
+  $("nwList").innerHTML=`<div class="empty">探しています…</div>`;
+  const {data,error}=await SH.sb.rpc("catch_find",{p:c});
+  if(error){ $("nwList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  if(NW.mode!=="search") return;
+  const list=data||[], member=isMember()&&hasProfile();
+  NW.list=list;
+  const withPos=list.filter(p=>p.lat!=null);
+  const sp=tally(list,"species").slice(0,8).map(([k,v])=>`${k} ${v}匹`).join("・");
+  const pf=tally(list,"pref").slice(0,6).map(([k,v])=>`${k} ${v}`).join("・");
+  let head=`<div class="nw-head"><b>${esc(condText(c))}</b><span>${list.length}件${list.length>=500?"（新しい500件）":""}</span></div>`;
+  if(sp && !c.q) head+=`<p class="hint" style="margin:0 0 2px">魚種：${esc(sp)}</p>`;
+  if(pf && !c.pref) head+=`<p class="hint" style="margin:0 0 4px">県別：${esc(pf)}</p>`;
+  if(!member) head+=`<div class="lockbox" role="button" tabindex="0" data-lock="釣れた場所の地図">🔒 釣れた場所を地図で見られるのは<b>会員</b>だけです（くわしくはここを押してください）</div>`;
+  else if(list.length) head+=`<p class="hint" style="margin:0 0 4px">地図に ${withPos.length}か所を表示しています。印を触ると記録が開きます。</p>`;
+  $("nwHint").textContent="";
+  $("nwList").innerHTML = head + (list.length ? list.map(catchCard).join("") : `<div class="empty">見つかりませんでした。条件を減らすか、ひらがな・別の呼び名（例：あこう／きじはた）でも探してください。</div>`);
+  drawPostMarkers(list, true);
+  if(withPos.length && c.s==null){
+    map.fitBounds(L.latLngBounds(withPos.map(p=>[p.lat,p.lon])).pad(0.2),{maxZoom:12});
+    if(isPhone()) $("mapwrap").scrollIntoView({block:"start",behavior:"smooth"});
+  }
+}
+
+/* ---------- お気に入り（会員） ---------- */
+async function nwFavs(reset=true){
+  if(reset){ NW.page=0; NW.list=[]; $("nwList").innerHTML=`<div class="empty">読み込み中…</div>`; }
+  const N=30, {data,error}=await SH.sb.rpc("my_favorites",{p_offset:NW.page*N,p_limit:N});
+  if(error){ $("nwList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  if(NW.mode!=="fav") return;
+  NW.list=NW.list.concat(data||[]); NW.page++;
+  $("nwMore").hidden=(data||[]).length<N;
+  $("nwHint").textContent="お気に入りに保存した釣果・投稿です（自分だけが見られます）。外すときは、開いて「★ お気に入り済み」を押します。投稿した人が消したものは、ここからも消えます。";
+  $("nwList").innerHTML = NW.list.length ? NW.list.map(catchCard).join("") : `<div class="empty">まだお気に入りはありません。<br>釣果を開いて「☆ お気に入り」を押すと、ここに保存されます。</div>`;
+  drawPostMarkers(NW.list, true);
+}
+
+/* ---------- この人の釣果（投稿者の公開中の釣果を、釣った日の新しい順に） ---------- */
+async function nwUser(postId,name,reset=true){
+  if(reset){
+    NW.mode="user"; NW.userPost=postId; NW.userName=name; NW.page=0; NW.list=[];
+    $("nwModes").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed","false"));
+    $("nwFeedTools").hidden=true; $("nwFind").hidden=true;
+    if($("viewFeed").hidden) showTab("feed"); else if(FD.fsub!=="new") feedSub("new");
+    $("nwList").innerHTML=`<div class="empty">読み込み中…</div>`;
+  }
+  const N=30, {data,error}=await SH.sb.rpc("user_catches",{p_post:postId,p_offset:NW.page*N,p_limit:N});
+  if(error){ $("nwList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  if(NW.mode!=="user") return;
+  NW.list=NW.list.concat(data||[]); NW.page++;
+  $("nwMore").hidden=(data||[]).length<N;
+  $("nwHint").textContent="";
+  $("nwList").innerHTML=`<div class="nw-head"><b>${esc(name||"")}さんの釣果</b><span>${NW.list.length}件${(data||[]).length<N?"":"〜"}</span><button type="button" class="btn sm" id="nwBack" style="margin-left:auto">新着に戻る</button></div>`
+    + (NW.list.length ? NW.list.map(catchCard).join("") : `<div class="empty">公開中の釣果はありません。</div>`);
+  drawPostMarkers(NW.list, true);
+}
+
+/* 新着の数（指定した県の分。指定がなければ全国）。ログインしなくても数える */
+async function newPoll(){
+  if(!SH.sb || document.visibilityState!=="visible") return;
+  const seen=seenNew();
+  if(!seen){ FD.newN=0; paintBadges(); return; }                 // はじめての人には数を出さない
+  let q=SH.sb.from("post_cards").select("id",{count:"exact",head:true}).eq("kind","catch").eq("status","public").gt("created_at",seen);
+  const pref=nwPref(); if(pref) q=q.eq("pref",pref);
+  const {count,error}=await q;
+  if(error) return;
+  FD.newN = (!$("viewFeed").hidden && FD.fsub==="new") ? 0 : (count||0);
+  paintBadges();
+}
+function paintBadges(){
+  const set=(id,n)=>{ $(id).hidden=!n; $(id).textContent=n>99?"99+":(n||""); };
+  set("newBadge",FD.newN); set("dmBadge",FD.dmN); set("feedBadge",FD.newN+FD.dmN);
+}
+setInterval(newPoll,180000);
+function needProfile(what){
+  const b=openDlg(`${what}にはログインが必要です`,`<p>${what}は、ログインして表示名を登録すると使えます（無料）。</p>
+    <div class="actions"><button type="button" class="btn" id="npClose">閉じる</button><button type="button" class="btn primary" id="npGo">ログインする</button></div>`);
+  b.querySelector("#npClose").onclick=()=>$("dlg").close();
+  b.querySelector("#npGo").onclick=()=>{ $("dlg").close(); showTab("share"); };
+  return false;
+}
+$("fdKinds").addEventListener("click",e=>{ const b=e.target.closest(".chip"); if(!b) return; FD.filter=b.dataset.k; feedLoad(true); });
+$("fdMore").onclick=()=>feedLoad(false);
+async function feedLoad(reset){
+  if(reset){ FD.page=0; FD.list=[]; $("feedList").innerHTML=`<div class="empty">読み込み中…</div>`; }
+  $("fdKinds").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.k===FD.filter)));
+  const N=20;
+  let q=SH.sb.from("post_cards").select("*").order("created_at",{ascending:false}).range(FD.page*N,FD.page*N+N-1);
+  if(FD.filter==="photo"||FD.filter==="blog") q=q.eq("kind",FD.filter);
+  else if(FD.filter!=="mine") q=q.in("kind",["photo","blog"]);       // 釣果の新着は「新着の釣果」に出す
+  if(FD.filter==="mine") q=q.eq("mine",true); else q=q.eq("status","public");
+  const {data,error}=await q;
+  if(error){ $("feedList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  FD.list=FD.list.concat(data); FD.page++;
+  $("fdMore").hidden=data.length<N;
+  $("feedList").innerHTML = FD.list.length ? FD.list.map(postCard).join("") : `<div class="empty">${FD.filter==="mine"?"まだ投稿していません。":"まだ投稿がありません。"}</div>`;
+  drawPostMarkers(FD.list);
+}
+const KIND_POST={photo:["gift","写真"],blog:["shop","ブログ"],catch:["catch","釣果"]};
+function postCard(p){
+  const u=postUrl(p.photos?.[0]);
+  const title=p.kind==="blog"?p.title:[p.species,p.size_cm?`${p.size_cm}cm`:""].filter(Boolean).join(" ")||"写真";
+  const [kc,kn]=KIND_POST[p.kind]||KIND_POST.photo;
+  return `<div class="card post" data-pid="${p.id}" tabindex="0" role="button">${u?`<img src="${esc(u)}" alt="" loading="lazy">`:`<div class="noimg"></div>`}
+    <div><div class="t"><span class="kind ${kc}">${kn}</span><span class="ttl">${esc(title)}</span>${p.status==="removed"?'<span class="st">管理者が削除</span>':""}</div>
+    ${p.body?`<div class="ex">${esc(p.body)}</div>`:""}
+    <div class="meta">${whoLine(p.owner_avatar,p.owner_name,20,p.owner_tsunuke)}${p.place?`<span>${esc(p.place)}</span>`:""}<span>♥ ${p.like_count}</span>${p.allow_comments?`<span>💬 ${p.comment_count}</span>`:""}<span>${fmtJ(p.created_at)}</span></div></div></div>`;
+}
+function drawPostMarkers(list,search){
+  postLayer.clearLayers();
+  for(const p of list||[]) if(p.lat!=null && p.status==="public"){
+    const isCatch=p.kind==="catch"||search;
+    const tip=p.kind==="blog"?p.title:[p.species||"写真",p.size_cm?`${p.size_cm}cm`:"",p.owner_name?`・${p.owner_name}`:""].filter(Boolean).join(" ");
+    const pm=L.circleMarker([p.lat,p.lon],{radius:(isCatch?6:7)+(coarse()?2:0),color:isCatch?"#d6336c":"#fff",weight:isCatch?2.5:2,fillColor:isCatch?spColor(p.species):"#d6336c",fillOpacity:.9,bubblingMouseEvents:false})
+      .bindTooltip(esc(tip),{direction:"top"}).on("click",e=>{ const h=nearMarks(e.containerPoint); h.length>1?openNear(h,e.latlng):postDetail(p.id); }).addTo(postLayer);
+    pm._post=p;
+  }
+}
+$("feedList").addEventListener("click",e=>{ const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid); });
+$("feedList").addEventListener("keydown",e=>{ if(e.key==="Enter"){ const c=e.target.closest(".card[data-pid]"); if(c) postDetail(c.dataset.pid); } });
+
+/* 会員に見せる、釣果のくわしい記録 */
+function detailRows(d){
+  const j=(...a)=>a.filter(x=>x!=null&&x!=="").join(" ");
+  return [
+    ["重量", d.weight?`${d.weight}g`:""],
+    ["棚／水深", j(d.tana!=null?`${d.tanaRef||""}${d.tana}m`:"", d.depth!=null?`水深${d.depth}m`:"")],
+    ["仕掛け", d.bait], ["ポイント名", d.spot], ["底質・反応", j(d.bottom,d.echo)], ["船の流れ", d.drift],
+    ["締め・保冷", j(d.treat?String(d.treat).replace(/,/g,"・"):"", d.cooling?`保冷：${d.cooling}`:"", d.shimeAt?`${mdhm(d.shimeAt)}締め`:"")],
+    ["天気・風", j(d.weather, d.temp!=null?`${d.temp}℃`:"", d.windDir?`${d.windDir}${d.wind??""}m/s`:"", d.gust!=null?`最大${d.gust}m/s`:"", d.press!=null?`${d.press}hPa`:"")],
+    ["波・水温", j(d.wave!=null?`波${d.wave}m`:"", d.wavePer!=null?`${d.wavePer}s`:"", d.waveDir, d.sst!=null?`水温${d.sst}℃`:"", d.color)],
+    ["潮", j(d.tideName, d.tideMove, d.moon!=null?`月齢${d.moon}`:"", d.tideLv!=null?`潮位${d.tideLv}cm`:"")],
+    ["満潮・干潮", j(d.high?`満潮 ${d.high}`:"", d.low?`干潮 ${d.low}`:"")],
+    ["メモ", d.memo],
+  ].filter(x=>x[1]);
+}
+const LOCK_DETAIL = `<div class="lockbox" role="button" tabindex="0" data-lock="くわしい記録">🔒 <b>会員になると</b>、釣った位置・棚・水深・仕掛け・ポイント名・気象・潮・メモまで見られます</div>`;
+async function postDetail(id){
+  const [{data:p},{data:cs}]=await Promise.all([
+    SH.sb.from("post_cards").select("*").eq("id",id).maybeSingle(),
+    SH.sb.from("comment_cards").select("*").eq("post_id",id).order("id")]);
+  if(!p){ openDlg("投稿","<p>この投稿は見られなくなりました。</p>"); return; }
+  const logged=hasProfile(), isAdmin=SH.profile?.role==="admin";
+  const isCatch=p.kind==="catch", localRec=isCatch&&p.mine&&p.catch_id ? records.find(r=>String(r.id)===p.catch_id) : null;
+  const facts=[["魚種",p.species],["大きさ",p.size_cm?`${p.size_cm}cm`:""],["匹数",p.count?`${p.count}匹`:""],["釣法",p.method],["締め方",p.shime],
+    ["釣った日",p.caught_at?fmtJ(p.caught_at):""],["県",p.pref],["場所",p.place],
+    ["釣った位置",p.lat!=null?fmtPos(p.lat,p.lon):(p.has_pos?(hasProfile()?"会員になると見られます":"会員がログインすると見られます"):"")]].filter(x=>x[1]);
+  const cmts=(cs||[]).map(c=>`<div class="cmt" data-cid="${c.id}"><span class="who">${whoLine(c.user_avatar,c.user_name,20,c.user_tsunuke)}</span>${esc(c.body)} <small class="hint">${fmtJ(c.created_at)}</small>
+     <span class="ops">${c.mine||c.on_my_post||isAdmin?`<button type="button" class="btn sm" data-a="cdel">消す</button>`:""}${logged&&!c.mine?`<button type="button" class="btn sm" data-a="crep">通報</button>`:""}</span></div>`).join("");
+  const b=openDlg(p.kind==="blog"?p.title:(p.species||"写真"),
+    `${(p.photos||[]).length?`<div class="gal">${p.photos.map(x=>`<img src="${esc(postUrl(x))}" alt="">`).join("")}</div>`:""}
+     <div class="hint" style="display:flex;align-items:center;gap:6px">${whoLine(p.owner_avatar,p.owner_name,28,p.owner_tsunuke)}<span>・${fmtJ(p.created_at)}${p.updated_at&&p.updated_at.slice(0,16)!==p.created_at.slice(0,16)?"（編集済み）":""}</span></div>
+     ${p.body?`<div class="pbody">${esc(p.body)}</div>`:""}
+     ${facts.length?`<table class="kv">${facts.map(([k,v])=>`<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join("")}</table>`:""}
+     ${isCatch&&p.detail&&detailRows(p.detail).length?`<div class="sec-h">くわしい記録（会員）</div><table class="kv">${detailRows(p.detail).map(([k,v])=>`<tr><td>${k}</td><td style="white-space:pre-wrap">${esc(v)}</td></tr>`).join("")}</table>`:""}
+     ${isCatch&&!p.detail&&!p.mine?LOCK_DETAIL:""}
+     <div class="toolbar" style="margin-top:10px">
+       <button type="button" class="btn likebtn" id="pdLike" aria-pressed="${p.liked}">♥ いいね ${p.like_count}</button>
+       ${!p.mine?`<button type="button" class="btn sm favbtn ${isMember()&&hasProfile()?"":"locked"}" id="pdFav" aria-pressed="${!!p.faved}">${p.faved?"★ お気に入り済み":"☆ お気に入り"}</button>`:""}
+       ${isCatch&&!p.mine?`<button type="button" class="btn sm" id="pdUser">この人の釣果</button>`:""}
+       ${p.lat!=null?`<button type="button" class="btn sm" id="pdMap">地図で見る</button>`:""}
+       ${!p.mine&&logged?`<button type="button" class="btn sm" id="pdDm">メッセージを送る</button>`:""}
+       ${!p.mine&&logged?`<button type="button" class="btn sm danger" id="pdRep">通報</button>`:""}
+     </div>
+     ${p.mine&&!isCatch?`<div class="toolbar"><button type="button" class="btn sm" id="pdEdit">編集</button><button type="button" class="btn sm" id="pdCmtTgl">${p.allow_comments?"コメントを受け付けない":"コメントを受け付ける"}</button><button type="button" class="btn sm danger" id="pdDel">投稿を消す</button></div>`:""}
+     ${p.mine&&isCatch?`<div class="toolbar">${localRec?`<button type="button" class="btn sm" id="pdRec">自分の記録を開く</button>`:""}<button type="button" class="btn sm" id="pdCmtTgl">${p.allow_comments?"コメントを受け付けない":"コメントを受け付ける"}</button><button type="button" class="btn sm danger" id="pdDel">新着から外す</button></div>
+       <p class="hint">魚種・大きさ・位置・写真は、「釣果一覧」で記録を直すと、ここにも反映されます。</p>`:""}
+     ${isAdmin&&!p.mine&&p.status==="public"?`<div class="toolbar"><button type="button" class="btn sm danger" id="pdRemove">管理者として削除</button></div>`:""}
+     <div class="sec-h">コメント${p.allow_comments?`（${(cs||[]).length}）`:""}</div>
+     ${p.allow_comments?(cmts||`<p class="hint">まだコメントはありません。</p>`):`<p class="hint">この投稿はコメントを受け付けていません。</p>${cmts}`}
+     ${p.allow_comments&&p.status==="public"?(logged?`<div class="row" style="margin-top:8px"><label>コメント<input id="pdCmt" maxlength="500" placeholder="ひとことどうぞ"></label><button type="button" class="btn primary" id="pdCmtSend">送る</button></div>`:`<p class="hint">コメントするにはログインしてください。</p>`):""}
+     <div class="status" id="pdStat"></div>`);
+  const st=(m,c)=>shMsg("pdStat",m,c);
+  b.querySelector("#pdLike").onclick=async e=>{
+    if(!hasProfile()) return needProfile("いいね");
+    const on=e.target.getAttribute("aria-pressed")!=="true";
+    const {error}= on ? await SH.sb.from("post_likes").insert({post_id:id,user_id:SH.user.id})
+                      : await SH.sb.from("post_likes").delete().eq("post_id",id).eq("user_id",SH.user.id);
+    if(error && !/duplicate/i.test(error.message)) return st(shErr(error),"err");
+    p.like_count=Math.max(0,p.like_count+(on?1:-1)); p.liked=on;
+    e.target.setAttribute("aria-pressed",String(on)); e.target.textContent=`♥ いいね ${p.like_count}`;
+    for(const c of [FD.list.find(x=>x.id===id),NW.list.find(x=>x.id===id)]) if(c){ c.like_count=p.like_count; c.liked=on; }
+    const q=document.querySelector(`#nwList button[data-like="${id}"]`); if(q){ q.setAttribute("aria-pressed",String(on)); q.textContent=`♥ ${p.like_count}`; }
+  };
+  b.querySelector("#pdFav")?.addEventListener("click",async e=>{
+    if(!(isMember()&&hasProfile())) return memberGate("お気に入り");
+    const on=!p.faved;
+    const {error}= on ? await SH.sb.from("post_favorites").insert({post_id:id,user_id:SH.user.id})
+                      : await SH.sb.from("post_favorites").delete().eq("post_id",id).eq("user_id",SH.user.id);
+    if(error && !/duplicate/i.test(error.message)) return st(shErr(error),"err");
+    p.faved=on; e.target.setAttribute("aria-pressed",String(on)); e.target.textContent=on?"★ お気に入り済み":"☆ お気に入り";
+    for(const c of [FD.list.find(x=>x.id===id),NW.list.find(x=>x.id===id)]) if(c) c.faved=on;
+    if(!on && NW.mode==="fav") nwFavs();
+  });
+  b.querySelector("#pdUser")?.addEventListener("click",()=>{ $("dlg").close(); nwUser(id,p.owner_name); });
+  b.querySelector("#pdRec")?.addEventListener("click",()=>{ $("dlg").close(); showTab("list"); map.flyTo([localRec.lat,localRec.lon],Math.max(map.getZoom(),13),{duration:.6}); setTimeout(()=>openRecPopup(localRec),700); if(isPhone()) $("mapwrap").scrollIntoView({block:"start"}); });
+  b.querySelector("#pdMap")?.addEventListener("click",()=>{ $("dlg").close(); map.flyTo([p.lat,p.lon],13,{duration:.6}); if(isPhone()) $("map").scrollIntoView({block:"start"}); });
+  b.querySelector("#pdDm")?.addEventListener("click",async()=>{
+    const {data:tid,error}=await SH.sb.rpc("dm_open_post",{p_post:id});
+    if(error) return st(shErr(error),"err");
+    dmThread(tid, p.owner_name);
+  });
+  b.querySelector("#pdRep")?.addEventListener("click",()=>postReport(id,null,p));
+  b.querySelector("#pdCmtSend")?.addEventListener("click",async e=>{
+    const body=$("pdCmt").value.trim(); if(!body) return;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("post_comments").insert({post_id:id,user_id:SH.user.id,body});
+    setBusy(e.target,false);
+    if(error) return st(shErr(error),"err");
+    postDetail(id);
+  });
+  b.querySelectorAll(".cmt button").forEach(x=>x.onclick=async()=>{
+    const cid=+x.closest("[data-cid]").dataset.cid;
+    if(x.dataset.a==="crep") return postReport(id,cid,p);
+    if(!x.dataset.armed){ x.dataset.armed="1"; x.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("post_comments").delete().eq("id",cid);
+    if(error) return st(shErr(error),"err");
+    postDetail(id);
+  });
+  b.querySelector("#pdCmtTgl")?.addEventListener("click",async()=>{
+    const {error}=await SH.sb.from("posts").update({allow_comments:!p.allow_comments}).eq("id",id);
+    if(error) return st(shErr(error),"err");
+    await postDetail(id); feedRefresh();
+  });
+  b.querySelector("#pdEdit")?.addEventListener("click",()=>postEdit(p));
+  b.querySelector("#pdDel")?.addEventListener("click",async e=>{
+    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("posts").delete().eq("id",id);
+    if(error) return st(shErr(error),"err");
+    if(p.photos?.length) SH.sb.storage.from("posts").remove(isCatch?withThumbs(p.photos):p.photos);
+    if(localRec){                                                // 新着から外した釣果は、この端末の記録も「載せない」にする
+      MYP.delete(String(localRec.id)); localRec.feed=false; localRec.feedPost=null; delete localRec.feedDirty; localRec.updatedAt=new Date().toISOString();
+      await saveRec(localRec); cloudSoon();
+    }
+    $("dlg").close(); feedRefresh();
+  });
+  b.querySelector("#pdRemove")?.addEventListener("click",async e=>{
+    if(!e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すと削除"; return; }
+    const {error}=await SH.sb.from("posts").update({status:"removed"}).eq("id",id);
+    if(error) return st(shErr(error),"err");
+    $("dlg").close(); feedRefresh();
+  });
+}
+function feedRefresh(){ if(FD.fsub==="new") (NW.mode==="search"&&NW.q?nwSearch():nwLoad(true)); else if(FD.fsub==="posts") feedLoad(true); }
+function postReport(pid,cid,p){
+  const b=openDlg(cid?"コメントを通報":"投稿を通報",`<label>理由<select id="prReason">${POST_REASONS.map(r=>`<option>${r}</option>`).join("")}</select></label>
+    <label style="margin-top:8px">くわしく（任意）<textarea id="prDetail" maxlength="400"></textarea></label>
+    <p class="hint">通報は管理者だけが見ます。</p>
+    <div class="actions"><button type="button" class="btn" id="prBack">戻る</button><button type="button" class="btn primary" id="prSend">通報する</button></div><div class="status" id="prStat"></div>`);
+  b.querySelector("#prBack").onclick=()=>postDetail(pid);
+  b.querySelector("#prSend").onclick=async()=>{
+    const {error}=await SH.sb.from("post_reports").insert({post_id:pid,comment_id:cid,reporter:SH.user.id,reason:$("prReason").value,detail:$("prDetail").value.trim()||null});
+    if(error) return shMsg("prStat",shErr(error),"err");
+    shMsg("prStat","通報しました。ご協力ありがとうございます","ok");
+  };
+}
+function postEdit(p){
+  const b=openDlg("投稿を編集",`<p class="hint">写真・魚種・位置は変えられません。変えたいときは、消して投稿し直してください。</p>
+    ${p.kind==="blog"?`<label>タイトル<input id="peTitle" maxlength="80" value="${esc(p.title||"")}"></label>`:""}
+    <label style="margin-top:8px">本文<textarea id="peBody" maxlength="5000" rows="6">${esc(p.body||"")}</textarea></label>
+    <label style="margin-top:8px">場所（大まかに。誰でも見られます）<input id="pePlace" maxlength="40" value="${esc(p.place||"")}"></label>
+    <div class="actions"><button type="button" class="btn" id="peBack">戻る</button><button type="button" class="btn primary" id="peSave">保存</button></div><div class="status" id="peStat"></div>`);
+  b.querySelector("#peBack").onclick=()=>postDetail(p.id);
+  b.querySelector("#peSave").onclick=async()=>{
+    const patch={body:$("peBody").value.trim()||null,place:$("pePlace").value.trim()||null};
+    if(p.kind==="blog"){ patch.title=$("peTitle").value.trim(); if(!patch.title) return shMsg("peStat","タイトルを入れてください","err"); }
+    const {error}=await SH.sb.from("posts").update(patch).eq("id",p.id);
+    if(error) return shMsg("peStat",shErr(error),"err");
+    await postDetail(p.id); feedRefresh();
+  };
+}
+
+/* 投稿する（会員） */
+$("btnPost").onclick=()=>{ if(!hasProfile()) return memberGate("投稿"); if(!memberGate("投稿")) return; postForm(); };
+function postForm(){
+  const P={photos:[], rec:null};
+  const recs=records.filter(r=>!r.sample).sort((a,b)=>b.datetime.localeCompare(a.datetime)).slice(0,50);
+  const b=openDlg("投稿する",`<div class="chips sq" id="pfK"><button type="button" class="chip" data-k="photo" aria-pressed="true">写真</button><button type="button" class="chip" data-k="blog" aria-pressed="false">ブログ</button></div>
+    <label style="margin-top:8px">釣果の記録から（任意。魚種・大きさ・写真などが入ります）<select id="pfRec"><option value="">選ばない</option>${recs.map(r=>`<option value="${esc(r.id)}">${esc(fmtDT(r.datetime))} ${esc(r.species)}${r.count?` ${r.count}匹`:""}</option>`).join("")}</select></label>
+    <label class="hidden-blog" style="margin-top:8px" hidden>タイトル<input id="pfTitle" maxlength="80" placeholder="例：ブリしゃぶの作り方"></label>
+    <label style="margin-top:8px">本文<textarea id="pfBody" maxlength="5000" rows="5" placeholder="釣れたときの様子や、料理のことなど"></textarea></label>
+    <div class="thumbs" id="pfThumbs"></div>
+    <label class="btn sm" style="flex-direction:row;color:var(--ink);width:max-content">写真を追加（6枚まで）<input type="file" id="pfFiles" accept="image/*" multiple hidden></label>
+    <label style="margin-top:8px">場所（大まかに。誰でも見られます）<input id="pfPlace" maxlength="40" placeholder="例：氷見沖、富山湾"></label>
+    <div class="checks">
+      <label id="pfPosL" hidden><input type="checkbox" id="pfPos">釣った位置を載せる（会員だけに見えます）</label>
+      <label><input type="checkbox" id="pfCmt" checked>コメントを受け付ける</label>
+    </div>
+    <p class="hint">写真の撮影場所などの情報は、縮小するときに消えます。人の顔や他人の写真を載せるときは、許可を取ってください。</p>
+    <div class="actions"><button type="button" class="btn" id="pfBack2">やめる</button><button type="button" class="btn primary" id="pfSend">投稿する</button></div>
+    <div class="status" id="pfStat2"></div>`);
+  let kind="photo";
+  const drawThumbs=()=>{ $("pfThumbs").innerHTML=P.photos.map((u,i)=>`<figure><img src="${u}" alt=""><button type="button" data-i="${i}" aria-label="外す">×</button></figure>`).join("");
+    $("pfThumbs").querySelectorAll("button").forEach(x=>x.onclick=()=>{ P.photos.splice(+x.dataset.i,1); drawThumbs(); }); };
+  b.querySelector("#pfK").onclick=e=>{ const c=e.target.closest(".chip"); if(!c) return; kind=c.dataset.k;
+    b.querySelectorAll("#pfK .chip").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.k===kind))); b.querySelector(".hidden-blog").hidden=kind!=="blog"; };
+  b.querySelector("#pfRec").onchange=e=>{
+    P.rec=records.find(r=>r.id===e.target.value)||null;
+    $("pfPosL").hidden=!P.rec;
+    if(P.rec){ P.photos=localPh(P.rec).slice(0,6); if(!$("pfPlace").value&&P.rec.spot) $("pfPlace").value=P.rec.spot; }
+    drawThumbs();
+  };
+  b.querySelector("#pfFiles").onchange=async e=>{
+    for(const f of [...e.target.files]){ if(P.photos.length>=6) break; try{ P.photos.push(await shrink(f,1280)); }catch{ shMsg("pfStat2",`${f.name} を読み込めませんでした（HEIC形式はJPEGに変換してください）`,"err"); } }
+    e.target.value=""; drawThumbs();
+  };
+  b.querySelector("#pfBack2").onclick=()=>$("dlg").close();
+  b.querySelector("#pfSend").onclick=async e=>{
+    const title=$("pfTitle").value.trim(), body=$("pfBody").value.trim();
+    if(kind==="blog"&&!title) return shMsg("pfStat2","タイトルを入れてください","err");
+    if(kind==="photo"&&!P.photos.length) return shMsg("pfStat2","写真を1枚以上つけてください","err");
+    if(!body&&!P.photos.length) return shMsg("pfStat2","本文か写真を入れてください","err");
+    setBusy(e.target,true,"写真を送信中…");
+    const base=`${SH.user.id}/${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, paths=[];
+    try{
+      for(let i=0;i<P.photos.length;i++){
+        const path=`${base}-${i}.jpg`;
+        const {error}=await SH.sb.storage.from("posts").upload(path,await dataUrlToBlob(P.photos[i]),{contentType:"image/jpeg",upsert:false});
+        if(error) throw error; paths.push(path);
+      }
+      e.target.textContent="投稿中…";
+      const r=P.rec, pos=r&&$("pfPos").checked;
+      const row={owner:SH.user.id,kind,title:kind==="blog"?title:null,body:body||null,photos:paths,
+        size_cm:r?.length||null,count:r?.count||null,method:r?.method?String(r.method).slice(0,40):null,shime:r?.shime?String(r.shime).slice(0,40):null,species:r?.species?String(r.species).slice(0,40):null,
+        caught_at:r?new Date(r.datetime+":00+09:00").toISOString():null,place:$("pfPlace").value.trim()||null,
+        lat:pos?r.lat:null,lon:pos?r.lon:null,allow_comments:$("pfCmt").checked};
+      const {error}=await SH.sb.from("posts").insert(row);
+      if(error) throw error;
+      $("dlg").close(); FD.filter="all"; feedLoad(true);
+    }catch(err){
+      if(paths.length) SH.sb.storage.from("posts").remove(paths);
+      shMsg("pfStat2",shErr(err),"err");
+    }finally{ setBusy(e.target,false); }
+  };
+}
+
+/* メッセージ */
+function dmSeen(){ try{ return JSON.parse(localStorage.getItem("choka-dmseen")||"{}"); }catch{ return {}; } }
+function dmMark(id,iso){ if(!iso) return; const m=dmSeen(); if(!m[id]||m[id]<iso){ m[id]=iso; try{ localStorage.setItem("choka-dmseen",JSON.stringify(m)); }catch{} } }
+const dmUnread = (t,seen) => t.last_in_at && (!seen[t.id] || seen[t.id] < t.last_in_at);
+async function dmList(){
+  const {data,error}=await SH.sb.from("dm_cards").select("*").order("last_at",{ascending:false}).limit(100);
+  if(error){ $("dmList").innerHTML=`<div class="empty">${esc(shErr(error))}</div>`; return; }
+  const seen=dmSeen();
+  $("dmList").innerHTML = data.length ? data.map(t=>`<div class="card dmrow" data-tid="${t.id}" data-name="${esc(t.other_name)}" tabindex="0" role="button"><div>
+      <div class="t"><span class="sp">${whoLine(t.other_avatar,t.other_name,26,t.other_tsunuke)}</span>${dmUnread(t,seen)?'<span class="tag">新着</span>':""}${t.blocked?'<span class="st">ブロック中</span>':""}<span class="hint" style="margin:0">${fmtJ(t.last_at)}</span></div>
+      <div class="facts"><span>${esc(t.last_body||"（まだメッセージはありません）")}</span></div></div></div>`).join("")
+    : `<div class="empty">まだメッセージはありません。<br>投稿を開いて「メッセージを送る」から始められます。</div>`;
+  feedBadge(data);
+}
+$("dmList").addEventListener("click",e=>{ const c=e.target.closest("[data-tid]"); if(c) dmThread(c.dataset.tid,c.dataset.name); });
+async function dmThread(tid,name){
+  const b=openDlg(`${name}さんとのメッセージ`,`<div class="thread" id="dmThr"></div>
+    <div class="row"><label>メッセージ<textarea id="dmIn" maxlength="1000" rows="2"></textarea></label><button type="button" class="btn primary" id="dmSend">送る</button></div>
+    <div class="toolbar" style="justify-content:flex-end"><button type="button" class="btn sm danger" id="dmBlock">ブロック</button></div>
+    <p class="hint">電話番号や住所を書くときは、相手をよく確かめてください。迷惑な相手はブロックすると、お互いにメッセージを送れなくなります。</p>
+    <div class="status" id="dmStat"></div>`);
+  let blockedByMe=false;
+  const load=async()=>{
+    const [{data:ms},{data:t}]=await Promise.all([
+      SH.sb.from("dm_messages").select("*").eq("thread_id",tid).order("id"),
+      SH.sb.from("dm_cards").select("*").eq("id",tid).maybeSingle()]);
+    const box=$("dmThr"); if(!box) return;
+    box.innerHTML=(ms||[]).map(m=>`<div class="msg ${m.sender===SH.user.id?"me":""}">${esc(m.body)}<small>${fmtJ(m.created_at)}</small></div>`).join("")||`<p class="hint">最初のメッセージを送ってください。</p>`;
+    box.scrollTop=box.scrollHeight;
+    if(t){ blockedByMe=t.i_blocked; $("dmBlock").textContent=t.i_blocked?"ブロックを解除":"ブロック";
+      $("dmSend").disabled=t.blocked; if(t.blocked) shMsg("dmStat",t.i_blocked?"この相手をブロックしています":"この相手とはメッセージをやり取りできません","err"); }
+    dmMark(tid,(ms||[]).filter(m=>m.sender!==SH.user.id).at(-1)?.created_at);
+  };
+  await load(); clearInterval(FD.dmT); FD.dmT=setInterval(()=>{ if($("dlg").open && $("dmThr")) load(); else clearInterval(FD.dmT); },10000);
+  b.querySelector("#dmSend").onclick=async e=>{
+    const body=$("dmIn").value.trim(); if(!body) return;
+    setBusy(e.target,true,"送信中…");
+    const {error}=await SH.sb.from("dm_messages").insert({thread_id:tid,sender:SH.user.id,body});
+    setBusy(e.target,false);
+    if(error) return shMsg("dmStat",shErr(error),"err");
+    $("dmIn").value=""; load();
+  };
+  b.querySelector("#dmBlock").onclick=async e=>{
+    if(!blockedByMe && !e.target.dataset.armed){ e.target.dataset.armed="1"; e.target.textContent="もう一度押すとブロック"; return; }
+    const {error}=await SH.sb.rpc("dm_block",{p_thread:tid,p_on:!blockedByMe});
+    if(error) return shMsg("dmStat",shErr(error),"err");
+    delete e.target.dataset.armed; shMsg("dmStat",""); load();
+  };
+}
+function feedBadge(threads){
+  const seen=dmSeen();
+  FD.dmN=(threads||[]).filter(t=>dmUnread(t,seen)).length;
+  paintBadges();
+}
+async function feedPoll(){
+  if(!hasProfile()||document.visibilityState!=="visible") return;
+  const {data}=await SH.sb.from("dm_cards").select("id,last_in_at").limit(200);
+  if(data) feedBadge(data);
+}
+function feedPollStart(){ feedPollStop(); feedPoll(); FD.pollT=setInterval(feedPoll,60000); }
+function feedPollStop(){ clearInterval(FD.pollT); FD.pollT=null; feedBadge([]); }
+
+/* ---------- 管理（管理者だけ） ---------- */
+async function shAdmin(){
+  const box=$("adminBox");
+  if(SH.profile?.role!=="admin"){ box.innerHTML=""; return; }
+  box.innerHTML=`<div class="empty">読み込み中…</div>`;
+  const [sh,rp,stq,dq,scq,rtq,ucq,prq]=await Promise.all([
+    SH.sb.from("shop_cards").select("*").order("created_at",{ascending:false}),
+    SH.sb.from("report_cards").select("*").eq("status","open").order("created_at",{ascending:false}),
+    SH.sb.rpc("admin_stats"),
+    SH.sb.from("request_cards").select("*").order("updated_at",{ascending:false}).limit(30),
+    SH.sb.from("shared_catch_cards").select("*").order("caught_at",{ascending:false}).limit(300),
+    SH.sb.from("rating_cards").select("*").order("created_at",{ascending:false}).limit(30),
+    SH.sb.from("user_cards").select("*").order("created_at",{ascending:false}).limit(500),
+    SH.sb.from("post_report_cards").select("*").eq("status","open").order("created_at",{ascending:false})]);
+  SH.users=ucq?.data||[]; SH.preports=prq?.data||[];
+  SH.ratings=rtq?.data||[];
+  const shops=sh.data||[], reports=rp.data||[], deals=dq.data||[];
+  SH.shared=scq.data||[];
+  deals.forEach(d=>SH.deals.set(d.id,d));
+  const lic=await signed(shops.map(s=>s.license_photo||""),"licenses");
+  const shopCard=(s,i)=>`<div class="card deal" data-shop="${s.id}"><div>
+     <div class="t"><span class="sp">${esc(s.name)}</span><span class="st ${s.status==="pending"?"hot":s.status==="approved"?"good":""}">${{pending:"審査待ち",approved:"承認済み",rejected:"差し戻し",suspended:"停止中"}[s.status]}</span></div>
+     <div class="facts"><span>許可番号 ${esc(s.license_no)}</span><span>${esc(s.health_center)}</span><span>${esc(s.area)}</span><span>申請者 ${esc(s.owner_name)}</span><span>${fmtJ(s.created_at)}</span></div>
+     ${s.status==="pending"&&lic[i]?`<a href="${esc(lic[i])}" target="_blank" rel="noopener"><img class="lic" src="${esc(lic[i])}" alt="許可証の写真"></a>`:""}
+     <div class="ops">${s.status!=="approved"?`<button type="button" class="btn sm primary" data-a="approve">承認</button>`:""}
+       ${s.status==="pending"?`<button type="button" class="btn sm" data-a="reject">差し戻し</button>`:""}
+       ${s.status==="approved"?`<button type="button" class="btn sm danger" data-a="suspend">停止</button>`:""}</div></div></div>`;
+  const pend=shops.filter(s=>s.status==="pending"), rest=shops.filter(s=>s.status!=="pending");
+  setTimeout(()=>{ usageLoad(); billAdminLoad(); },0);         // 下の画面を作ったあとで、使用量と支払いを読み込む
+  box.innerHTML=`
+    ${statsHtml(stq.data, stq.error)}
+    <div id="billBox"><div class="sec-h">会員の支払いと紹介</div><p class="hint">読み込み中…</p></div>
+    <div class="sec-h">通報（未対応 ${reports.length}件）</div>
+    ${reports.length?reports.map(r=>`<div class="card deal" data-rep="${r.id}" data-lid="${r.listing_id}"><div>
+      <div class="t"><span class="kind ${r.kind}">${KIND_JA[r.kind]}</span><span class="sp">${esc(r.species)}</span><span class="st hot">${esc(r.reason)}</span>${r.owner_banned?'<span class="st">出品者は停止中</span>':""}</div>
+      <div class="facts"><span>出品者 ${esc(r.owner_name)}</span><span>通報者 ${esc(r.reporter_name)}</span><span>${fmtJ(r.created_at)}</span><span>出品の状態：${L_STATUS[r.listing_status]||r.listing_status}</span></div>
+      ${r.detail?`<div class="facts"><span>「${esc(r.detail)}」</span></div>`:""}
+      <div class="ops"><button type="button" class="btn sm" data-a="view">出品を見る</button><button type="button" class="btn sm" data-a="close">対応済みにする</button></div></div></div>`).join(""):`<div class="empty">未対応の通報はありません。</div>`}
+    <div class="sec-h">お店の審査（${pend.length}件）</div>
+    ${pend.length?pend.map(s=>shopCard(s,shops.indexOf(s))).join(""):`<div class="empty">審査待ちはありません。</div>`}
+    <div class="sec-h">登録済みのお店</div>
+    ${rest.length?rest.map(s=>shopCard(s,shops.indexOf(s))).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">最近のやり取り（全体）</div>
+    ${deals.length?deals.map(d=>`<div class="card deal" data-adeal="${d.id}"><div>
+      <div class="t"><span class="kind ${d.kind}">${KIND_JA[d.kind]}</span><span class="sp">${esc(d.species)} ${d.count}匹</span><span class="st">${{pending:"返事待ち",accepted:"受け渡し待ち",done:"受け渡し済み",declined:"見送り",cancelled:"取り消し"}[d.status]||d.status}</span></div>
+      <div class="facts"><span>出品 ${esc(d.owner_name)}</span><span>申込 ${esc(d.shop_name||d.requester_name)}</span><span>${esc(d.pickup_area)}</span>${d.offer_yen!=null?`<span>提示 ${yen(d.offer_yen)}</span>`:""}<span>${fmtJ(d.updated_at)}</span></div>
+      <div class="ops"><button type="button" class="btn sm" data-a="athread">メッセージを見る（${d.msg_count}）</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">おすそわけの本人の確かめ</div>
+    <label class="checks" style="margin:4px 0"><span><input type="checkbox" id="admReqCard" ${SH.requireCard?"checked":""}> おすそわけの出品・申し込みに、会員の申し込みで登録したカードを求める</span></label>
+    <p class="hint">オンにすると、Stripe で申し込んだ会員だけが出品・申し込みできます（管理者が「1年間の会員にする」で会員にした人は、カードがないので使えなくなります）。利用を停止した人のカードでは、アカウントを作り直しても会員になれません。登録して14日間のアカウントは、出品と申し込みの数を少なくしています。</p>
+    <div class="sec-h">利用者と会員（会員 ${SH.users.filter(u=>u.role==="admin"||(u.member_until&&u.member_until>=todayStr())).length}人／${SH.users.length}人）</div>
+    <p class="hint">決済の仕組みを入れるまでは、ここで会員にします。会員は、釣果・航跡の記録、おすそわけ、投稿が使えます。</p>
+    <input type="search" id="usrQ" placeholder="表示名・メールアドレスで絞り込み" style="margin-bottom:6px">
+    <div id="usrList">${usersHtml("")}</div>
+    <div class="sec-h">投稿の通報（未対応 ${SH.preports.length}件）</div>
+    ${SH.preports.length?SH.preports.map(r=>`<div class="card deal" data-prep="${r.id}" data-pid="${r.post_id}" data-cid="${r.comment_id??""}"><div>
+      <div class="t"><span class="sp">${esc(r.post_title||"（本文なし）")}</span><span class="st hot">${esc(r.reason)}</span></div>
+      <div class="facts"><span>投稿者 ${esc(r.owner_name)}</span><span>通報者 ${esc(r.reporter_name)}</span><span>${fmtJ(r.created_at)}</span></div>
+      ${r.comment_body?`<div class="facts"><span>コメント（${esc(r.comment_user)}）：「${esc(r.comment_body)}」</span></div>`:""}
+      ${r.detail?`<div class="facts"><span>「${esc(r.detail)}」</span></div>`:""}
+      <div class="ops"><button type="button" class="btn sm" data-a="pview">投稿を見る</button>${r.comment_id?`<button type="button" class="btn sm danger" data-a="pcdel">コメントを消す</button>`:`<button type="button" class="btn sm danger" data-a="pdel">投稿を削除</button>`}<button type="button" class="btn sm" data-a="pclose">対応済みにする</button></div></div></div>`).join(""):`<div class="empty">未対応の通報はありません。</div>`}
+    <div class="sec-h">最近の評価</div>
+    ${(SH.ratings||[]).length?SH.ratings.map(g=>`<div class="card deal" data-rating="${g.id}"><div>
+      <div class="t"><span class="sp">${esc(g.ratee_name)}</span><span class="st">${g.ratee_is_owner?"出品者として":"申込者として"}</span><span>★${((g.s1+g.s2+g.s3)/3).toFixed(1)}（${g.s1}・${g.s2}・${g.s3}）</span></div>
+      <div class="facts"><span>評価した人 ${esc(g.rater_name)}</span><span>${esc(g.species)}</span><span>${fmtJ(g.created_at)}</span></div>
+      ${g.comment?`<div class="facts"><span>「${esc(g.comment)}」</span></div>`:""}
+      <div class="ops"><button type="button" class="btn sm danger" data-a="rdel">不当な評価として消す</button></div></div></div>`).join(""):`<div class="empty">まだありません。</div>`}
+    <div class="sec-h">提供された釣果</div>
+    ${sharedHtml()}
+    <div class="sec-h">出品できない種類</div>
+    <p class="hint">魚種名にこの言葉が含まれると出品できません（ひらがな・カタカナは区別しません）。</p>
+    <div class="chips sq" id="blkList">${SH.blocked.map(([t,r])=>`<button type="button" class="chip" data-term="${esc(t)}" title="${esc(r)}">${esc(t)} ×</button>`).join("")}</div>
+    <div class="row" style="margin-top:8px"><label>言葉<input id="blkTerm" maxlength="20"></label><label>理由<input id="blkReason" maxlength="60" placeholder="例：漁業権の対象"></label><button type="button" class="btn" id="blkAdd">追加</button></div>
+    <div class="status" id="admStat"></div>`;
+}
+function statsHtml(S,err){
+  if(err||!S) return `<div class="sec-h">利用状況</div><p class="status err">${esc(err?shErr(err):"読み込めませんでした")}（schema.sql を最新のものにして実行し直してください）</p>`;
+  const Ls=S.listings||{}, sum=o=>Object.values(o||{}).reduce((a,n)=>a+n,0), pre=k=>Object.entries(Ls).filter(([x])=>x.startsWith(k)).reduce((a,[,n])=>a+n,0);
+  const tile=(n,l)=>`<div class="tile"><b>${n}</b><span>${l}</span></div>`;
+  const days=[]; const by=new Map((S.daily||[]).map(d=>[d.d,d]));
+  for(let i=29;i>=0;i--){ const d=new Date(Date.now()-i*86400000); const k=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; const v=by.get(k)||{gift:0,shop:0}; days.push([k,v.gift,v.shop]); }
+  const mx=Math.max(1,...days.map(([,g,s])=>g+s));
+  const tbl=(rows,h)=>rows&&rows.length?`<table class="mini"><tr><th>魚種</th><th>${h}</th><th>匹数</th></tr>${rows.map(r=>`<tr><td>${esc(r.species)}</td><td class="n">${r.n}</td><td class="n">${r.fish??""}</td></tr>`).join("")}</table>`:`<p class="hint">まだありません。</p>`;
+  return `<div class="sec-h">利用状況</div>
+    <div class="tiles">
+      ${tile(S.users,`利用者（7日で+${S.users_7d}）`)}${tile(S.signins_7d,"7日以内にログイン")}${tile(S.active_30d,"30日以内に出品・申込・連絡")}
+      ${tile(pre("gift_"),"おすそわけの出品")}${tile(pre("shop_"),"お店向けの出品")}${tile((Ls.gift_done||0)+(Ls.shop_done||0),"受け渡し済み")}
+      ${tile(sum(S.requests),"申し込み")}${tile(S.messages,"メッセージ")}${tile(sum(S.shops),`お店（承認${(S.shops||{}).approved||0}）`)}
+      ${tile(S.members??0,"会員")}${tile(`${S.posts??0}（7日で${S.posts_7d??0}）`,"みんなの投稿")}${tile(`♥${S.likes??0}・💬${S.comments??0}`,"いいね・コメント")}
+      ${tile(S.dms??0,"メッセージ")}${tile(S.post_reports_open??0,"未対応の投稿の通報")}
+      ${tile(S.wants_open??0,"受付中の買い取り希望")}${tile(S.ratings??0,"評価")}${tile(Object.values(S.cancels||{}).reduce((a,n)=>a+n,0),"理由つきの取り消し")}
+      ${tile(`${S.sharing_devices}台`,`釣果を提供中の端末（${S.shared_catches}件・7日で${S.shared_7d}件）`)}${tile(S.reports_open,"未対応の通報")}${tile(S.banned,"利用停止中")}
+    </div>
+    <p class="hint" style="margin-top:8px">直近30日の出品（緑：おすそわけ／茶：お店向け）・合計 ${S.listings_30d}件</p>
+    <div class="bars">${days.map(([k,g,s])=>`<i style="height:${(g+s)/mx*100}%" title="${k.slice(5).replace("-","/")}：おすそわけ${g}・お店向け${s}"><u style="height:${g+s?s/(g+s)*100:0}%"></u></i>`).join("")}</div>
+    <div class="grid" style="margin-top:10px">
+      <div><p class="hint">出品の多い魚種</p>${tbl(S.top_species,"件数")}</div>
+      <div><p class="hint">提供された釣果の多い魚種</p>${tbl(S.shared_species,"記録")}</div>
+    </div>
+    <div id="usageBox"><div class="sec-h">サーバーの使用量</div><p class="hint">読み込み中…</p></div>`;
+}
+/* サーバーの使用量（データベースと写真の保存場所）。通信量は Supabase の画面（Usage）で見る */
+const MBf = n => n>=1073741824 ? `${(n/1073741824).toFixed(2)}GB` : `${(n/1048576).toFixed(1)}MB`;
+async function usageLoad(){
+  const box=$("usageBox"); if(!box) return;
+  const {data:U,error}=await SH.sb.rpc("admin_usage");
+  if(error||!U){ box.innerHTML=`<div class="sec-h">サーバーの使用量</div><p class="status err">${esc(error?shErr(error):"読み込めませんでした")}（schema.sql を最新のものにして実行し直してください）</p>`; return; }
+  const fb=(U.buckets||[]).reduce((a,b)=>a+(+b.bytes||0),0), db=+U.db_bytes||0;
+  const bar=(v,max,l)=>`<div class="ubar"><span>${l}</span><i><u style="width:${Math.min(100,v/max*100).toFixed(1)}%"></u></i><b>${MBf(v)} ／ ${MBf(max)}（${(v/max*100).toFixed(1)}%）</b></div>`;
+  const BN={posts:"新着・投稿の写真",photos:"出品の写真",cloud:"写真の同期",avatars:"アイコン",licenses:"お店の許可証"};
+  box.innerHTML=`<div class="sec-h">サーバーの使用量</div>
+    <p class="hint">無料プランの上限との比較です（Pro は データベース8GB・写真100GB まで）。</p>
+    ${bar(db,500*1048576,"データベース")}${bar(fb,1024*1048576,"写真などのファイル")}
+    <div class="grid" style="margin-top:8px">
+      <div><p class="hint">ファイルの内訳</p><table class="mini"><tr><th>保存場所</th><th>数</th><th>容量</th></tr>${(U.buckets||[]).map(b=>`<tr><td>${esc(BN[b.name]||b.name)}</td><td class="n">${b.files}</td><td class="n">${MBf(+b.bytes||0)}</td></tr>`).join("")||`<tr><td colspan="3">まだありません</td></tr>`}</table></div>
+      <div><p class="hint">データベースの大きい表</p><table class="mini"><tr><th>表</th><th>容量</th></tr>${(U.tables||[]).map(t=>`<tr><td>${esc(t.name)}</td><td class="n">${MBf(+t.bytes||0)}</td></tr>`).join("")}</table></div>
+    </div>
+    <p class="hint">データベースには、空のときから仕組みの分（数十MB）が含まれます。通信量（写真の表示など）は、Supabase の画面の「Usage」で見られます。</p>`;
+}
+function sharedHtml(){
+  const rows=SH.shared||[];
+  if(!rows.length) return `<p class="hint">まだ届いていません。はじめの確認事項に同意した会員の端末から、登録した釣果が届きます（ログイン中の利用者から届きます）。</p>`;
+  const names=[...new Set(rows.map(r=>r.nickname))];
+  return `<div class="toolbar"><select id="scWho" style="flex:1"><option value="">全員（${rows.length}件）</option>${names.map(n=>`<option>${esc(n)}</option>`).join("")}</select>
+      <button type="button" class="btn sm" data-a="scmap">地図に表示</button><button type="button" class="btn sm" data-a="sccsv">CSV出力</button></div>
+    <div id="scList">${sharedRows("")}</div>`;
+}
+function sharedRows(who){
+  const rows=(SH.shared||[]).filter(r=>!who||r.nickname===who);
+  return rows.slice(0,40).map(r=>{ const d=r.data||{};
+    return `<div class="card deal"><div><div class="t"><span class="sp">${esc(r.species)}</span><span>${r.count??1}匹${d.length?` ・${d.length}cm`:""}</span><span class="st">${esc(r.nickname)}</span></div>
+      <div class="facts"><span>${fmtJ(r.caught_at)}</span>${d.spot?`<span>${esc(d.spot)}</span>`:""}${d.method?`<span>${esc(d.method)}</span>`:""}${d.shime?`<span>${esc(shimeLine(d))}</span>`:""}${d.depth!=null?`<span>水深${d.depth}m</span>`:""}</div></div></div>`; }).join("")
+    + (rows.length>40?`<p class="hint">ほか${rows.length-40}件（すべては地図とCSVで確認できます）</p>`:"");
+}
+function drawSharedMap(who){
+  shareLayer.clearLayers();
+  const rows=(SH.shared||[]).filter(r=>!who||r.nickname===who); if(!rows.length) return;
+  for(const r of rows){ const d=r.data||{};
+    L.circleMarker([r.lat,r.lon],{radius:6,color:"#fff",weight:1.5,fillColor:spColor(r.species),fillOpacity:.9})
+      .bindPopup(`<div class="pop"><h4>${esc(r.species)} ${r.count??1}匹</h4><div class="coord mono">${fmtPos(r.lat,r.lon)}</div>
+        <table><tr><td>利用者</td><td>${esc(r.nickname)}</td></tr><tr><td>日時</td><td>${fmtJ(r.caught_at)}</td></tr>
+        ${d.method?`<tr><td>釣法</td><td>${esc(d.method)}</td></tr>`:""}${d.shime?`<tr><td>締め</td><td>${esc(shimeLine(d))}</td></tr>`:""}${d.memo?`<tr><td>メモ</td><td>${esc(d.memo)}</td></tr>`:""}</table></div>`,{maxWidth:260})
+      .addTo(shareLayer);
+  }
+  shareLayer.addTo(map);
+  map.fitBounds(L.latLngBounds(rows.map(r=>[r.lat,r.lon])).pad(0.2),{maxZoom:13});
+  if(matchMedia("(max-width:820px)").matches) $("map").scrollIntoView({block:"start"});
+}
+async function sharedCsv(who){
+  let q=SH.sb.from("shared_catch_cards").select("*").order("caught_at").limit(10000);
+  if(who) q=q.eq("nickname",who);
+  const {data,error}=await q; if(error){ shMsg("admStat",shErr(error),"err"); return; }
+  const keys=[["length","全長cm"],["weight","重量g"],["method","釣法"],["bait","エサ・ルアー"],["tana","棚m"],["tanaRef","棚基準"],["depth","水深m"],["spot","ポイント"],
+    ["shime","締め"],["treat","処理"],["shimeAt","締め時刻"],["cooling","保冷"],["weather","天気"],["temp","気温℃"],["windDir","風向"],["wind","風速m/s"],["wave","波高m"],["sst","水温℃"],["tideName","潮名"],["tideMove","潮の動き"],["memo","メモ"]];
+  const q2=v=>{v=v??"";v=String(v);return /[",\n]/.test(v)?`"${v.replace(/"/g,'""')}"`:v;};
+  const head=["利用者","日時","魚種","匹数","緯度","経度",...keys.map(k=>k[1])];
+  const lines=[head.join(",")].concat(data.map(r=>{ const d=new Date(r.caught_at), dd=r.data||{};
+    return [r.nickname,`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`,r.species,r.count,r.lat,r.lon,...keys.map(([k])=>k==="treat"&&dd[k]?String(dd[k]).replace(/,/g,"・"):dd[k])].map(q2).join(","); }));
+  download(`提供された釣果_${stamp()}.csv`,"\ufeff"+lines.join("\r\n"),"text/csv");
+}
+$("adminBox").addEventListener("change",e=>{ if(e.target.id==="scWho") $("scList").innerHTML=sharedRows(e.target.value); });
+$("adminBox").addEventListener("change",async e=>{
+  if(e.target.id!=="admReqCard") return;
+  const on=e.target.checked;
+  const {error}=await SH.sb.from("app_settings").update({v:on?"on":"off",updated_at:new Date().toISOString()}).eq("k","require_card");
+  if(error){ e.target.checked=!on; return shMsg("admStat",shErr(error),"err"); }
+  SH.requireCard=on; await loadSettings(); identUi(); shMsg("admStat",on?"おすそわけに、カードの登録を求めるようにしました":"おすそわけに、カードの登録を求めないようにしました","ok");
+});
+$("adminBox").addEventListener("input",e=>{ if(e.target.id==="usrQ") $("usrList").innerHTML=usersHtml(e.target.value.trim()); });
+function usersHtml(q){
+  const rows=(SH.users||[]).filter(u=>!q||(u.nickname+" "+(u.email||"")).includes(q));
+  return rows.slice(0,50).map(u=>{
+    const mem=u.role==="admin"||(u.member_until&&u.member_until>=todayStr());
+    return `<div class="card deal" data-uid="${u.id}"><div>
+      <div class="t"><span class="sp">${esc(u.nickname)}</span><span class="st ${mem?"good":""}">${u.role==="admin"?"管理者":mem?`会員（${u.member_until.replace(/-/g,"/")}まで）`:u.member_until?"会員の期限切れ":"無料"}</span>${u.banned?'<span class="st hot">停止中</span>':""}</div>
+      <div class="facts"><span>${esc(u.email||"")}</span><span>登録 ${fmtJ(u.created_at)}</span>${u.last_sign_in_at?`<span>最終ログイン ${fmtJ(u.last_sign_in_at)}</span>`:""}<span>投稿${u.posts}・出品${u.listings}</span><span>カード ${u.card_ok?"登録済み":"なし"}</span></div>
+      ${u.role==="admin"?"":`<div class="ops"><button type="button" class="btn sm primary" data-a="m1y">${mem?"会員を1年延ばす":"1年間の会員にする"}</button>${u.member_until?`<button type="button" class="btn sm" data-a="m0">会員を外す</button>`:""}${u.banned?`<button type="button" class="btn sm" data-a="unban">停止を解除</button>`:`<button type="button" class="btn sm danger" data-a="ban">利用を停止</button>`}</div>`}</div></div>`; }).join("")
+    + (rows.length>50?`<p class="hint">ほか${rows.length-50}人（絞り込んでください）</p>`:"") || `<div class="empty">該当する利用者はいません。</div>`;
+}
+$("adminBox").addEventListener("click",async e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  const who=$("scWho")?.value||"";
+  if(b.dataset.a==="scmap"){ drawSharedMap(who); return; }
+  if(b.dataset.a==="sccsv"){ sharedCsv(who); return; }
+  if(b.dataset.a==="athread"){ shThread(b.closest("[data-adeal]").dataset.adeal); return; }
+  const prep=b.closest("[data-prep]");
+  if(prep){
+    const a=b.dataset.a;
+    if(a==="pview"){ postDetail(prep.dataset.pid); return; }
+    if((a==="pdel"||a==="pcdel") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと消す"; return; }
+    const {error}= a==="pdel" ? await SH.sb.from("posts").update({status:"removed"}).eq("id",prep.dataset.pid)
+                 : a==="pcdel" ? await SH.sb.from("post_comments").delete().eq("id",+prep.dataset.cid)
+                 : await SH.sb.from("post_reports").update({status:"closed"}).eq("id",+prep.dataset.prep);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    if(a!=="pclose") await SH.sb.from("post_reports").update({status:"closed"}).eq("id",+prep.dataset.prep);
+    shAdmin(); return;
+  }
+  const usr=b.closest("[data-uid]");
+  if(usr){
+    const a=b.dataset.a, d=new Date(Date.now()+365*86400000);
+    const patch = a==="m1y" ? {member_until:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`}
+                : a==="m0" ? {member_until:null} : a==="ban" ? {banned:true} : a==="unban" ? {banned:false} : null;
+    if(!patch) return;
+    if((a==="m0"||a==="ban") && !b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと確定"; return; }
+    const {error}=await SH.sb.from("profiles").update(patch).eq("id",usr.dataset.uid);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    if(a==="ban"){                                     // 利用を停止した人の会員の支払いも止める（それ以上請求しない）
+      try{ await billFn("admin_cancel",{user_id:usr.dataset.uid}); }
+      catch(err){ shAdmin(); return shMsg("admStat","利用は停止しましたが、支払いを止められませんでした（"+err.message+"）。Stripe の画面で購読をキャンセルしてください","err"); }
+    }
+    shAdmin(); return;
+  }
+  if(b.dataset.a==="rdel"){
+    if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent="もう一度押すと消す"; return; }
+    const {error}=await SH.sb.from("ratings").delete().eq("id",b.closest("[data-rating]").dataset.rating);
+    if(error) return shMsg("admStat",shErr(error),"err");
+    shAdmin(); return;
+  }
+  const st=m=>shMsg("admStat",m.text,m.cls);
+  if(b.id==="blkAdd"){
+    const term=$("blkTerm").value.trim(), reason=$("blkReason").value.trim()||"管理者が追加";
+    if(!term) return;
+    const {error}=await SH.sb.from("blocked_terms").insert({term,reason});
+    if(error) return st({text:shErr(error),cls:"err"});
+    await loadBlocked(); shAdmin(); return;
+  }
+  if(b.dataset.term){
+    if(!b.dataset.armed){ b.dataset.armed="1"; b.textContent=`${b.dataset.term} を外す？`; return; }
+    const {error}=await SH.sb.from("blocked_terms").delete().eq("term",b.dataset.term);
+    if(error) return st({text:shErr(error),cls:"err"});
+    await loadBlocked(); shAdmin(); return;
+  }
+  const a=b.dataset.a; if(!a) return;
+  const shopEl=b.closest("[data-shop]"), repEl=b.closest("[data-rep]");
+  if(shopEl){
+    const id=shopEl.dataset.shop;
+    let patch={approve:{status:"approved",admin_note:null},suspend:{status:"suspended"},reject:{status:"rejected"}}[a];
+    if(a==="reject"){ const note=prompt("差し戻す理由（申請者に表示されます）",""); if(note===null) return; patch.admin_note=note.slice(0,400); }
+    const {error}=await SH.sb.from("shops").update(patch).eq("id",id);
+    if(error) return st({text:shErr(error),cls:"err"});
+    shAdmin(); return;
+  }
+  if(repEl){
+    if(a==="view"){ shDetail(repEl.dataset.lid); return; }
+    if(a==="close"){
+      const {error}=await SH.sb.from("reports").update({status:"closed"}).eq("id",repEl.dataset.rep);
+      if(error) return st({text:shErr(error),cls:"err"});
+      shAdmin();
+    }
+  }
+});
+
+/* ========== 起動 ========== */
+const SAMPLES = [
+  {id:"sample1",sample:true,lat:36.7672,lon:137.3203,datetime:"2026-10-18T06:20",spot:"水橋沖",species:"フクラギ",count:4,length:42,weight:900,method:"ジギング",bait:"メタルジグ 120g",tana:15,tanaRef:"底から",depth:48,echo:"中層に群れ",shime:"脳締め",treat:"血抜き",cooling:"潮氷",weather:"晴れ",temp:14.2,press:1019.5,windDir:"南西",wind:2.8,sst:21.4,wave:0.4,wavePer:4.1,waveDir:"北北東",tideName:"中潮",moon:6.5,tideMove:"上げ",memo:"朝マヅメ1時間で集中。鳥山あり。",photos:[]},
+  {id:"sample2",sample:true,lat:36.7935,lon:137.3612,datetime:"2026-10-11T15:40",spot:"滑川沖 藻場際",species:"アオリイカ",count:2,length:22,weight:550,method:"エギング（ティップラン）",bait:"エギ3.5号 オレンジ",tana:2,tanaRef:"底から",depth:22,bottom:"岩礁",weather:"曇り",temp:17.8,press:1013.1,windDir:"北東",wind:4.5,sst:22.1,wave:0.7,wavePer:5.0,waveDir:"北東",tideName:"大潮",moon:29.4,tideMove:"下げ",photos:[]},
+  {id:"sample3",sample:true,lat:36.7780,lon:137.2467,datetime:"2026-10-04T09:05",spot:"岩瀬沖 魚礁",species:"キジハタ（アコウ）",count:1,length:34,weight:620,method:"タイラバ",bait:"80g オレンジ",tana:1,tanaRef:"底から",depth:35,bottom:"魚礁",shime:"脳締め",treat:"血抜き,神経締め",cooling:"氷",weather:"快晴",temp:20.5,press:1016.0,windDir:"南",wind:1.6,sst:23.0,wave:0.3,wavePer:3.8,waveDir:"北",tideName:"小潮",moon:22.1,tideMove:"満潮前後",photos:[]},
+];
+
+(async()=>{
+  const fromMail = /access_token|type=magiclink|code=/.test(location.hash+location.search);   // メールのリンクから戻ってきた
+  try{ await DB.open(); }catch{ memStore=new Map(); alertStatus("このブラウザでは保存領域が使えないため、閉じると記録が消えます。"); }
+  records = await loadAll();
+  await initTracks();
+  let seeded=false; try{ seeded=localStorage.getItem("choka-seeded")==="1"; }catch{}
+  // サンプル（例）の釣果は入れない。前の版で入れたサンプルも消す
+  if(records.some(r=>r.sample)){ for(const r of records.filter(r=>r.sample)) await delRec(r.id,true); records=records.filter(r=>!r.sample); }
+  try{localStorage.setItem("choka-seeded","1")}catch{}
+  render();
+  if(records.length) map.fitBounds(L.latLngBounds(records.map(r=>[r.lat,r.lon])).pad(0.4),{maxZoom:12});
+  hereStart();
+  setMapMode(mapMode);
+  if(SB_URL && SB_KEY){ await shStart(); if(fromMail) showTab("share"); newPoll(); }
+  updateAccountBtn();   // ログイン済みならやり取りの新着を数える
+})();
+
+
+/* ヘッダーに「管理」「会員登録」「ログアウト」ボタンを追加（本体コードは変更しない） */
+(function () {
+  function run() {
+    var ref = document.getElementById("btnRefresh");
+    var acc = document.getElementById("btnAccount");
+    if (!ref || !acc || document.getElementById("btnJoinHdr")) return;
+
+    var loggedIn = function () {
+      try { return typeof hasProfile === "function" && hasProfile(); } catch (e) { return false; }
+    };
+
+    // 会員登録（全ユーザー表示）：会員・お支払い・紹介のダイアログを開く
+    var join = document.createElement("button");
+    join.id = "btnJoinHdr"; join.type = "button"; join.className = "btn";
+    join.title = "会員登録・お支払い・紹介"; join.textContent = "会員登録";
+    join.addEventListener("click", function () {
+      try { if (typeof billingDlg === "function") billingDlg(); else showTab("share"); } catch (e) {}
+    });
+
+    // 管理（管理者のみ表示・一番左）：おすそわけの「管理」画面へ
+    var adm = document.createElement("button");
+    adm.id = "btnAdminHdr"; adm.type = "button"; adm.className = "btn";
+    adm.title = "管理"; adm.textContent = "管理"; adm.hidden = true;
+    adm.addEventListener("click", function () {
+      try {
+        if (typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin") SH.sub = "admin";
+        showTab("share");
+      } catch (e) {}
+    });
+
+    // ログアウト（ログイン中のみ表示・アカウントボタンの隣）
+    var out = document.createElement("button");
+    out.id = "btnLogoutHdr"; out.type = "button"; out.className = "btn"; out.hidden = true;
+    out.title = "ログアウト"; out.textContent = "ログアウト";
+    out.addEventListener("click", function () {
+      try {
+        if (typeof SH !== "undefined" && SH && SH.sb) {
+          SH.sb.auth.signOut().then(function () {
+            try { SH.cache && SH.cache.clear(); SH.deals && SH.deals.clear(); } catch (e) {}
+            try { lsSet("choka-profile", null); } catch (e) {}
+            try { shRefreshMe(); } catch (e) {}
+          });
+        }
+      } catch (e) {}
+    });
+
+    // 並び順： [管理][会員登録] 更新 アカウント [ログアウト] 昼／夜
+    ref.parentNode.insertBefore(join, ref);
+    ref.parentNode.insertBefore(adm, join);
+    acc.parentNode.insertBefore(out, acc.nextSibling);
+
+    // 表示の切替（ログイン状態に合わせて）
+    setInterval(function () {
+      try {
+        var isAdmin = (typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin");
+        adm.hidden = !isAdmin;
+        out.hidden = !loggedIn();
+      } catch (e) {}
+    }, 1000);
+  }
+  if (document.readyState !== "loading") run();
+  else document.addEventListener("DOMContentLoaded", run);
+})();
