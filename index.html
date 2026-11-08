@@ -320,17 +320,20 @@
 
       <div id="shProfile" hidden>
         <p class="hint">はじめて使うときだけ、表示名の登録と確認事項への同意をお願いします。</p>
-        <label>表示名（ニックネーム・20文字まで。ほかの利用者に見えます）<input id="shNick" maxlength="20"></label>
+        <label id="shNickL">表示名（ニックネーム・20文字まで。ほかの利用者に見えます）<input id="shNick" maxlength="20"></label>
         <label style="margin-top:8px">住んでいる県（任意。「みんな」の新着で、この県の釣果を先に並べます。ほかの人には見えません）<select id="shPref"></select></label>
-        <div class="checks">
+        <p class="sub-h" style="margin-top:14px">確認事項（すべてにチェックが必要です）</p>
+        <label class="check-all"><input type="checkbox" id="shAll">すべてに同意する</label>
+        <div class="checks" id="shChecks">
           <label><input type="checkbox">出品するのは自分で釣った魚だけで、禁止されている種類・大きさ・数量・禁漁期間などの決まりを守ります</label>
           <label><input type="checkbox">おすそわけでは、お金や物を受け取りません</label>
           <label><input type="checkbox">受け取った魚の保存・調理・食べるときの安全（寄生虫・毒など）は、受け取った人が確認します</label>
           <label><input type="checkbox">決まりに反した出品は管理者が削除し、利用を停止することがあります</label>
           <label><input type="checkbox">出品の内容・申し込み・やり取りのメッセージは、トラブル対応とアプリの改善のため管理者が見ることがあります</label>
           <label><input type="checkbox">記録した釣果（位置・日時・魚種・数・大きさ・釣法・気象・メモなど。写真は除く）は、釣果の分析とアプリの改善のため運営者に送られます（ほかの利用者には公開しません）</label>
-          <label><input type="checkbox"><span><a href="#" data-doc="terms">利用規約</a>と<a href="#" data-doc="privacy">プライバシーポリシー</a>に同意します</span></label>
+          <label><input type="checkbox">利用規約とプライバシーポリシーに同意します</label>
         </div>
+        <p class="hint">読む：<a href="#" data-doc="terms">利用規約</a>　<a href="#" data-doc="privacy">プライバシーポリシー</a></p>
         <button type="button" class="btn primary" id="btnProfile">同意して始める</button>
         <div class="status" id="profMsg"></div>
         <div class="shfoot"><span></span><button type="button" class="btn sm" data-logout>ログアウト</button></div>

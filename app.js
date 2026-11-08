@@ -1813,7 +1813,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.08.3";
+const APP_VER="2026.11.08.4";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){
@@ -1907,10 +1907,24 @@ $("btnCode").onclick=async()=>{
   await shRefreshMe();
 };
 $("shPref").innerHTML=prefOptions("選ばない");
+/* 同意画面：「すべてに同意する」と、足りない所を赤く囲んでそこまで画面を送る */
+const profChecks = () => [...document.querySelectorAll("#shChecks input")];
+$("shAll").addEventListener("change",e=>{ profChecks().forEach(c=>{ c.checked=e.target.checked; c.closest("label").classList.remove("need"); }); });
+$("shChecks").addEventListener("change",e=>{
+  if(e.target.checked) e.target.closest("label").classList.remove("need");
+  $("shAll").checked = profChecks().every(c=>c.checked);
+});
+$("shNick").addEventListener("input",()=>{ if($("shNick").value.trim()) $("shNickL").classList.remove("need"); });
+function profNeed(el,msg){
+  el.classList.add("need"); shMsg("profMsg",msg,"err");
+  el.scrollIntoView({block:"center",behavior:"smooth"});
+}
 $("btnProfile").onclick=async()=>{
   const nick=$("shNick").value.trim();
-  if(!nick){ shMsg("profMsg","表示名を入れてください","err"); return; }
-  if([...document.querySelectorAll("#shProfile .checks input")].some(c=>!c.checked)){ shMsg("profMsg","必須の項目すべてに同意すると使えます","err"); return; }
+  if(!nick){ profNeed($("shNickL"),"いちばん上の「表示名」を入れてください"); setTimeout(()=>$("shNick").focus({preventScroll:true}),400); return; }
+  const miss=profChecks().filter(c=>!c.checked);
+  miss.forEach(c=>c.closest("label").classList.add("need"));
+  if(miss.length){ profNeed(miss[0].closest("label"),`チェックが入っていない項目が${miss.length}つあります（赤い枠）。「すべてに同意する」でまとめて入れられます`); return; }
   const {error}=await SH.sb.from("profiles").insert({id:SH.user.id,nickname:nick,home_pref:$("shPref").value||null});
   if(error){ shMsg("profMsg",shErr(error),"err"); return; }
   await shRefreshMe();
