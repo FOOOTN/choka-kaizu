@@ -4949,11 +4949,16 @@ const SAMPLES = [
     var ref = document.getElementById("btnRefresh");
     if (!ref || document.getElementById("btnJoinHdr")) return;
 
-    // 会員登録（全ユーザー表示）：おすそわけ画面＝ログイン／会員登録メニューへ
+    // 会員登録（全ユーザー表示）：会員・お支払い・紹介のダイアログを開く
     var join = document.createElement("button");
     join.id = "btnJoinHdr"; join.type = "button"; join.className = "btn";
-    join.title = "会員登録・ログイン"; join.textContent = "会員登録";
-    join.addEventListener("click", function () { try { showTab("share"); } catch (e) {} });
+    join.title = "会員登録・お支払い・紹介"; join.textContent = "会員登録";
+    join.addEventListener("click", function () {
+      try {
+        if (typeof billingDlg === "function") billingDlg();
+        else showTab("share");
+      } catch (e) {}
+    });
 
     // 管理（管理者のみ表示・一番左）：おすそわけの「管理」画面へ
     var adm = document.createElement("button");
