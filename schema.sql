@@ -2114,3 +2114,41 @@ end $$;
 -- 9. 変更をすぐ画面から使えるように、Supabase に読み込み直してもらう
 -- ---------------------------------------------------------------------
 notify pgrst, 'reload schema';
+
+
+-- =========================================================
+-- 2026-11-08 セキュリティ硬化（schema.sql 本体より後に必ず実行されるよう末尾に置く）
+-- =========================================================
+-- 1. 利用者一覧を関数に移し、user_cards は auth.users を直接出さない INVOKER ビューにする
+create or replace function public.admin_users()
+returns table(id uuid, nickname text, role text, banned boolean, member_until date,
+              created_at timestamptz, email varchar, last_sign_in_at timestamptz,
+              card_ok boolean, posts bigint, listings bigint)
+language sql stable security definer set search_path = public as $$
+  select p.id, p.nickname, p.role, p.banned, p.member_until, p.created_at,
+         u.email, u.last_sign_in_at,
+         exists(select 1 from billing b where b.user_id = p.id and b.card_fp is not null),
+         (select count(*) from posts x where x.owner = p.id),
+         (select count(*) from listings x where x.owner = p.id)
+    from public.profiles p join auth.users u on u.id = p.id
+   where public.is_admin()
+$$;
+revoke execute on function public.admin_users() from public, anon;
+grant  execute on function public.admin_users() to authenticated;
+
+drop view if exists public.user_cards;
+create view public.user_cards with (security_invoker = true) as
+  select id, nickname, role, banned, member_until, created_at,
+         email::varchar(255) as email, last_sign_in_at, card_ok, posts, listings
+  from public.admin_users();
+revoke all on public.user_cards from anon;
+grant  select on public.user_cards to authenticated;
+
+-- 2. 内部専用の述語関数の RPC 公開を閉じる（RLS で使う is_admin 等は残す）
+revoke execute on function public.my_shop()            from public, anon, authenticated;
+revoke execute on function public.new_account()        from public, anon, authenticated;
+revoke execute on function public.ident_ok()           from public, anon, authenticated;
+revoke execute on function public.rating_of(uuid)      from public, anon, authenticated;
+revoke execute on function public.blocked_reason(text) from public, anon, authenticated;
+
+notify pgrst, 'reload schema';
