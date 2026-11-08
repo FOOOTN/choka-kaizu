@@ -4942,3 +4942,44 @@ const SAMPLES = [
 </script>
 </body>
 </html>
+
+<script>
+/* ヘッダーに「管理」「会員登録」ボタンを追加（管理は管理者ログイン時のみ表示） */
+(function () {
+  function run() {
+    var ref = document.getElementById("btnRefresh");
+    if (!ref || document.getElementById("btnJoinHdr")) return;
+
+    // 会員登録（全ユーザー表示）：おすそわけ画面＝ログイン／会員登録メニューへ
+    var join = document.createElement("button");
+    join.id = "btnJoinHdr"; join.type = "button"; join.className = "btn";
+    join.title = "会員登録・ログイン"; join.textContent = "会員登録";
+    join.addEventListener("click", function () { try { showTab("share"); } catch (e) {} });
+
+    // 管理（管理者のみ表示・一番左）：おすそわけの「管理」画面へ
+    var adm = document.createElement("button");
+    adm.id = "btnAdminHdr"; adm.type = "button"; adm.className = "btn";
+    adm.title = "管理"; adm.textContent = "管理"; adm.hidden = true;
+    adm.addEventListener("click", function () {
+      try {
+        if (typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin") SH.sub = "admin";
+        showTab("share");
+      } catch (e) {}
+    });
+
+    // 並び順： [管理][会員登録] 更新 アカウント 昼／夜
+    ref.parentNode.insertBefore(join, ref);
+    ref.parentNode.insertBefore(adm, join);
+
+    // 管理ボタンの表示はログイン状態に合わせて切替
+    setInterval(function () {
+      try { adm.hidden = !(typeof SH !== "undefined" && SH && SH.profile && SH.profile.role === "admin"); } catch (e) {}
+    }, 1000);
+  }
+  if (document.readyState !== "loading") run();
+  else document.addEventListener("DOMContentLoaded", run);
+})();
+</script>
+
+
+
