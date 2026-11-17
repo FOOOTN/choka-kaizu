@@ -195,6 +195,7 @@ function hereStart(){
     $("hereBox").title = c.accuracy>=1000 ? "GPSがない機器（PCなど）では、Wi-Fiや回線から推定するため数kmずれます。スマホでは数m〜数十mになります。" : "現在地（押すとこの場所へ移動）";
     if(!hereMarker) hereMarker=L.circleMarker([c.latitude,c.longitude],{radius:6,color:"#fff",weight:2,fillColor:"#1a73e8",fillOpacity:1,interactive:false}).addTo(map);
     else hereMarker.setLatLng([c.latitude,c.longitude]);
+    if(typeof ptOnFix==="function") ptOnFix(c);           // 仲間への位置の共有・SOS（party.js）
   },e=>{ $("hereBox").textContent = e.code===1 ? "現在地：位置情報が許可されていません" : "現在地：取得できません"; },
   {enableHighAccuracy:true,maximumAge:10000,timeout:30000});
 }
@@ -373,6 +374,7 @@ let popClosedAt=0;
 map.on("popupclose",()=>{ popClosedAt=Date.now(); });
 
 map.on("click",e=>{
+  if(typeof ptMapClick==="function" && ptMapClick(e)) return;   // 仲間のポイントを置く（party.js）
   if(SH.pick){ setPickup(e.latlng.lat,e.latlng.lng); shPickEnd(true); return; }
   if(MV.r){ MV.pin.setLatLng(e.latlng); moveInfo(); return; }
   if(!$("viewForm").hidden){ setDraft(e.latlng.lat,e.latlng.lng,false); return; }
@@ -793,7 +795,7 @@ function render(){
 
 /* ========== タブとフォーム ========== */
 function showTab(which){
-  const views={list:"viewList",form:"viewForm",track:"viewTrack",share:"viewShare",feed:"viewFeed"}, tabs={list:"tabList",form:"tabForm",track:"tabTrack",share:"tabShare",feed:"tabFeed"};
+  const views={list:"viewList",form:"viewForm",track:"viewTrack",share:"viewShare",feed:"viewFeed",party:"viewParty"}, tabs={list:"tabList",form:"tabForm",track:"tabTrack",share:"tabShare",feed:"tabFeed",party:"tabParty"};
   for(const k in views){ $(views[k]).hidden = k!==which; $(tabs[k]).setAttribute("aria-selected", String(k===which)); }
   const form = which==="form";
   shPickEnd(); moveEnd();
@@ -806,6 +808,8 @@ function showTab(which){
   else { map.removeLayer(shareLayer); clearPickup(); }
   if(which==="feed"||which==="share") map.closePopup();
   if(which==="feed"){ postLayer.addTo(map); feedOpen(); } else map.removeLayer(postLayer);
+  if(which==="party" && typeof ptOpen==="function") ptOpen();
+  if(which!=="party" && typeof ptPickEnd==="function") ptPickEnd();
   if(isPhone()){                                      // 下の方を見ていたら、タブのすぐ下から表示する
     const top=$("panel").getBoundingClientRect().top+scrollY;
     if(scrollY>top) scrollTo({top});
@@ -832,6 +836,7 @@ $("tabForm").onclick=()=>openForm(null);
 $("tabTrack").onclick=()=>showTab("track");
 $("tabShare").onclick=()=>showTab("share");
 $("tabFeed").onclick=()=>showTab("feed");
+$("tabParty").onclick=()=>showTab("party");
 $("btnNew").onclick=()=>openForm(null);
 $("btnCancel").onclick=()=>showTab("list");
 
@@ -1813,7 +1818,7 @@ document.addEventListener("click",e=>{                  // 説明の枠（🔒�
   const l=e.target.closest(".lockbox[data-lock]"); if(l && !e.target.closest("#nwList")) memberGate(l.dataset.lock);
 });
 /* アプリの版。サーバーの min_app_ver より古ければ「読み込み直してください」を出す */
-const APP_VER="2026.11.08.4";
+const APP_VER="2026.11.17.1";
 const verOlder=(a,b)=>{ const x=String(a).split(".").map(Number), y=String(b).split(".").map(Number); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
 /* 公開されている index.html の版も調べる（サーバーの設定を変えない更新でも、新しい版に気づけるように） */
 async function publishedVer(){

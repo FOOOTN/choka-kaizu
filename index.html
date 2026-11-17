@@ -39,6 +39,7 @@
       <button role="tab" id="tabTrack" aria-selected="false">航跡</button>
       <button role="tab" id="tabShare" aria-selected="false">おすそわけ<span class="badge" id="shareBadge" hidden></span></button>
       <button role="tab" id="tabFeed" aria-selected="false">みんな<span class="badge" id="feedBadge" hidden></span></button>
+      <button role="tab" id="tabParty" aria-selected="false">仲間・SOS<span class="badge" id="partyBadge" hidden></span></button>
     </div>
 
     <!-- 一覧 -->
@@ -299,6 +300,9 @@
       </div>
     </div>
 
+    <!-- 仲間（パーティ）・SOS（party.js が中身を作る） -->
+    <div class="view" id="viewParty" hidden><div id="ptBox"></div></div>
+
     <!-- おすそわけ・お店 -->
     <div class="view" id="viewShare" hidden>
       <div id="shNoConf" hidden>
@@ -467,6 +471,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="app.js"></script>
+<script src="party.js"></script>
 
 
 

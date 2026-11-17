@@ -402,3 +402,61 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
 #posMoved{color:var(--magenta)}
 #btnPosMap{margin-left:auto}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* ---------- 仲間（パーティ）・SOS ---------- */
+.sos-btn{position:absolute;z-index:750;right:10px;top:116px;width:58px;height:58px;border-radius:50%;border:3px solid #fff;background:#d50000;color:#fff;font:900 17px/1 var(--f-body);letter-spacing:.04em;cursor:pointer;box-shadow:0 3px 10px rgba(0,0,0,.35)}
+.sos-btn:active{transform:scale(.96)}
+.sos-btn.on{animation:sosPulse 1.2s infinite}
+@keyframes sosPulse{0%{box-shadow:0 0 0 0 rgba(213,0,0,.7)}70%{box-shadow:0 0 0 16px rgba(213,0,0,0)}100%{box-shadow:0 0 0 0 rgba(213,0,0,0)}}
+@media (max-width:820px){ .sos-btn{width:52px;height:52px;font-size:16px} }
+.sos-bar{position:absolute;z-index:790;left:8px;right:8px;max-width:520px;margin:0 auto;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:7px 10px;border-radius:6px;font-size:13px;box-shadow:0 3px 12px rgba(0,0,0,.3)}
+.sos-bar span{flex:1;min-width:0}
+.sos-bar.in{top:44px;background:#d50000;color:#fff;animation:sosBlink 1s 6}
+.sos-bar.in .btn{background:#fff;color:#d50000;border-color:#fff;font-weight:700}
+.sos-bar.mine{top:44px;background:#fff3e0;color:#7a2b00;border:2px solid #d50000}
+#sosMine:not([hidden]) ~ #sosIn{top:96px}
+@keyframes sosBlink{50%{filter:brightness(1.35)}}
+@media (max-width:700px){ .sos-bar.in,.sos-bar.mine{top:62px} #sosMine:not([hidden]) ~ #sosIn{top:112px} }
+.sos-warn{background:#fff3e0;color:#5c2400;border-left:4px solid #d50000;border-radius:3px;padding:8px 10px;font-size:13px;line-height:1.6;margin:0 0 10px}
+.sos-call{display:flex;justify-content:center;align-items:center;min-height:48px;margin:0 0 6px;background:#d50000;border-color:#d50000;color:#fff;font-size:16px;font-weight:700;text-decoration:none}
+.sos-call:hover{background:#b00000}
+.sos-pos{font-size:20px;line-height:1.35;font-weight:500}
+.sos-go{font-size:16px;font-weight:700;padding-left:22px;padding-right:22px}
+.sos-head{display:flex;gap:10px;align-items:center}
+.sos-r{color:#d50000;font-size:16px}
+.sos-msg{background:var(--paper);border:1px solid var(--rule);border-radius:3px;padding:6px 8px;margin:8px 0 0;white-space:pre-wrap}
+.sos-rep{margin:0;padding-left:18px;font-size:13px}
+.pt-tag{display:inline-block;font-size:10px;border:1px solid var(--ink-2);color:var(--ink-2);border-radius:8px;padding:0 6px;margin-left:6px;vertical-align:1px}
+.badge.sos{background:#d50000}
+.pt-sw{flex-direction:row;align-items:flex-start;gap:10px;font-size:13px;color:var(--ink);margin:8px 0}
+.pt-sw input{width:22px;height:22px;flex:none;margin:1px 0 0}
+.pt-sw small{display:block;color:var(--ink-2);font-size:12px;line-height:1.5;margin-top:2px}
+.pt-form{display:flex;gap:8px;align-items:flex-end;margin:8px 0}
+.pt-form label{flex:1}
+.pt-form .btn{min-height:36px}
+.pt-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;font-size:15px;margin:4px 0}
+.pt-code{font-size:16px;letter-spacing:.12em;color:var(--ink)}
+.pt-list{display:flex;flex-direction:column;border-top:1px solid var(--rule);margin:6px 0}
+.pt-row{display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid var(--rule);font:inherit;font-size:13px;color:var(--ink);background:none;border-left:0;border-right:0;border-top:0;text-align:left;width:100%}
+button.pt-row{cursor:pointer}
+.pt-row > span:not(.av):not(.av-w):not(.pt-flag){flex:1;min-width:0}
+.pt-row small{display:block;color:var(--ink-2);font-size:11px}
+.pt-row.sos{background:#ffebee}
+.pt-row.sos b{color:#d50000}
+.pt-c{width:6px;align-self:stretch;border-radius:3px;background:var(--c)}
+.pt-flag{font-size:18px;color:#0f7f73;width:28px;text-align:center}
+/* 地図の上の仲間・ポイント・SOS */
+.pt-mk{position:absolute;transform:translate(-50%,-13px);display:flex;flex-direction:column;align-items:center;pointer-events:auto;cursor:pointer}
+.pt-dot{width:26px;height:26px;border-radius:50%;background:var(--c);color:#fff;border:2px solid #fff;display:flex;align-items:center;justify-content:center;font:700 13px/1 var(--f-body);box-shadow:0 1px 4px rgba(0,0,0,.45)}
+.pt-nm{margin-top:2px;background:rgba(255,255,255,.92);color:#16263a;font:700 11px/1.25 var(--f-body);padding:1px 5px;border-radius:3px;white-space:nowrap;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.pt-nm small{font-weight:400;margin-left:4px;color:#4b5a6c}
+.pt-mk.old .pt-dot{opacity:.55;filter:grayscale(.5)}
+.pt-mk.sos .pt-dot{background:#d50000;animation:sosPulse 1.2s infinite}
+.pt-mk.sos .pt-nm{background:#d50000;color:#fff}
+.pt-hd{position:absolute;top:-9px;left:50%;width:0;height:0;margin-left:-5px;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:9px solid var(--c);transform-origin:5px 22px}
+.pt-pt{position:absolute;transform:translate(-4px,-100%);pointer-events:auto;cursor:pointer}
+.pt-pt span{display:inline-block;background:#0f7f73;color:#fff;font:700 11px/1.3 var(--f-body);padding:2px 6px;border-radius:3px 3px 3px 0;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.35)}
+.pt-pt::after{content:"";position:absolute;left:0;bottom:-6px;border-left:3px solid #0f7f73;height:6px}
+.sos-mk{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;cursor:pointer;pointer-events:auto}
+.sos-mk .ring{width:22px;height:22px;border-radius:50%;background:#d50000;border:3px solid #fff;animation:sosPulse 1s infinite}
+.sos-mk .pt-nm{background:#d50000;color:#fff}
