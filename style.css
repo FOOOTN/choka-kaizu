@@ -420,6 +420,7 @@ ul.mfeat li.hit{background:var(--magenta-soft);padding-left:6px}
 .sos-warn{background:#fff3e0;color:#5c2400;border-left:4px solid #d50000;border-radius:3px;padding:8px 10px;font-size:13px;line-height:1.6;margin:0 0 10px}
 .sos-call{display:flex;justify-content:center;align-items:center;min-height:48px;margin:0 0 6px;background:#d50000;border-color:#d50000;color:#fff;font-size:16px;font-weight:700;text-decoration:none}
 .sos-call:hover{background:#b00000}
+.sos-call-note{margin:0 0 10px;text-align:center}
 .sos-pos{font-size:20px;line-height:1.35;font-weight:500}
 .sos-go{font-size:16px;font-weight:700;padding-left:22px;padding-right:22px}
 .sos-head{display:flex;gap:10px;align-items:center}

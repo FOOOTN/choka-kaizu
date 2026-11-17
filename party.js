@@ -56,7 +56,14 @@ function sosNotify(s){
 /* ---------- SOS を出す ---------- */
 function posLine(p){ return p ? `<div class="sos-pos mono">${toDM(p.lat,"N","S")}<br>${toDM(p.lon,"E","W")}</div><div class="hint" style="margin:2px 0 0">${p.acc?`精度 ±${Math.round(p.acc)}m・`:""}118番にはこの緯度・経度を伝えてください</div>`
                           : `<div class="hint">現在地を取得中です（屋外・空の見える所で待ってください）</div>`; }
-const CALL118 = `<a class="btn sos-call" href="tel:118">📞 118番（海上保安庁）に電話</a>`;
+const CALL118 = `<a class="btn sos-call" href="tel:118" data-call118>📞 118番（海上保安庁）に電話する</a>
+  <p class="hint sos-call-note">押すと確認が出て、「OK」を選ぶと<b>本当に118番に電話がかかります</b>（スマホ）。</p>`;
+/* 118番：まちがえて押してもすぐにかからないよう、一度確かめてから電話をかける */
+document.addEventListener("click",e=>{
+  const a=e.target.closest("a[data-call118]"); if(!a) return;
+  e.preventDefault();
+  if(confirm("118番（海上保安庁・海の事故の通報）に電話をかけます。\n\n本当に電話をかけますか？\n（「OK」で電話がかかります）")) location.href="tel:118";
+});
 function sosDlg(){
   if(PT.mine) return sosMineDlg();
   const p=myPos(), logged=ptOn();
